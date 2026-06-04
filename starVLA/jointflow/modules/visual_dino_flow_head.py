@@ -1,0 +1,98 @@
+"""PR5: Visual DINO flow-matching head.
+
+复用:
+- starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit.DiT
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import nn
+from torch.distributions import Beta
+
+from starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit import DiT
+
+
+######### // code // ##########
+# 中文注释：DINO feature 的 continuous flow-matching 头。
+# forward 输入 cond [B,N_q,D_qwen] 和 z_gt [B,N_v,384]，输出 velocity MSE。
+# predict 从高斯噪声 Euler 积分，输出 z_hat [B,N_v,384]，仍在 norm 后的 DINO feature 空间。
+class VisualFlowMatchingHead(nn.Module):
+    def __init__(self, full_config):
+        super().__init__()
+        cfg = full_config.framework.visual_model
+        self.d_dino = int(cfg.get("d_dino", 384))
+        self.hidden_size = int(cfg.get("hidden_size", 768))
+        self.num_timestep_buckets = int(cfg.get("num_timestep_buckets", 1000))
+        self.noise_s = float(cfg.get("noise_s", 0.999))
+        self.num_inference_timesteps = int(cfg.get("num_inference_timesteps", 4))
+        self.add_pos_embed = bool(cfg.get("add_pos_embed", True))
+
+        self.x_embed = nn.Linear(self.d_dino, self.hidden_size)
+        self.x_decode = nn.Linear(self.hidden_size, self.d_dino)
+        if self.add_pos_embed:
+            self.position_embedding = nn.Embedding(int(cfg.get("max_seq_len", 1024)), self.hidden_size)
+            nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
+
+        dit_cfg = dict(cfg.get("diffusion_model_cfg", {}))
+        dit_cfg.setdefault("num_attention_heads", int(cfg.get("num_attention_heads", 12)))
+        dit_cfg.setdefault("attention_head_dim", int(cfg.get("attention_head_dim", self.hidden_size // dit_cfg["num_attention_heads"])))
+        dit_cfg.setdefault("num_layers", int(cfg.get("num_layers", 8)))
+        dit_cfg.setdefault("output_dim", self.hidden_size)
+        dit_cfg.setdefault("dropout", float(cfg.get("dropout", 0.1)))
+        dit_cfg.setdefault("final_dropout", True)
+        dit_cfg.setdefault("interleave_self_attention", True)
+        dit_cfg.setdefault("norm_type", "ada_norm")
+        dit_cfg.setdefault("positional_embeddings", None)
+        dit_cfg["cross_attention_dim"] = int(cfg.get("cross_attention_dim", full_config.framework.qwenvl.get("vl_hidden_dim", 896)))
+        self.model = DiT(**dit_cfg)
+
+        self.beta_dist = Beta(float(cfg.get("noise_beta_alpha", 1.5)), float(cfg.get("noise_beta_beta", 1.0)))
+
+    def sample_time(self, batch_size: int, device, dtype) -> torch.Tensor:
+        sample = self.beta_dist.sample([batch_size]).to(device=device, dtype=dtype).clamp(max=self.noise_s)
+        return (self.noise_s - sample) / self.noise_s
+
+    def _embed_noisy(self, z: torch.Tensor) -> torch.Tensor:
+        x = self.x_embed(z)
+        if self.add_pos_embed:
+            pos = torch.arange(z.shape[1], device=z.device)
+            x = x + self.position_embedding(pos).unsqueeze(0)
+        return x
+
+    def forward(self, cond: torch.Tensor, z_gt: torch.Tensor) -> torch.Tensor:
+        z_gt = z_gt.float()
+        cond = cond.to(dtype=z_gt.dtype)
+        noise = torch.randn_like(z_gt)
+        t = self.sample_time(z_gt.shape[0], z_gt.device, z_gt.dtype)[:, None, None]
+        noisy = (1 - t) * noise + t * z_gt
+        velocity = z_gt - noise
+        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+
+        hidden = self._embed_noisy(noisy)
+        out = self.model(
+            hidden_states=hidden,
+            encoder_hidden_states=cond,
+            timestep=t_discretized,
+            return_all_hidden_states=False,
+        )
+        pred_velocity = self.x_decode(out)
+        return ((pred_velocity.float() - velocity.float()) ** 2).mean()
+
+    @torch.inference_mode()
+    def predict(self, cond: torch.Tensor, n: int) -> torch.Tensor:
+        batch_size = cond.shape[0]
+        z = torch.randn(batch_size, n, self.d_dino, device=cond.device, dtype=cond.dtype)
+        dt = 1.0 / float(self.num_inference_timesteps)
+
+        for step in range(self.num_inference_timesteps):
+            t_cont = step / float(self.num_inference_timesteps)
+            t_discretized = int(t_cont * self.num_timestep_buckets)
+            timestep = torch.full((batch_size,), t_discretized, device=cond.device, dtype=torch.long)
+            hidden = self._embed_noisy(z)
+            out = self.model(hidden_states=hidden, encoder_hidden_states=cond, timestep=timestep)
+            pred_velocity = self.x_decode(out)
+            z = z + dt * pred_velocity
+        return z
+######### // code // ##########
+
