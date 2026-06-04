@@ -74,25 +74,31 @@ def _env_flag(name: str, default: bool) -> bool:
     raise ValueError(f"Invalid boolean env {name}={value!r}")
 
 
-def _build_accelerator() -> Accelerator:
+def _build_accelerator(gradient_accumulation_steps: int = 1) -> Accelerator:
     mixed_precision = _get_jointflow_mixed_precision()
     kwargs_handlers = []
     if _env_flag("JOINTFLOW_FIND_UNUSED_PARAMETERS", True):
         kwargs_handlers.append(DistributedDataParallelKwargs(find_unused_parameters=True))
     override = os.environ.get("JOINTFLOW_USE_DEEPSPEED", "").strip().lower()
     if override in {"0", "false", "no"}:
-        return Accelerator(mixed_precision=mixed_precision, kwargs_handlers=kwargs_handlers)
+        return Accelerator(
+            mixed_precision=mixed_precision,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            kwargs_handlers=kwargs_handlers,
+        )
     use_deepspeed = override in {"1", "true", "yes"} or os.environ.get("ACCELERATE_USE_DEEPSPEED", "").lower() == "true"
     if use_deepspeed:
         return Accelerator(
             mixed_precision=mixed_precision,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             deepspeed_plugin=DeepSpeedPlugin(),
             kwargs_handlers=kwargs_handlers,
         )
-    return Accelerator(mixed_precision=mixed_precision, kwargs_handlers=kwargs_handlers)
-
-
-accelerator = _build_accelerator()
+    return Accelerator(
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        kwargs_handlers=kwargs_handlers,
+    )
 
 
 ######### // code // ##########
@@ -173,6 +179,7 @@ def print_runtime_device_info_safe(accelerator_obj: Accelerator) -> None:
     print(f"  torch.cuda.device_count={torch.cuda.device_count()}")
     print(f"  accelerator.device={accelerator_obj.device}")
     print(f"  accelerator.mixed_precision={accelerator_obj.mixed_precision}")
+    print(f"  accelerator.gradient_accumulation_steps={accelerator_obj.gradient_accumulation_steps}")
     if torch.cuda.is_available():
         for idx in range(torch.cuda.device_count()):
             print(f"  logical cuda:{idx} name={torch.cuda.get_device_name(idx)}")
@@ -202,7 +209,12 @@ def build_component_parameter_table(model) -> list[dict]:
         ("dino_projector", getattr(model, "dino_proj", None), "DINO 384-dim tokens to Qwen hidden size"),
         ("state_encoder", getattr(model, "state_enc", None), "Current proprio state to state token"),
         ("action_context_encoder", getattr(model, "act_ctx", None), "Clean action chunk to context tokens for FDM"),
-        ("query_tokens", getattr(model, "queries", None), "Learned action/image query tokens"),
+        ("action_query_tokens", getattr(model, "action_queries", None), "Learned action query tokens for policy/IDM"),
+        (
+            "future_dino_query_tokens",
+            getattr(model, "future_dino_queries", None),
+            "Learned spatial future-DINO query tokens for FDM/passive",
+        ),
         ("action_diffusion_head", getattr(model, "action_head", None), "Flow head for policy and IDM actions"),
         ("visual_dino_diffusion_head", getattr(model, "visual_head", None), "Flow head for FDM/passive DINO features"),
     ]
@@ -437,6 +449,7 @@ class JointFlowTrainer(TrainerUtils):
 def main(cfg):
     cfg.framework.name = "QwenJointFlow"
     cfg = wrap_config(cfg)
+    accelerator = _build_accelerator(int(getattr(cfg.trainer, "gradient_accumulation_steps", 1)))
     setup_directories(cfg)
     model = build_framework(cfg)
     dataloader = build_joint_dataloader(cfg)

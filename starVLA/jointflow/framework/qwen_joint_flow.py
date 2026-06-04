@@ -29,8 +29,9 @@ from starVLA.jointflow.modules.attention_mask import build_block_causal_mask
 from starVLA.jointflow.modules.dino_v3 import DINOv3Backbone
 from starVLA.jointflow.modules.joint_modules import (
     ActionContextEncoder,
+    ActionQueryTokenBank,
     DinoProjector,
-    QueryTokenBank,
+    FutureDinoQueryTokenBank,
     StateEncoder,
 )
 from starVLA.jointflow.modules.visual_dino_flow_head import VisualFlowMatchingHead
@@ -165,9 +166,9 @@ class QwenJointFlowVLA(baseframework):
             hidden_size=hidden_size,
             n_state_tokens=int(state_cfg.get("n_state_tokens", 1)),
         )
-        self.queries = QueryTokenBank(
-            action_horizon=self.action_horizon,
-            max_image_queries=int(visual_cfg.get("max_image_queries", visual_cfg.get("n_query", 196))),
+        self.action_queries = ActionQueryTokenBank(action_horizon=self.action_horizon, hidden_size=hidden_size)
+        self.future_dino_queries = FutureDinoQueryTokenBank(
+            max_queries=int(visual_cfg.get("max_image_queries", visual_cfg.get("n_query", 196))),
             hidden_size=hidden_size,
         )
 
@@ -430,15 +431,19 @@ class QwenJointFlowVLA(baseframework):
 
         query_start = sum(block_sizes)
         if task in {"policy", "idm"}:
-            query = self.queries.get_action_queries(text_embeds.shape[0], device=text_embeds.device).to(dtype=target_dtype)
+            query = self.action_queries(text_embeds.shape[0], device=text_embeds.device).to(dtype=target_dtype)
             query_kind = "action_query"
         elif task in {"fdm", "passive"}:
             if batch["dino_1"] is None:
                 raise KeyError(f"{task} requires `dino_1`.")
             target = self._select_future_dino(batch["dino_1"], examples)
             n_query = int(target.shape[1])
-            query = self.queries.get_image_queries(text_embeds.shape[0], n_query=n_query, device=text_embeds.device).to(dtype=target_dtype)
-            query_kind = "image_query"
+            query = self.future_dino_queries(
+                text_embeds.shape[0],
+                n_query=n_query,
+                device=text_embeds.device,
+            ).to(dtype=target_dtype)
+            query_kind = "future_dino_query"
         else:
             raise ValueError(f"Unsupported JointFlow task `{task}`")
 

@@ -76,26 +76,32 @@ class StateEncoder(nn.Module):
         return self.norm(out)
 
 
-# 中文注释：管理 action query 和 image query 两组 learned tokens。
-# action_query 输出 [B,H_a,D]；image_query 输出 [B,N_q,D]。
-class QueryTokenBank(nn.Module):
-    def __init__(self, action_horizon: int = 8, max_image_queries: int = 196, hidden_size: int = 896):
+# 中文注释：Action query 是一组 chunk-level learned tokens，只服务 policy/IDM action head。
+# 输出 [B,H_a,D]。
+class ActionQueryTokenBank(nn.Module):
+    def __init__(self, action_horizon: int = 8, hidden_size: int = 896):
         super().__init__()
         self.action_horizon = int(action_horizon)
-        self.max_image_queries = int(max_image_queries)
         self.action_query = nn.Embedding(self.action_horizon, hidden_size)
-        self.image_query = nn.Embedding(self.max_image_queries, hidden_size)
         nn.init.normal_(self.action_query.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.image_query.weight, mean=0.0, std=0.02)
 
-    def get_action_queries(self, batch_size: int, device=None) -> torch.Tensor:
+    def forward(self, batch_size: int, device=None) -> torch.Tensor:
         ids = torch.arange(self.action_horizon, device=device or self.action_query.weight.device)
         return self.action_query(ids).unsqueeze(0).expand(batch_size, -1, -1)
 
-    def get_image_queries(self, batch_size: int, n_query: int, device=None) -> torch.Tensor:
-        if n_query > self.max_image_queries:
-            raise ValueError(f"n_query={n_query} exceeds max_image_queries={self.max_image_queries}")
-        ids = torch.arange(n_query, device=device or self.image_query.weight.device)
-        return self.image_query(ids).unsqueeze(0).expand(batch_size, -1, -1)
-######### // code // ##########
 
+# 中文注释：Future-DINO query 是一组 spatial patch-level learned tokens，只服务 FDM/passive visual head。
+# 输出 [B,N_q,D]，N_q 通常对应 DINO patch token 数。
+class FutureDinoQueryTokenBank(nn.Module):
+    def __init__(self, max_queries: int = 196, hidden_size: int = 896):
+        super().__init__()
+        self.max_queries = int(max_queries)
+        self.future_dino_query = nn.Embedding(self.max_queries, hidden_size)
+        nn.init.normal_(self.future_dino_query.weight, mean=0.0, std=0.02)
+
+    def forward(self, batch_size: int, n_query: int, device=None) -> torch.Tensor:
+        if n_query > self.max_queries:
+            raise ValueError(f"n_query={n_query} exceeds max_queries={self.max_queries}")
+        ids = torch.arange(n_query, device=device or self.future_dino_query.weight.device)
+        return self.future_dino_query(ids).unsqueeze(0).expand(batch_size, -1, -1)
+######### // code // ##########
