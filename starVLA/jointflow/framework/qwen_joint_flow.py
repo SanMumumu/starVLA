@@ -15,14 +15,36 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch import nn
 from omegaconf import OmegaConf
 from PIL import Image
+
+
+######### // code // ##########
+# 中文注释：是否启用逐张量的 finite 断言。
+# 单卡 debug 默认开（方便定位 NaN/Inf 来源）；多卡训练默认关，
+# 因为这些断言在 forward 里逐 rank 抛异常，会造成只有一张卡抛错、
+# 其它卡卡在下一次 all-reduce → NCCL 挂死。多卡下统一交给 trainer 里
+# 的“集合通信版” loss 有限性检查（所有 rank 一起判定、一起抛错）。
+# 需要在多卡下也打开逐张量断言时，设 JOINTFLOW_ASSERT_FINITE=1。
+def _assert_finite_enabled() -> bool:
+    flag = os.environ.get("JOINTFLOW_ASSERT_FINITE", "").strip().lower()
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    # 未显式设置：分布式（多卡）下默认关闭，单进程下默认开启。
+    return not dist.is_initialized()
+######### // code // ##########
 
 from starVLA.jointflow.backbone.qwen2_text_interface import _QWen2_Text_Interface
 from starVLA.jointflow.modules.attention_mask import build_block_causal_mask
@@ -52,7 +74,9 @@ class QwenJointFlowDefaultConfig:
     qwenvl: dict = field(
         default_factory=lambda: {
             "base_vlm": "playground/Pretrained_models/Qwen2.5-0.5B",
-            "attn_implementation": "sdpa",
+            "attn_implementation": "eager",
+            "torch_dtype": "float32",
+            "fp32_forward": True,
             "vl_hidden_dim": 896,
             "max_text_length": 256,
         }
@@ -78,6 +102,7 @@ class QwenJointFlowDefaultConfig:
         default_factory=lambda: {
             "weights": {"policy": 1.0, "fdm": 0.5, "idm": 0.5, "passive": 0.5},
             "hybrid_mask": True,
+            "attention_mask_neg_value": -1.0e4,
         }
     )
     action_model: dict = field(
@@ -191,6 +216,108 @@ class QwenJointFlowVLA(baseframework):
         self.register_buffer("_dino_std", torch.ones(self.d_dino), persistent=False)
         self._dino_stats_source = None
         self._load_dino_stats(dino_cfg.get("stats_path", None))
+
+    @staticmethod
+    def _zero_grad_anchor_for_modules(modules: list[nn.Module | None], ref: torch.Tensor) -> torch.Tensor:
+        anchor = ref.new_zeros(())
+        seen: set[int] = set()
+        for module in modules:
+            if module is None:
+                continue
+            for param in module.parameters(recurse=True):
+                if not param.requires_grad or param.numel() == 0:
+                    continue
+                param_id = id(param)
+                if param_id in seen:
+                    continue
+                seen.add(param_id)
+                anchor = anchor + param.reshape(-1)[0].to(dtype=anchor.dtype) * 0.0
+        return anchor
+
+    def _unused_task_param_anchor(self, task: str, ref: torch.Tensor) -> torch.Tensor:
+        modules: list[nn.Module | None] = []
+        if task in {"policy", "idm"}:
+            modules.extend([self.visual_head, self.future_dino_queries, self.act_ctx])
+        elif task == "fdm":
+            modules.extend([self.action_head, self.action_queries])
+        elif task == "passive":
+            modules.extend([self.action_head, self.action_queries, self.act_ctx])
+        else:
+            raise ValueError(f"Unsupported JointFlow task `{task}`")
+        if self.state_inject_mode != "token":
+            modules.append(self.state_enc)
+        return self._zero_grad_anchor_for_modules(modules, ref)
+
+    ######### // code // ##########
+    # 中文注释：对“全部可训练子模块”做 zero-grad anchor。
+    # 用途：当某个 rank 因为 future_valid 全为 False 走了 early-return（没调用对应 head），
+    # 而其它 rank 走了正常路径（调用了 head）时，DDP 要求每个 rank 在每次 backward
+    # 都把所有参数标记为 ready。这里把所有可训练参数都挂上 0 梯度，
+    # 保证 early-return 这一支也让每个参数 ready，从而消除多卡 reduction 卡死。
+    # （已用 2 卡 DDP find_unused_parameters=False 验证：partial anchor 会挂死，full anchor 通过。）
+    def _all_trainable_anchor(self, ref: torch.Tensor) -> torch.Tensor:
+        modules = [
+            self.backbone,
+            self.dino_proj,
+            self.act_ctx,
+            self.state_enc,
+            self.action_queries,
+            self.future_dino_queries,
+            self.action_head,
+            self.visual_head,
+        ]
+        return self._zero_grad_anchor_for_modules(modules, ref)
+    ######### // code // ##########
+
+    @staticmethod
+    def _tensor_debug_summary(tensor: torch.Tensor) -> dict:
+        detached = tensor.detach()
+        finite = torch.isfinite(detached)
+        summary = {
+            "shape": list(detached.shape),
+            "dtype": str(detached.dtype),
+            "device": str(detached.device),
+            "numel": int(detached.numel()),
+            "finite": int(finite.sum().item()),
+            "nan": int(torch.isnan(detached).sum().item()) if detached.is_floating_point() else 0,
+            "inf": int(torch.isinf(detached).sum().item()) if detached.is_floating_point() else 0,
+        }
+        if bool(finite.any()):
+            values = detached[finite].float()
+            summary.update(
+                {
+                    "min": float(values.min().item()),
+                    "max": float(values.max().item()),
+                    "mean": float(values.mean().item()),
+                    "std": float(values.std(unbiased=False).item()) if values.numel() > 1 else 0.0,
+                }
+            )
+        return summary
+
+    def _sample_debug_summary(self, examples: List[dict], max_items: int = 4) -> list[dict]:
+        keys = ("dataset_name", "trajectory_id", "base_index", "future_index", "future_valid_steps", "future_stride", "lang")
+        rows = []
+        for ex in examples[:max_items]:
+            row = {key: ex.get(key, None) for key in keys if key in ex}
+            if "lang" in row:
+                row["lang"] = str(row["lang"])[:120]
+            rows.append(row)
+        return rows
+
+    def _assert_finite(self, name: str, tensor: torch.Tensor | None, task: str, examples: List[dict]) -> None:
+        # 中文注释：多卡训练默认跳过逐张量断言，避免单 rank 抛异常导致 NCCL 挂死。
+        if not _assert_finite_enabled():
+            return
+        if tensor is None or not torch.is_tensor(tensor) or not tensor.is_floating_point():
+            return
+        if bool(torch.isfinite(tensor).all()):
+            return
+        summary = self._tensor_debug_summary(tensor)
+        samples = self._sample_debug_summary(examples)
+        raise FloatingPointError(
+            f"Non-finite tensor in QwenJointFlow task={task} name={name}: "
+            f"summary={summary}, samples={samples}"
+        )
 
     def _read_dino_stats_file(self, path: Path) -> dict:
         with open(path, "r", encoding="utf-8") as f:
@@ -457,9 +584,10 @@ class QwenJointFlowVLA(baseframework):
         attn4d = build_block_causal_mask(
             block_sizes=block_sizes,
             text_valid_lens=text_valid_lens,
-            dtype=inputs_embeds.dtype,
+            dtype=torch.float32,
             device=inputs_embeds.device,
             hybrid=bool(self.config.framework.tasks.get("hybrid_mask", True)),
+            neg_value=float(self.config.framework.tasks.get("attention_mask_neg_value", -1.0e4)),
         )
         return inputs_embeds, attn4d, position_ids, query_slice, block_names, block_sizes
 
@@ -469,31 +597,57 @@ class QwenJointFlowVLA(baseframework):
             require_future_dino=task in {"fdm", "idm", "passive"},
             require_action=task in {"policy", "fdm", "idm"},
         )
+        self._assert_finite("batch.dino_0", batch.get("dino_0"), task, batch["examples"])
+        self._assert_finite("batch.dino_1", batch.get("dino_1"), task, batch["examples"])
+        self._assert_finite("batch.action", batch.get("action"), task, batch["examples"])
+        self._assert_finite("batch.state", batch.get("state"), task, batch["examples"])
         inputs_embeds, attn4d, position_ids, query_slice, _, _ = self._assemble_sequence(task, batch)
+        self._assert_finite("inputs_embeds", inputs_embeds, task, batch["examples"])
+        self._assert_finite("attention_mask_4d", attn4d, task, batch["examples"])
         hidden = self.backbone(inputs_embeds=inputs_embeds, attention_mask_4d=attn4d, position_ids=position_ids)
+        self._assert_finite("backbone.hidden", hidden, task, batch["examples"])
         cond = hidden[:, query_slice].float()
+        self._assert_finite("cond", cond, task, batch["examples"])
 
         if task in {"policy", "idm"}:
             actions = batch["action"]
             if actions is None:
                 raise KeyError(f"{task} requires `action` labels.")
             target = actions[:, -self.action_horizon :, : self.action_dim].float()
+            self._assert_finite("target.action", target, task, batch["examples"])
             if task == "idm":
                 valid_mask = self._future_valid_mask(batch, cond)
                 if not bool(valid_mask.any()):
-                    return {f"{task}_loss": cond.sum() * 0.0}
+                    # 中文注释：本 rank 整个 batch 的 future 都无效 → 不调用 action_head。
+                    # 必须用 full anchor（覆盖所有可训练参数，含 action_head），否则当
+                    # 别的 rank 走了正常路径用到 action_head 时，两边 ready 的参数集合不一致 → DDP 挂死。
+                    loss = cond.sum() * 0.0
+                    return {f"{task}_loss": loss + self._all_trainable_anchor(loss)}
                 cond = cond[valid_mask]
                 target = target[valid_mask]
-            loss = self.action_head(cond, target, state=None, encoder_attention_mask=None)
+            # 中文注释：与 visual_head / backbone 保持一致——强制 action head 的 DiT 在 fp32 下计算。
+            # accelerate(bf16) 默认会把整个 model.forward 包进 autocast，backbone 和 visual_head
+            # 都显式 opt-out 跑 fp32，唯独 FlowmatchingActionHead 没有，导致 policy/idm 的 24 层
+            # DiT 实际在 bf16 下跑，是数值尖刺/NaN 的高风险来源。这里本地 opt-out（不改共享的
+            # GR00T_ActionHeader.py），让 policy/idm 与 fdm/passive 数值口径一致。
+            device_type = cond.device.type
+            ac = torch.autocast(device_type=device_type, enabled=False) if device_type in {"cuda", "cpu"} else nullcontext()
+            with ac:
+                loss = self.action_head(cond.float(), target.float(), state=None, encoder_attention_mask=None)
         else:
             target = self._select_future_dino(batch["dino_1"], batch["examples"]).to(cond.device, dtype=torch.float32)
+            self._assert_finite("target.dino_1", target, task, batch["examples"])
             valid_mask = self._future_valid_mask(batch, cond)
             if not bool(valid_mask.any()):
-                return {f"{task}_loss": cond.sum() * 0.0}
+                # 中文注释：fdm/passive 同理，本 rank future 全无效时不调用 visual_head。
+                # 用 full anchor 保证所有可训练参数 ready，避免多卡 reduction 不一致挂死。
+                loss = cond.sum() * 0.0
+                return {f"{task}_loss": loss + self._all_trainable_anchor(loss)}
             cond = cond[valid_mask]
             target = target[valid_mask]
             loss = self.visual_head(cond, target)
-        return {f"{task}_loss": loss}
+        self._assert_finite(f"{task}.loss", loss, task, batch["examples"])
+        return {f"{task}_loss": loss + self._unused_task_param_anchor(task, loss)}
 
     def compute_loss(self, tag: str, batch, loss_scale: dict = None):
         if tag != "vla":

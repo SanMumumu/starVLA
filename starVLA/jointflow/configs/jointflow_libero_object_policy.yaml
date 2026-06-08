@@ -1,15 +1,15 @@
-run_id: qwen_jointflow_libero
-run_root_dir: playground/Debug_Checkpoints
+run_id: qwen_jointflow_libero_object_policy
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_jointflow
 seed: 42
 wandb_entity: sanmumumu
 wandb_project: starVLA_JointFlow
 is_debug: false
-version_id: "0.21"
+version_id: "0.21-object-policy-ah8"
 
 framework:
   name: QwenJointFlow
   qwenvl:
-    base_vlm: playground/Pretrained_models/Qwen2.5-0.5B
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen2.5-0.5B
     attn_implementation: eager
     torch_dtype: float32
     fp32_forward: true
@@ -35,11 +35,13 @@ framework:
   tasks:
     hybrid_mask: true
     attention_mask_neg_value: -1.0e4
+    # 中文注释：policy-only——只训练 policy；fdm/idm/passive 权重置 0,JointTaskSampler 会跳过它们
+    # （visual_head / future_dino_queries 仍会被构建但拿 0 梯度 anchor,不参与更新）。
     weights:
       policy: 1.0
-      fdm: 0.5
-      idm: 0.5
-      passive: 0.5
+      fdm: 0.0
+      idm: 0.0
+      passive: 0.0
   action_model:
     action_model_type: DiT-B
     hidden_size: 1024
@@ -83,14 +85,16 @@ framework:
 datasets:
   vla_data:
     dataset_py: jointflow
-    data_root_dir: /mnt/hwdata/wangsen/starVLA/DATA/LEBERO/libero
-    data_mix: libero_object # libero_all
+    data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero
+    data_mix: libero_object
     action_type: delta_qpos
     # 中文注释：LIBERO 的 lerobot `action` 本身就是 delta 控制量（OSC_POSE 增量），不能再用
     # action_mode=delta 二次差分。delta 模式会做 action[0]-state[0]（delta 减绝对 proprio，
     # roll 被搞成 ≈-π）并对后续步再差分，污染训练目标 → flow loss 仍低但 eval 全 0% SR。
     # 已是相对量时用 abs 透传，与 starvla_cotrain_libero / FastUMI(action_mode=abs) 一致。改此项需重训。
     action_mode: abs
+    # 中文注释：action_horizon=8;future_stride 同样设 8 保持对齐(policy-only 时 fdm/passive 不训,
+    # future_stride 实际不参与,但对齐设置便于和多任务版一致、避免误解)。
     action_horizon: 8
     world_model:
       future_stride: 8
@@ -100,7 +104,7 @@ datasets:
     dino_feature_layout: lingbot_episode
     dino_episode_cache_size: 2
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task."
-    per_device_batch_size: 1
+    per_device_batch_size: 4
     load_all_data_for_training: true
     video_backend: torchvision_av
     num_workers: 4

@@ -1,0 +1,28 @@
+REQUIRED:
+  JOB_NAME: "starvla-jointflow-eval-client"
+  JOB_PASSWD: "newk8s666"
+
+  UPLOAD_DIR: "/home/users/sen02.wang-labs/aidi_jobs/starvla_dev"
+  PROJECT_ID: "horizon-labs"
+
+  # CLIENT 节点：8 卡机起 8 个 LIBERO 客户端（GPU0-7），从共享 bucket 发现 server 节点。
+  WORKER_MIN_NUM: 1
+  WORKER_MAX_NUM: 1
+  GPU_PER_WORKER: 8
+
+  # 集群路径：~/aidi_jobs/starvla_dev/starVLA/starVLA/jointflow/eval_aidi/run_client_aidi.sh
+  RUN_SCRIPTS: "${WORKING_PATH}/starVLA/starVLA/jointflow/eval_aidi/run_client_aidi.sh"
+
+OPTIONAL:
+  FRAMEWORK: "pytorch"
+  TASK_LABEL: "DEV"
+  PRIORITY: 5
+  # client 用已内置 LIBERO / MuJoCo 依赖的镜像；run_client_aidi.sh 不再运行时安装。
+  DOCKER_IMAGE: "docker.hobot.cc/imagesys/starvla-libero:v1.0"
+  WALL_TIME: 20000
+  JOB_TYPE: "train"
+  REMARK: "jointflow libero eval - CLIENT node (8 LIBERO clients)"
+  DATA_SPACE:
+    DATA_TYPE: "dmp"
+    INPUT: "robot_lab"
+    OUTPUT: "robot_lab"

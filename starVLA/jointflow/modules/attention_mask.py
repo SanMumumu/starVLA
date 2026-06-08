@@ -10,19 +10,20 @@ import torch
 ######### // code // ##########
 # 中文注释：构造 block-causal 4D additive mask。
 # 输入 block_sizes 为同一 batch 的块长度列表，text_valid_lens [B] 只作用于第 0 个 text block。
-# 输出 mask [B,1,T,T]：可见位置为 0，不可见位置为 finfo.min。
+# 输出 mask [B,1,T,T]：可见位置为 0，不可见位置为稳定有限负数。
 def build_block_causal_mask(
     block_sizes: list[int],
     text_valid_lens: torch.Tensor,
     dtype: torch.dtype,
     device: torch.device,
     hybrid: bool = True,
+    neg_value: float = -1e4,
 ) -> torch.Tensor:
     if not block_sizes or block_sizes[0] <= 0:
         raise ValueError(f"Invalid block_sizes: {block_sizes}")
     total = int(sum(block_sizes))
     batch_size = int(text_valid_lens.shape[0])
-    neg = torch.finfo(dtype if torch.is_floating_point(torch.empty((), dtype=dtype)) else torch.float32).min
+    neg = float(neg_value)
 
     if hybrid:
         visible = torch.zeros(total, total, dtype=torch.bool, device=device)
@@ -67,4 +68,3 @@ def visualize_mask(mask4d: torch.Tensor, block_names: list[str], save_path: str 
     plt.savefig(save_path)
     plt.close()
 ######### // code // ##########
-

@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 from torch import nn
 from torch.distributions import Beta
@@ -61,23 +63,26 @@ class VisualFlowMatchingHead(nn.Module):
         return x
 
     def forward(self, cond: torch.Tensor, z_gt: torch.Tensor) -> torch.Tensor:
-        z_gt = z_gt.float()
-        cond = cond.to(dtype=z_gt.dtype)
-        noise = torch.randn_like(z_gt)
-        t = self.sample_time(z_gt.shape[0], z_gt.device, z_gt.dtype)[:, None, None]
-        noisy = (1 - t) * noise + t * z_gt
-        velocity = z_gt - noise
-        t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
+        device_type = z_gt.device.type
+        autocast_ctx = torch.autocast(device_type=device_type, enabled=False) if device_type in {"cuda", "cpu"} else nullcontext()
+        with autocast_ctx:
+            z_gt = z_gt.float()
+            cond = cond.float()
+            noise = torch.randn_like(z_gt)
+            t = self.sample_time(z_gt.shape[0], z_gt.device, z_gt.dtype)[:, None, None]
+            noisy = (1 - t) * noise + t * z_gt
+            velocity = z_gt - noise
+            t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
 
-        hidden = self._embed_noisy(noisy)
-        out = self.model(
-            hidden_states=hidden,
-            encoder_hidden_states=cond,
-            timestep=t_discretized,
-            return_all_hidden_states=False,
-        )
-        pred_velocity = self.x_decode(out)
-        return ((pred_velocity.float() - velocity.float()) ** 2).mean()
+            hidden = self._embed_noisy(noisy)
+            out = self.model(
+                hidden_states=hidden,
+                encoder_hidden_states=cond,
+                timestep=t_discretized,
+                return_all_hidden_states=False,
+            )
+            pred_velocity = self.x_decode(out)
+            return ((pred_velocity.float() - velocity.float()) ** 2).mean()
 
     @torch.inference_mode()
     def predict(self, cond: torch.Tensor, n: int) -> torch.Tensor:
@@ -95,4 +100,3 @@ class VisualFlowMatchingHead(nn.Module):
             z = z + dt * pred_velocity
         return z
 ######### // code // ##########
-

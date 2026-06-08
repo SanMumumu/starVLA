@@ -1,15 +1,15 @@
-run_id: qwen_jointflow_libero
-run_root_dir: playground/Debug_Checkpoints
+run_id: qwen_jointflow_libero_object
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_jointflow
 seed: 42
 wandb_entity: sanmumumu
 wandb_project: starVLA_JointFlow
 is_debug: false
-version_id: "0.21"
+version_id: "0.21-object-ah8"
 
 framework:
   name: QwenJointFlow
   qwenvl:
-    base_vlm: playground/Pretrained_models/Qwen2.5-0.5B
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen2.5-0.5B
     attn_implementation: eager
     torch_dtype: float32
     fp32_forward: true
@@ -37,9 +37,9 @@ framework:
     attention_mask_neg_value: -1.0e4
     weights:
       policy: 1.0
-      fdm: 0.5
-      idm: 0.5
-      passive: 0.5
+      fdm: 0.25
+      idm: 0.25
+      passive: 0.1
   action_model:
     action_model_type: DiT-B
     hidden_size: 1024
@@ -83,14 +83,16 @@ framework:
 datasets:
   vla_data:
     dataset_py: jointflow
-    data_root_dir: /mnt/hwdata/wangsen/starVLA/DATA/LEBERO/libero
-    data_mix: libero_object # libero_all
+    data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero
+    data_mix: libero_object
     action_type: delta_qpos
     # 中文注释：LIBERO 的 lerobot `action` 本身就是 delta 控制量（OSC_POSE 增量），不能再用
     # action_mode=delta 二次差分。delta 模式会做 action[0]-state[0]（delta 减绝对 proprio，
     # roll 被搞成 ≈-π）并对后续步再差分，污染训练目标 → flow loss 仍低但 eval 全 0% SR。
     # 已是相对量时用 abs 透传，与 starvla_cotrain_libero / FastUMI(action_mode=abs) 一致。改此项需重训。
     action_mode: abs
+    # 中文注释：三处必须对齐到 8——framework.action_model.action_horizon、本处 action_horizon、
+    # world_model.future_stride。这样 FDM 的“未来 DINO 帧”正好落在 8 步动作块执行完之后。
     action_horizon: 8
     world_model:
       future_stride: 8
@@ -100,7 +102,7 @@ datasets:
     dino_feature_layout: lingbot_episode
     dino_episode_cache_size: 2
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task."
-    per_device_batch_size: 1
+    per_device_batch_size: 4
     load_all_data_for_training: true
     video_backend: torchvision_av
     num_workers: 4
