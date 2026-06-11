@@ -48,7 +48,7 @@ def _assert_finite_enabled() -> bool:
 
 from starVLA.jointflow.backbone.qwen2_text_interface import _QWen2_Text_Interface
 from starVLA.jointflow.modules.attention_mask import build_block_causal_mask
-from starVLA.jointflow.modules.dino_v3 import DINOv3Backbone
+from starVLA.jointflow.modules.dino_v3 import DINOv3Backbone, resolve_dino_spec
 from starVLA.jointflow.modules.joint_modules import (
     ActionContextEncoder,
     ActionQueryTokenBank,
@@ -181,7 +181,12 @@ class QwenJointFlowVLA(baseframework):
 
         self.action_horizon = int(action_cfg.action_horizon)
         self.action_dim = int(action_cfg.action_dim)
-        self.d_dino = int(dino_cfg.get("embed_dim", visual_cfg.get("d_dino", 384)))
+        # 中文注释：在线 DINO。dino_spec 由 model_size/weights 等解析而来（见 resolve_dino_spec），
+        # 是“一处指定尺寸”的真源：embed_dim 据此确定，并同步给 visual_model.d_dino，
+        # 保证 visual flow head 的 x_embed/x_decode 维度与 DINO 输出对齐（改尺寸不用再手动改两处）。
+        self._dino_spec = resolve_dino_spec(dino_cfg)
+        self.d_dino = int(self._dino_spec["embed_dim"])
+        self.config.framework.visual_model.d_dino = self.d_dino
         self.state_inject_mode = state_cfg.get("inject_mode", "token")
 
         self.dino_proj = DinoProjector(d_dino=self.d_dino, hidden_size=hidden_size)
@@ -199,18 +204,11 @@ class QwenJointFlowVLA(baseframework):
 
         self.action_head = FlowmatchingActionHead(self.config)
         self.visual_head = VisualFlowMatchingHead(self.config)
+        # 中文注释：在线模式默认 load_live_backbone=true，构造时即加载 frozen DINOv3；
+        # __init__ 阶段不 .to(device)，随整模型 .to() 一起搬。requires_grad=False，不进优化器更新。
         self.dino = None
         if bool(dino_cfg.get("load_live_backbone", False)):
-            self.dino = DINOv3Backbone(
-                name=dino_cfg.get("name", "dinov3_vits16"),
-                hf_model_id=dino_cfg.get("hf_model_id", "facebook/dinov3-vits16-pretrain-lvd1689m"),
-                repo_or_dir=dino_cfg.get("repo_or_dir", "facebookresearch/dinov3"),
-                weights=dino_cfg.get("weights", None),
-                loader=dino_cfg.get("loader", "auto"),
-                image_size=int(dino_cfg.get("image_size", 224)),
-                patch_size=int(dino_cfg.get("patch_size", 16)),
-                embed_dim=int(dino_cfg.get("embed_dim", 384)),
-            )
+            self.dino = DINOv3Backbone(**self._dino_spec)
 
         self.register_buffer("_dino_mean", torch.zeros(self.d_dino), persistent=False)
         self.register_buffer("_dino_std", torch.ones(self.d_dino), persistent=False)
@@ -391,9 +389,16 @@ class QwenJointFlowVLA(baseframework):
         mean = torch.tensor(stats["mean"], dtype=torch.float32)
         std = torch.tensor(stats["std"], dtype=torch.float32).clamp_min(1e-6)
         if mean.numel() != self.d_dino or std.numel() != self.d_dino:
-            raise ValueError(
-                f"DINO stats dim mismatch: mean={mean.numel()} std={std.numel()} expected={self.d_dino}"
-            )
+            # 中文注释：stats 维度与当前 DINO embed_dim 对不上（常见于换了 dino.model_size
+            # 之后命中旧尺寸残留的离线 stats）。在线模式下 stats 是可选项：不崩，退回恒等归一化
+            # （直接用 DINOv3 自带 LayerNorm 后的 patch token，数值已较稳定）。
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(
+                    f"[QwenJointFlow][warn] DINO stats dim {mean.numel()} != embed_dim {self.d_dino} "
+                    f"(source={source}); skipping stats, using identity normalization.",
+                    flush=True,
+                )
+            return
         self._dino_mean.copy_(mean)
         self._dino_std.copy_(std)
         self._dino_stats_source = source
@@ -456,49 +461,86 @@ class QwenJointFlowVLA(baseframework):
     def _normalize_live_dino(self, z: torch.Tensor) -> torch.Tensor:
         return (z - self._dino_mean.to(z.device, z.dtype)) / self._dino_std.to(z.device, z.dtype)
 
-    def _live_dino_0(self, examples: List[dict]) -> torch.Tensor:
+    ######### // code // ##########
+    # 中文注释：在线 DINO 工具方法。
+    # 训练时 dataset 返回原始图像 image_0/image_1（[V,H,W,C] uint8）；eval 时 policy server
+    # 给的是 `image`（PIL 列表）。这里统一在 GPU 上跑 frozen DINOv3 → 标准化特征 [B,V,N,D]。
+    def _ensure_dino(self) -> DINOv3Backbone:
         if self.dino is None:
-            dino_cfg = self.config.framework.dino
-            self.dino = DINOv3Backbone(
-                name=dino_cfg.get("name", "dinov3_vits16"),
-                hf_model_id=dino_cfg.get("hf_model_id", "facebook/dinov3-vits16-pretrain-lvd1689m"),
-                repo_or_dir=dino_cfg.get("repo_or_dir", "facebookresearch/dinov3"),
-                weights=dino_cfg.get("weights", None),
-                loader=dino_cfg.get("loader", "auto"),
-                image_size=int(dino_cfg.get("image_size", 224)),
-                patch_size=int(dino_cfg.get("patch_size", 16)),
-                embed_dim=int(dino_cfg.get("embed_dim", 384)),
-            ).to(self.device)
-        images = []
+            # 中文注释：兜底惰性构造（理论上 load_live_backbone=true 已在 __init__ 建好）。
+            self.dino = DINOv3Backbone(**self._dino_spec).to(self.device)
+        return self.dino
+
+    def _collect_images(self, examples: List[dict], keys: list[str]):
+        # 返回 batch 维的 view 列表：[[view0,view1,...], ...]；任一样本缺图返回 None。
+        batch_views = []
         for ex in examples:
-            imgs = ex.get("image", None)
-            if imgs is None:
-                raise KeyError("predict_action requires either `dino_0` or live `image` inputs.")
-            if isinstance(imgs, Image.Image):
-                imgs = [imgs]
-            images.append(imgs)
-        tensor = self.dino.prepare_dino_input(images)
-        feats = self.dino(tensor)
-        bsz = len(images)
-        views = len(images[0])
-        feats = feats.view(bsz, views, feats.shape[1], feats.shape[2])
-        return self._normalize_live_dino(feats.float())
+            val = None
+            for key in keys:
+                cand = ex.get(key, None)
+                if cand is not None:
+                    val = cand
+                    break
+            if val is None:
+                return None
+            if isinstance(val, Image.Image):
+                views = [val]
+            elif isinstance(val, np.ndarray):
+                if val.ndim == 4:  # [V,H,W,C]
+                    views = [val[i] for i in range(val.shape[0])]
+                elif val.ndim == 3:  # [H,W,C]
+                    views = [val]
+                else:
+                    raise ValueError(f"Unsupported image array ndim={val.ndim} for keys={keys}")
+            elif isinstance(val, (list, tuple)):
+                views = list(val)
+            else:
+                views = [val]
+            batch_views.append(views)
+        return batch_views
+
+    def _run_dino_on_images(self, examples: List[dict], keys: list[str], required: bool) -> torch.Tensor | None:
+        batch_views = self._collect_images(examples, keys)
+        if batch_views is None:
+            if required:
+                raise KeyError(f"Online DINO needs one of {keys} in the batch (got none).")
+            return None
+        dino = self._ensure_dino()
+        n_views = len(batch_views[0])
+        flat = [img for views in batch_views for img in views]
+        # 中文注释：DINO 强制 fp32（关 autocast），与 backbone / flow head 数值口径一致，
+        # 保证作为 flow 目标的 dino_1 特征稳定、可复现。
+        device_type = self.device.type
+        autocast_ctx = torch.autocast(device_type=device_type, enabled=False) if device_type in {"cuda", "cpu"} else nullcontext()
+        with autocast_ctx:
+            tensor = dino.preprocess_batch(flat)
+            feats = dino(tensor)  # [B*V, N, D]
+        bsz = len(batch_views)
+        feats = feats.view(bsz, n_views, feats.shape[1], feats.shape[2]).float()
+        return self._normalize_live_dino(feats)
+    ######### // code // ##########
 
     def _examples_to_batch(self, examples: List[dict], require_future_dino: bool, require_action: bool) -> dict:
         if not isinstance(examples, list):
             examples = [examples]
+        # 中文注释：优先用离线特征 dino_0/dino_1（若存在）；否则在线对原始图像跑 DINO。
+        # 训练在线：image_0/image_1；eval：policy server 给 `image`（当前观测，等价 image_0）。
+        dino_0 = self._stack_field(examples, "dino_0", required=False)
+        if dino_0 is None:
+            dino_0 = self._run_dino_on_images(examples, ["image_0", "image"], required=True)
+        dino_1 = self._stack_field(examples, "dino_1", required=False)
+        if dino_1 is None and require_future_dino:
+            dino_1 = self._run_dino_on_images(examples, ["image_1"], required=True)
         batch = {
             "examples": examples,
             "instructions": [str(ex.get("lang", "")) for ex in examples],
-            "dino_0": self._stack_field(examples, "dino_0", required=False),
-            "dino_1": self._stack_field(examples, "dino_1", required=require_future_dino),
+            "dino_0": dino_0,
+            "dino_1": dino_1,
             "action": self._stack_field(examples, "action", required=require_action),
             "state": self._stack_field(examples, "state", required=False),
             "future_valid": self._stack_field(examples, "future_valid", required=False),
             "future_valid_steps": self._stack_field(examples, "future_valid_steps", required=False),
         }
-        if batch["dino_0"] is None:
-            batch["dino_0"] = self._live_dino_0(examples)
         if batch["future_valid"] is None and require_future_dino:
             batch["future_valid"] = torch.ones(len(examples), device=self.device, dtype=torch.float32)
         return batch

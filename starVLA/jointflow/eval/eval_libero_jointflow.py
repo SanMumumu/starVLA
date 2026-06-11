@@ -53,9 +53,16 @@ from deployment.model_server.tools.websocket_policy_client import WebsocketClien
 # 本文件已 `from __future__ import annotations`，联合注解会被当作字符串，3.8 下安全。
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 
-# 中文注释:原 examples 的 _binarize_gripper_open(把 gripper 映射成 {-1,+1})对本数据是错的——
-# 本数据集 gripper 是 {0,1},env 只有 action≈0 才闭合,故已删除该 helper,夹爪在 _run_task 里
-# 按 {0,1} 阈值直接发(见那里的说明 + demo 回放验证)。
+
+def _binarize_gripper_open(open_val: np.ndarray | float) -> np.ndarray:
+    # 中文注释:lerobot 里 gripper 存成 {0,1}(0=合, 1=开),但 LIBERO/robosuite env 的 gripper
+    # 动作约定是 {+1=合, -1=开}。所以必须做这个映射:v>0.5(=1, 开)→ -1(env 开);
+    # v<=0.5(=0, 合)→ +1(env 合)。已用 demo 精确回放验证:用本函数,夹爪在接近期张开、
+    # 抓取期夹住物体,任务能 done=True;直接发 {0,1} 会让 env 一直空抓闭合 → 永远抓不到。
+    arr = np.asarray(open_val, dtype=np.float32).reshape(-1)
+    v = float(arr[0])
+    bin_val = 1.0 - 2.0 * (v > 0.5)
+    return np.asarray([bin_val], dtype=np.float32)
 
 
 def _get_libero_env(task, resolution, seed):
@@ -212,11 +219,10 @@ def _run_task(conn, task_suite, task_id, args, video_dir: Optional[Path]) -> "tu
             raw = np.asarray(conn.get_action(example, step), dtype=np.float32).reshape(-1)
             world_vector = raw[:3]
             rotation_delta = raw[3:6]
-            # 中文注释：本数据集的 gripper 是 {0,1}(0=合,1=开)且训练不归一化,模型直接回归 {0,1}。
-            # 旧的 _binarize_gripper_open 把它映射成 {-1,+1},但这个 LIBERO env 实测只有 action≈0
-            # 才闭合,{-1,+1} 都不闭合 → 夹爪永不抓取、pick 任务必 0%。已用 demo 回放验证:
-            # 直接按 {0,1} 阈值发(raw / thr01)夹爪能闭合抓取(qpos→0.001),binarize 不抓取(qpos≈0.05)。
-            gripper = np.array([1.0 if float(raw[6]) > 0.5 else 0.0], dtype=np.float32)
+            # 中文注释：gripper 从模型输出的 {0,1} 空间映射回 env 的 {+1=合,-1=开}。
+            # 已用 demo 精确回放验证:用 _binarize_gripper_open,夹爪接近期张开、抓取期夹住物体、
+            # 任务 done=True;若直接发 {0,1},env 会一直空抓闭合,永远抓不到 → 0% SR。
+            gripper = _binarize_gripper_open(raw[6:7])
             delta_action = np.concatenate([world_vector, rotation_delta, gripper], axis=0)
 
             obs, _, done, _ = env.step(delta_action.tolist())

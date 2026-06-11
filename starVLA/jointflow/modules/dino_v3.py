@@ -1,25 +1,93 @@
-"""PR1: Frozen DINOv3-S wrapper.
+"""PR1: Frozen DINOv3 wrapper（在线版）.
 
 复用:
 - torchvision transforms
 - torch.hub / transformers AutoModel fallback
 
 说明:
-训练时 JointFlow 默认读取离线 DINOv3 特征；该模块主要用于预计算和
-predict_action live 图像特征抽取。
+JointFlow 已从“离线预计算 DINO 特征”切换为“在线提特征”。本模块在
+训练 / predict_action 时都直接在模型内对原始图像跑 frozen DINOv3，
+省掉离线预处理与读盘环节（见 framework/qwen_joint_flow.py）。
+模型尺寸由 dino.model_size 一处指定，离线权重由 dino.weights 指定本地路径。
 """
 
 from __future__ import annotations
 
-import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torch import nn
 from torchvision import transforms
+
+
+######### // code // ##########
+# 中文注释：DINOv3 尺寸预设。用户只需在 config 里写 dino.model_size，
+# 这里据此自动填好 torch.hub 名称 / HF model id / embed_dim / patch_size，
+# 避免“改了尺寸却忘了同步 embed_dim”导致 visual head 维度对不上。
+DINOV3_PRESETS = {
+    "vits16": {"name": "dinov3_vits16", "hf_model_id": "facebook/dinov3-vits16-pretrain-lvd1689m", "embed_dim": 384, "patch_size": 16},
+    "vits16plus": {"name": "dinov3_vits16plus", "hf_model_id": "facebook/dinov3-vits16plus-pretrain-lvd1689m", "embed_dim": 384, "patch_size": 16},
+    "vitb16": {"name": "dinov3_vitb16", "hf_model_id": "facebook/dinov3-vitb16-pretrain-lvd1689m", "embed_dim": 768, "patch_size": 16},
+    "vitl16": {"name": "dinov3_vitl16", "hf_model_id": "facebook/dinov3-vitl16-pretrain-lvd1689m", "embed_dim": 1024, "patch_size": 16},
+    "vith16plus": {"name": "dinov3_vith16plus", "hf_model_id": "facebook/dinov3-vith16plus-pretrain-lvd1689m", "embed_dim": 1280, "patch_size": 16},
+    "vit7b16": {"name": "dinov3_vit7b16", "hf_model_id": "facebook/dinov3-vit7b16-pretrain-lvd1689m", "embed_dim": 4096, "patch_size": 16},
+}
+# 中文注释：尺寸别名，方便写 s/b/l 等简写。
+_SIZE_ALIASES = {
+    "s": "vits16", "small": "vits16", "vits": "vits16",
+    "b": "vitb16", "base": "vitb16", "vitb": "vitb16",
+    "l": "vitl16", "large": "vitl16", "vitl": "vitl16",
+    "h": "vith16plus", "huge": "vith16plus",
+    "g": "vit7b16", "giant": "vit7b16", "7b": "vit7b16",
+}
+
+
+def _cfg_get(cfg, key: str, default=None):
+    if cfg is None:
+        return default
+    if hasattr(cfg, "get"):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def resolve_dino_spec(dino_cfg) -> dict:
+    """把 framework.dino 配置解析成 DINOv3Backbone 的构造参数。
+
+    - 若指定 model_size：用预设覆盖 name/hf_model_id/embed_dim/patch_size（“一处改尺寸”）。
+    - weights：本地离线 ckpt（torch.hub 的 .pth 文件，或 HF 快照目录）。
+    - 其余字段（repo_or_dir/loader/image_size/weights）保留用户值。
+    """
+    spec = {
+        "name": _cfg_get(dino_cfg, "name", "dinov3_vits16"),
+        "hf_model_id": _cfg_get(dino_cfg, "hf_model_id", "facebook/dinov3-vits16-pretrain-lvd1689m"),
+        "repo_or_dir": _cfg_get(dino_cfg, "repo_or_dir", "facebookresearch/dinov3"),
+        "weights": _cfg_get(dino_cfg, "weights", None),
+        "loader": _cfg_get(dino_cfg, "loader", "auto"),
+        "image_size": int(_cfg_get(dino_cfg, "image_size", 224)),
+        "patch_size": int(_cfg_get(dino_cfg, "patch_size", 16)),
+        "embed_dim": int(_cfg_get(dino_cfg, "embed_dim", 384)),
+    }
+    size = _cfg_get(dino_cfg, "model_size", None)
+    if size:
+        key = str(size).lower()
+        key = _SIZE_ALIASES.get(key, key)
+        if key not in DINOV3_PRESETS:
+            raise ValueError(
+                f"Unknown dino.model_size={size!r}; valid keys: {sorted(DINOV3_PRESETS)} "
+                f"(aliases: {sorted(_SIZE_ALIASES)})"
+            )
+        preset = DINOV3_PRESETS[key]
+        spec["name"] = preset["name"]
+        spec["hf_model_id"] = preset["hf_model_id"]
+        spec["embed_dim"] = preset["embed_dim"]
+        spec["patch_size"] = preset["patch_size"]
+    return spec
+######### // code // ##########
 
 
 def _apply_transform(image: Image.Image, transform):
@@ -27,9 +95,9 @@ def _apply_transform(image: Image.Image, transform):
 
 
 ######### // code // ##########
-# 中文注释：冻结 DINOv3 ViT-S/16，输出 patch tokens。
+# 中文注释：冻结 DINOv3 ViT，输出 patch tokens。
 # 输入：imgs [B*V,3,H,W]，已经按 ImageNet mean/std 标准化。
-# 输出：patch_tokens [B*V,N_v,384]；224x224+patch16 时 N_v=196。
+# 输出：patch_tokens [B*V,N_v,embed_dim]；224x224+patch16 时 N_v=196。
 class DINOv3Backbone(nn.Module):
     def __init__(
         self,
@@ -61,6 +129,9 @@ class DINOv3Backbone(nn.Module):
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
         )
+        # 中文注释：在线 batch 预处理用到的 ImageNet 常量（注册成 buffer 随模型搬到对应 device）。
+        self.register_buffer("_imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer("_imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
 
         self.body = self._load_body(trust_repo=trust_repo)
         self.body.eval()
@@ -69,11 +140,22 @@ class DINOv3Backbone(nn.Module):
 
     def _load_body(self, trust_repo: bool):
         errors: list[str] = []
+        weights = self.weights
+        # 中文注释：weights 指向一个目录时，按 HF 本地快照加载（离线、不联网）。
+        want_hf = self.loader == "hf" or (weights and Path(str(weights)).is_dir())
+        if want_hf:
+            from transformers import AutoModel
+
+            ref = str(weights) if (weights and Path(str(weights)).is_dir()) else self.hf_model_id
+            self._hf_mode = True
+            return AutoModel.from_pretrained(ref, trust_remote_code=True)
+
         if self.loader in {"auto", "torchhub"}:
             try:
                 kwargs = {}
-                if self.weights:
-                    kwargs["weights"] = self.weights
+                # 中文注释：weights 是本地 .pth 离线权重文件 → 交给 torch.hub 的 entrypoint(weights=...) 加载。
+                if weights:
+                    kwargs["weights"] = str(weights)
                 source = "local" if Path(self.repo_or_dir).exists() else "github"
                 return torch.hub.load(self.repo_or_dir, self.name, source=source, trust_repo=trust_repo, **kwargs)
             except Exception as exc:  # pragma: no cover - depends on local weights/network
@@ -84,12 +166,14 @@ class DINOv3Backbone(nn.Module):
         try:
             from transformers import AutoModel
 
+            ref = str(weights) if (weights and Path(str(weights)).is_dir()) else self.hf_model_id
             self._hf_mode = True
-            return AutoModel.from_pretrained(self.hf_model_id, trust_remote_code=True)
+            return AutoModel.from_pretrained(ref, trust_remote_code=True)
         except Exception as exc:  # pragma: no cover - depends on installed transformers/model cache
             errors.append(f"HF AutoModel failed: {exc}")
             raise RuntimeError(
-                "Unable to load DINOv3. Provide a local repo/weights or a cached HF model. " + " | ".join(errors)
+                "Unable to load DINOv3. Provide dino.weights (local .pth or HF snapshot dir), "
+                "a local dino.repo_or_dir, or a cached HF model. " + " | ".join(errors)
             ) from exc
 
     @torch.no_grad()
@@ -129,6 +213,38 @@ class DINOv3Backbone(nn.Module):
             tokens = tokens[:, -expected_patches:, :]
         return tokens
 
+    ######### // code // ##########
+    # 中文注释：在线 batch 预处理。输入是一“扁平”图像列表（长度 = B*V），
+    # 每个元素可为 PIL.Image 或 HWC 的 numpy(uint8 / float)。
+    # 在 GPU 上做 Resize(image_size) + ToTensor([0,1]) + ImageNet Normalize，
+    # 返回 [M,3,image_size,image_size] 的 fp32 张量（M=len(images)）。
+    # 与离线 dino_transform 数值口径一致；训练和 eval 都走这一条路径，保证 train/eval 一致。
+    @torch.no_grad()
+    def preprocess_batch(self, images: Sequence) -> torch.Tensor:
+        device = next(self.parameters()).device
+        tensors = []
+        for img in images:
+            if isinstance(img, Image.Image):
+                arr = np.asarray(img.convert("RGB"))
+            else:
+                arr = np.asarray(img)
+            t = torch.as_tensor(arr)
+            if t.ndim == 2:  # 灰度 -> 3 通道
+                t = t.unsqueeze(-1).repeat(1, 1, 3)
+            if t.shape[-1] in (1, 3, 4):  # HWC -> CHW，丢掉 alpha
+                t = t[..., :3].permute(2, 0, 1)
+            t = t.to(device=device, dtype=torch.float32)
+            if float(t.max()) > 1.5:  # uint8 / [0,255] -> [0,1]
+                t = t / 255.0
+            t = F.interpolate(
+                t.unsqueeze(0), size=(self.image_size, self.image_size), mode="bilinear", align_corners=False, antialias=True
+            )
+            tensors.append(t)
+        x = torch.cat(tensors, dim=0)
+        x = (x - self._imagenet_mean.to(device)) / self._imagenet_std.to(device)
+        return x
+    ######### // code // ##########
+
     def prepare_dino_input(self, img_list: Sequence[Sequence[Image.Image]]) -> torch.Tensor:
         with ThreadPoolExecutor() as executor:
             image_tensors = torch.stack(
@@ -144,4 +260,3 @@ class DINOv3Backbone(nn.Module):
         image_tensors = image_tensors.view(bsz * num_view, channels, height, width)
         return image_tensors.to(next(self.parameters()).device)
 ######### // code // ##########
-

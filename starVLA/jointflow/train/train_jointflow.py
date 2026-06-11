@@ -322,7 +322,7 @@ def build_component_parameter_table(model) -> list[dict]:
         )
     components = [
         ("llm_text_encoder", backbone, llm_note),
-        ("dino_encoder", getattr(model, "dino", None), "Live DINOv3; zero means training reads offline latents"),
+        ("dino_encoder", getattr(model, "dino", None), "Frozen online DINOv3 (in-model feature extraction); not optimized"),
         ("dino_projector", getattr(model, "dino_proj", None), "DINO 384-dim tokens to Qwen hidden size"),
         ("state_encoder", getattr(model, "state_enc", None), "Current proprio state to state token"),
         ("action_context_encoder", getattr(model, "act_ctx", None), "Clean action chunk to context tokens for FDM"),

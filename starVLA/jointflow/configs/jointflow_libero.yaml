@@ -16,17 +16,23 @@ framework:
     vl_hidden_dim: 896
     max_text_length: 256
   dino:
+    # 中文注释：在线 DINO（训练时在模型内对原始图像在线提特征，不再离线预计算）。
+    # model_size：一处指定尺寸（vits16/vitb16/vitl16/vith16plus/vit7b16，或简写 s/b/l），
+    #   自动同步 name/hf_model_id/embed_dim/patch_size 以及 visual head 的 d_dino。
+    # weights：本地离线 ckpt 地址——torch.hub 的 .pth 权重文件，或 HF 快照目录；
+    #   DINOv3 权重 gated / 集群不联网时必填。
+    model_size: vits16
     name: dinov3_vits16
     hf_model_id: facebook/dinov3-vits16-pretrain-lvd1689m
     repo_or_dir: facebookresearch/dinov3
-    weights: null
-    loader: auto
+    weights: null              # 例：/path/to/dinov3_vits16_pretrain_lvd1689m-xxxx.pth 或 HF 快照目录
+    loader: auto               # auto | torchhub | hf
     image_size: 224
     patch_size: 16
     embed_dim: 384
     future_view_keys: ["video.primary_image", "observation.images.image", "primary_image", "agentview"]
-    stats_path: null
-    load_live_backbone: false
+    stats_path: null           # 可选：DINO 特征 per-channel 标准化 stats；缺省用 DINOv3 自带 LayerNorm 后特征
+    load_live_backbone: true    # 在线模式必须 true：训练 forward 在 GPU 上跑 frozen DINO
     dino_pool: 1
   state:
     inject_mode: token
@@ -92,10 +98,14 @@ datasets:
     # 已是相对量时用 abs 透传，与 starvla_cotrain_libero / FastUMI(action_mode=abs) 一致。改此项需重训。
     action_mode: abs
     action_horizon: 8
+    # 中文注释：online_dino=true → dataloader 返回原始图像 image_0/image_1（video delta=[0,future_stride]），
+    # DINO 在模型 forward 内在线提特征。=false 则回退“离线读取预计算 latent”旧路径（需 dino_feature_* 配置）。
+    online_dino: true
     world_model:
       future_stride: 8
     sequential_step_sampling: false
     include_state: true
+    # 以下 dino_feature_* 仅在 online_dino=false（离线模式）下生效。
     dino_feature_dir: latents
     dino_feature_layout: lingbot_episode
     dino_episode_cache_size: 2
@@ -109,6 +119,7 @@ datasets:
     persistent_workers: true
 
 trainer:
+  resume_from: Z_ws/jointflow_libero_object/checkpoints_all/state_steps_5000
   max_train_steps: 50000
   num_warmup_steps: 500
   save_interval: 5000
