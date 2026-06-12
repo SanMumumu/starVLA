@@ -1,0 +1,171 @@
+# 中文注释（CED C6）：CED 实验基配置 = jointflow_libero_highscore_b24 + CED 增量节点。
+# 默认值即 E2.1（effect 任务开、lam_i=0.1、lam_a=0）；其余实验臂用 --key=value dotlist 覆盖
+# （裸 key=value 会被 normalize_dotlist_args 静默丢弃，务必带 --）。
+# 训练配方（用户拍板）：libero_all + 100k 步；E1.0 锚点用 highscore_b24 同步数重跑。
+run_id: qwen_jointflow_libero_ced
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_jointflow
+seed: 42
+wandb_entity: sanmumumu
+wandb_project: starVLA_JointFlow
+is_debug: false
+version_id: "0.22-ced"
+
+framework:
+  name: QwenJointFlow
+  qwenvl:
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen2.5-0.5B
+    attn_implementation: eager
+    torch_dtype: float32
+    fp32_forward: true
+    vl_hidden_dim: 896
+    max_text_length: 256
+  dino:
+    name: dinov3_vits16
+    hf_model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+    # 中文注释：集群无外网——repo/权重全部指 bucket 本地路径（torch.hub source=local /
+    # HF snapshot 目录 AutoModel），杜绝 torch.hub/HF 联网。训练走离线 latents 时根本不加载
+    # DINO，这两项是"个别数据集缺 latents 回退在线"与 eval 端的兜底。
+    repo_or_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/dinov3_repo
+    weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/dinov3-vits16-pretrain-lvd1689m/
+    loader: auto
+    image_size: 224
+    patch_size: 16
+    embed_dim: 384
+    future_view_keys: ["video.primary_image", "observation.images.image", "primary_image", "agentview"]
+    stats_path: null
+    load_live_backbone: false
+    dino_pool: 1
+  state:
+    inject_mode: token
+    n_state_tokens: 1
+    state_dim: 8
+  # 中文注释（CED）：机制超参。enabled=false 时 probe/proj 不构造、effect 任务不可用，
+  # 旧 config/ckpt 行为零影响。
+  ced:
+    enabled: true
+    tau: 1.0                 # Δ 池化 softmax 温度
+    eps_gate: 1.0e-3         # loss_align 的 per-sample gate：‖t_vec‖ 低于此视为噪声、不蒸馏
+    probe_hidden: 512        # probe MLP 隐层
+    probe_val_mod: 10        # trajectory_id % N == 0 → probe 验证集（按轨迹切分防泄露）
+  losses:
+    lam_i: 0.1               # loss_ident 权重（可辨识性引擎）
+    lam_a: 0.0               # loss_align 权重（Phase 3 前恒为 0——杀手#4）
+    teacher: delta           # delta | pooled_future | delta_shuffled
+    effect_delta_prob: 1.0   # Δ 段子采样概率（降本钩子，紧张时 0.5）
+  tasks:
+    hybrid_mask: true
+    attention_mask_neg_value: -1.0e4
+    weights:
+      policy: 1.0
+      effect: 0.5            # 替换 fdm（fdm 代码路径保留，权重 0 即弃用）
+      fdm: 0.0
+      idm: 0.25
+      passive: 0.0
+  action_model:
+    action_model_type: DiT-B
+    hidden_size: 1024
+    action_dim: 7
+    state_dim: 0
+    # 中文注释：libero_all 动作 horizon 用 8（用户拍板，匹配 Libero4in1DataConfig 的 action_indices）；
+    # 动作去噪 10 步（性能更好）。E1.0 锚点（highscore 配方）经 e102 的 OVERRIDES 对齐同款。
+    action_horizon: 8
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_inference_timesteps: 10
+    num_target_vision_tokens: 8
+    repeated_diffusion_steps: 1
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    diffusion_model_cfg:
+      cross_attention_dim: 896
+      dropout: 0.1
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 24
+      num_attention_heads: 12
+      attention_head_dim: 64
+      output_dim: 768
+      positional_embeddings: null
+  visual_model:
+    d_dino: 384
+    n_query: 196
+    max_image_queries: 256
+    hidden_size: 1024
+    cross_attention_dim: 896
+    num_attention_heads: 16
+    attention_head_dim: 64
+    num_layers: 12
+    dropout: 0.1
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_inference_timesteps: 6
+    patch_weighting: change  # 中文注释（CED C3）：none|change，fdm/effect 共用
+
+datasets:
+  vla_data:
+    dataset_py: jointflow
+    data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero
+    data_mix: libero_all
+    action_type: delta_qpos
+    # 中文注释：LIBERO lerobot action 本身是 delta 控制量，必须 abs 透传（v1 血泪教训，改此项需重训）。
+    # CED 的 a₀ 语义（平动维 raw 0 = 原地不动）同样依赖该 delta 性质。
+    action_mode: abs
+    action_horizon: 8
+    world_model:
+      future_stride: 8
+    sequential_step_sampling: false
+    include_state: true
+    # 中文注释（坑）：online_dino 这个键**缺省值是 true**（在线模式：dataset 出 image_0/image_1，
+    # framework 前向里现场加载 DINO → 集群无外网直接崩，latents 再全也不会被读）。
+    # 显式 auto = 全部数据集存在维度匹配(384)的离线 latents 才走离线，否则整体在线。
+    # LIBERO 四个数据集 bucket 上 latents 齐全 → 实际解析为 OFFLINE，训练零 DINO 依赖。
+    online_dino: auto
+    dino_feature_dir: latents
+    dino_feature_layout: lingbot_episode
+    dino_episode_cache_size: 2
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task."
+    per_device_batch_size: 4
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+    num_workers: 4
+    prefetch_factor: 2
+    pin_memory: true
+    persistent_workers: true
+
+trainer:
+  max_train_steps: 100000
+  num_warmup_steps: 1000
+  save_interval: 5000
+  eval_interval: 500
+  learning_rate:
+    base: 2.0e-04
+    backbone: 2.0e-05
+    dino_proj: 2.0e-04
+    act_ctx: 2.0e-04
+    state_enc: 2.0e-04
+    action_queries: 2.0e-04
+    future_dino_queries: 2.0e-04
+    action_head: 2.0e-04
+    visual_head: 2.0e-04
+    probe_mlp: 2.0e-04
+    proj_A: 2.0e-04
+  lr_scheduler_type: constant_with_warmup
+  scheduler_specific_kwargs: {}
+  freeze_modules: ""
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  task_loss_ema_beta: 0.98
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 0.0

@@ -20,13 +20,17 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-import wandb
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.utils import DistributedDataParallelKwargs, set_seed
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from starVLA.jointflow.data.joint_dataset import build_joint_dataloader
+from starVLA.jointflow.data.joint_dataset import build_joint_dataloader, compute_null_action_table
+# 中文注释：wandb 上行不稳 → 默认 SwanLab（调用面兼容 init/log/finish/run.summary）；
+# JOINTFLOW_LOGGER=wandb 可切回。指标字段名全部不变。
+from starVLA.jointflow.train.track_logger import get_tracker
+
+wandb = get_tracker()
 import starVLA.jointflow.framework.qwen_joint_flow  # noqa: F401 - 注册 QwenJointFlow
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
@@ -681,6 +685,13 @@ class JointFlowTrainer(TrainerUtils):
         }
         if grad_norm_value is not None:
             metrics["grad_norm"] = grad_norm_value
+        # 中文注释（CED C4）：framework forward 返回的子指标（loss/act、loss/ident、
+        # metric/probe_mse_val、stat/* 等标量）全部透传给 wandb；key 即 wandb 字段名。
+        for key, value in output.items():
+            if key == f"{task}_loss":
+                continue
+            if torch.is_tensor(value) and value.numel() == 1:
+                metrics[key] = float(value.detach().cpu())
         total_task_samples = max(sum(self.task_counts.values()), 1)
         for name in self.sampler.tasks:
             metrics[f"task_sampled/{name}"] = 1.0 if name == task else 0.0
@@ -932,6 +943,14 @@ def main(cfg):
     setup_rank_output_control(cfg)
     model = build_framework(cfg)
     dataloader = build_joint_dataloader(cfg)
+    # 中文注释（CED C2）：effect 任务需要"归一化空间的空动作"查表（per-dataset 常数），
+    # 从 dataloader 持有的 mixture 数据集的活 Normalizer 上算出并注入 model。
+    ced_cfg = cfg.framework.get("ced", None)
+    if ced_cfg is not None and bool(ced_cfg.get("enabled", False)):
+        null_table = compute_null_action_table(dataloader.dataset)
+        model.set_null_action_table(null_table)
+        if accelerator.is_main_process:
+            print(f"[jointflow][ced] null-action table ready for datasets: {sorted(null_table)}", flush=True)
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model, cfg)
     trainer = JointFlowTrainer(cfg, model, dataloader, optimizer, lr_scheduler, accelerator)
     trainer.prepare_training()

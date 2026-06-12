@@ -136,7 +136,7 @@ def resolve_server_for_client(
 
 
 ######### // code // ##########
-# 中文注释：命令行入口，供 eval_aidi.sh 调用。
+# 中文注释：命令行入口，供 aidi/eval/run_*_aidi.sh 调用。
 # - ip                                  打印本节点可路由 IP。
 # - publish --rdv_dir D --base_port P --num_servers N [--host H]
 #                                       发布 servers.json（host 默认本机 IP，端口 P..P+N-1）。

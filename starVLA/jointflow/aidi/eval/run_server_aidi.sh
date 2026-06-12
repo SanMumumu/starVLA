@@ -3,7 +3,7 @@
 # 只改这里的 CKPT；client 脚本里必须填同一个 CKPT。
 set -euo pipefail
 
-cd "$(dirname "$0")/../../.."
+cd "$(dirname "$0")/../../../.."
 test -f pyproject.toml || { echo "ERROR: not in StarVLA repo root: $PWD"; exit 1; }
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1

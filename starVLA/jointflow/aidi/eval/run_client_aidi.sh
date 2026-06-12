@@ -3,7 +3,7 @@
 # object ckpt 默认只测 libero_object；CKPT 必须和 server 脚本一致。
 set -euo pipefail
 
-cd "$(dirname "$0")/../../.."
+cd "$(dirname "$0")/../../../.."
 test -f pyproject.toml || { echo "ERROR: not in StarVLA repo root: $PWD"; exit 1; }
 export PYTHONPATH="${PWD}${LIBERO_HOME:+:${LIBERO_HOME}}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1

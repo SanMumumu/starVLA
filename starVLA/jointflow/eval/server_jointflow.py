@@ -9,7 +9,7 @@
 JointFlow 版（其内部会注册 QwenJointFlow framework、归一化 state、加载 live DINO）。
 server 绑定 0.0.0.0，因此跨机时 client 用 server 节点 IP:port 即可连接。
 
-server 发现（rendezvous）由上层 AIDI 入口 eval_aidi/run_server_aidi.sh 负责发布
+server 发现（rendezvous）由上层 AIDI 入口 aidi/eval/run_server_aidi.sh 负责发布
 （调用 starVLA.jointflow.eval.rendezvous publish），本入口只管单个 server 进程。
 """
 

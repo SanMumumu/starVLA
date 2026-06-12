@@ -56,6 +56,7 @@ from starVLA.jointflow.modules.joint_modules import (
     FutureDinoQueryTokenBank,
     StateEncoder,
 )
+from starVLA.jointflow.modules.ced_probe import CedProbeMLP, CedProjA
 from starVLA.jointflow.modules.visual_dino_flow_head import VisualFlowMatchingHead
 from starVLA.jointflow.patches.qwen2_text_patch import apply_qwen2_text_block_mask_patch
 from starVLA.jointflow.data.mix_registry import resolve_data_mix
@@ -204,11 +205,27 @@ class QwenJointFlowVLA(baseframework):
 
         self.action_head = FlowmatchingActionHead(self.config)
         self.visual_head = VisualFlowMatchingHead(self.config)
+        # 中文注释（CED C5）：probe / 对齐投影仅在 ced.enabled 时构造，
+        # 旧 config/ckpt 的参数集合与严格加载完全不受影响。
+        ced_cfg = self.config.framework.get("ced", None)
+        self.ced_enabled = bool(ced_cfg.get("enabled", False)) if ced_cfg is not None else False
+        self.probe_mlp = None
+        self.proj_A = None
+        if self.ced_enabled:
+            self.probe_mlp = CedProbeMLP(
+                d_in=self.d_dino,
+                hidden=int(ced_cfg.get("probe_hidden", 512)),
+                d_out=self.action_horizon * self.action_dim,
+            )
+            self.proj_A = CedProjA(d_in=hidden_size, d_out=self.d_dino)
         # 中文注释：在线模式默认 load_live_backbone=true，构造时即加载 frozen DINOv3；
         # __init__ 阶段不 .to(device)，随整模型 .to() 一起搬。requires_grad=False，不进优化器更新。
         self.dino = None
         if bool(dino_cfg.get("load_live_backbone", False)):
             self.dino = DINOv3Backbone(**self._dino_spec)
+
+        # 中文注释（CED C2）：空动作查表，trainer 启动时注入（仅 effect 任务需要）。
+        self._null_action_table: dict[str, torch.Tensor] = {}
 
         self.register_buffer("_dino_mean", torch.zeros(self.d_dino), persistent=False)
         self.register_buffer("_dino_std", torch.ones(self.d_dino), persistent=False)
@@ -235,11 +252,15 @@ class QwenJointFlowVLA(baseframework):
     def _unused_task_param_anchor(self, task: str, ref: torch.Tensor) -> torch.Tensor:
         modules: list[nn.Module | None] = []
         if task in {"policy", "idm"}:
-            modules.extend([self.visual_head, self.future_dino_queries, self.act_ctx])
+            modules.extend([self.visual_head, self.future_dino_queries, self.act_ctx, self.probe_mlp, self.proj_A])
         elif task == "fdm":
-            modules.extend([self.action_head, self.action_queries])
+            modules.extend([self.action_head, self.action_queries, self.probe_mlp, self.proj_A])
         elif task == "passive":
-            modules.extend([self.action_head, self.action_queries, self.act_ctx])
+            modules.extend([self.action_head, self.action_queries, self.act_ctx, self.probe_mlp, self.proj_A])
+        elif task == "effect":
+            # 中文注释（CED C7）：effect 同时走 policy+fdm⁺/fdm⁰+probe/proj，全部模块在用；
+            # Δ 段被 effect_delta_prob 跳过时由 _effect_forward 局部对 probe/proj 挂 anchor。
+            pass
         else:
             raise ValueError(f"Unsupported JointFlow task `{task}`")
         if self.state_inject_mode != "token":
@@ -263,6 +284,8 @@ class QwenJointFlowVLA(baseframework):
             self.future_dino_queries,
             self.action_head,
             self.visual_head,
+            self.probe_mlp,
+            self.proj_A,
         ]
         return self._zero_grad_anchor_for_modules(modules, ref)
     ######### // code // ##########
@@ -545,6 +568,51 @@ class QwenJointFlowVLA(baseframework):
             batch["future_valid"] = torch.ones(len(examples), device=self.device, dtype=torch.float32)
         return batch
 
+    ######### // code // ##########
+    # 中文注释（CED C2）：归一化空间的空动作 a₀。
+    # 表由 trainer 启动时经 joint_dataset.compute_null_action_table 注入：
+    #   - 数值维 = 该数据集 raw 0 的归一化常数（"原地不动"，LIBERO delta 语义）；
+    #   - NaN 维（无归一化的 gripper）= 复制 batch 动作首步（raw 空间"保持首步指令"的等价物）。
+    # 查不到数据集名直接 raise——静默回退会让 Δ 失去因果语义。
+    def set_null_action_table(self, table: dict) -> None:
+        self._null_action_table = {
+            str(name): torch.as_tensor(np.asarray(vec), dtype=torch.float32) for name, vec in table.items()
+        }
+
+    def make_null_action(self, action: torch.Tensor, examples: List[dict]) -> torch.Tensor:
+        bsz, horizon, dim = action.shape
+        bases = []
+        for ex in examples:
+            name = str(ex.get("dataset_name", ""))
+            if name not in self._null_action_table:
+                raise KeyError(
+                    f"[CED] dataset `{name}` missing from null-action table "
+                    f"(have: {sorted(self._null_action_table)}); call set_null_action_table at startup."
+                )
+            base = self._null_action_table[name]
+            if base.shape[0] != dim:
+                raise ValueError(f"[CED] null-action dim mismatch for `{name}`: table {base.shape[0]} vs action {dim}")
+            bases.append(base)
+        bases = torch.stack(bases).to(device=action.device, dtype=action.dtype)  # [B,D]
+        nan_mask = torch.isnan(bases).unsqueeze(1).expand(bsz, horizon, dim)
+        null = bases.unsqueeze(1).expand(bsz, horizon, dim).clone()
+        first = action[:, :1, :].expand(bsz, horizon, dim)
+        null[nan_mask] = first[nan_mask]
+        return null
+
+    # 中文注释（CED C3）：change-based 逐 patch 权重 w=‖z_H−z_t‖₂（均在 dino-stats 归一化空间），
+    # 按 batch 内每样本均值归一再 clamp[0.1,10]，全程 no_grad（权重不回传）。
+    # 返回 (weights[B,N], clamp 触发率标量)。
+    @staticmethod
+    def _change_weights(z_t: torch.Tensor, z_h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        with torch.no_grad():
+            w = (z_h.float() - z_t.float()).norm(dim=-1)
+            w = w / w.mean(dim=1, keepdim=True).clamp_min(1e-8)
+            clamped = w.clamp(0.1, 10.0)
+            clamp_frac = (w != clamped).float().mean()
+        return clamped, clamp_frac
+    ######### // code // ##########
+
     def _future_valid_mask(self, batch: dict, cond: torch.Tensor) -> torch.Tensor:
         valid = batch.get("future_valid", None)
         if valid is None:
@@ -633,7 +701,33 @@ class QwenJointFlowVLA(baseframework):
         )
         return inputs_embeds, attn4d, position_ids, query_slice, block_names, block_sizes
 
+    ######### // code // ##########
+    # 中文注释（CED）：一次"组装→backbone→取 query 段"的完整路径，policy/fdm 复用。
+    # batch["action"] 换成 a₀ 再调本函数即得 fdm⁰ 分支（参数全共享）。
+    def _run_path(self, task: str, batch: dict) -> torch.Tensor:
+        inputs_embeds, attn4d, position_ids, query_slice, _, _ = self._assemble_sequence(task, batch)
+        hidden = self.backbone(inputs_embeds=inputs_embeds, attention_mask_4d=attn4d, position_ids=position_ids)
+        return hidden[:, query_slice].float()
+
+    # 中文注释（CED C3 日志）：按 ‖z_H−z_t‖ top-10% patch 把逐 patch loss 拆成 dynamic/static
+    # 两条曲线（机制读数：change 加权生效 ⇒ dynamic 占比上升）。全程 no_grad。
+    @staticmethod
+    def _fdm_split_metrics(per_patch: torch.Tensor, z_t: torch.Tensor, z_h: torch.Tensor) -> dict:
+        with torch.no_grad():
+            change = (z_h.float() - z_t.float()).norm(dim=-1)
+            k = max(1, int(round(0.1 * change.shape[1])))
+            thresh = change.topk(k, dim=1).values[:, -1:]
+            dyn_mask = change >= thresh
+            out = {"loss/fdm_dynamic": per_patch[dyn_mask].mean().detach()}
+            out["loss/fdm_static"] = (
+                per_patch[~dyn_mask].mean().detach() if bool((~dyn_mask).any()) else per_patch.detach().mean() * 0.0
+            )
+        return out
+    ######### // code // ##########
+
     def forward(self, examples: List[dict] = None, task: str = "policy", **kwargs) -> dict:
+        if task == "effect":
+            return self._effect_forward(examples)
         batch = self._examples_to_batch(
             examples,
             require_future_dino=task in {"fdm", "idm", "passive"},
@@ -651,6 +745,7 @@ class QwenJointFlowVLA(baseframework):
         cond = hidden[:, query_slice].float()
         self._assert_finite("cond", cond, task, batch["examples"])
 
+        extras: dict = {}
         if task in {"policy", "idm"}:
             actions = batch["action"]
             if actions is None:
@@ -687,9 +782,153 @@ class QwenJointFlowVLA(baseframework):
                 return {f"{task}_loss": loss + self._all_trainable_anchor(loss)}
             cond = cond[valid_mask]
             target = target[valid_mask]
-            loss = self.visual_head(cond, target)
+            # 中文注释（CED C3）：patch_weighting=change 时按 ‖z_H−z_t‖ 加权逐 patch loss，
+            # 并按 top-10% 变化 patch 拆 static/dynamic 两条日志（直接用逐 patch loss，无额外前向）。
+            # z_t 取与 future 目标同一视角：_select_future_dino 的视角选择对 dino_0/dino_1 同源可复用。
+            if str(self.config.framework.visual_model.get("patch_weighting", "none")) == "change":
+                z_t = self._select_future_dino(batch["dino_0"], batch["examples"]).to(target.device, torch.float32)
+                z_t = z_t[valid_mask]
+                weights, clamp_frac = self._change_weights(z_t, target)
+                loss, _, per_patch = self.visual_head(cond, target, weights=weights, return_pred=True)
+                extras.update(self._fdm_split_metrics(per_patch, z_t, target))
+                extras["stat/w_clamp_frac"] = clamp_frac.detach()
+            else:
+                loss = self.visual_head(cond, target)
         self._assert_finite(f"{task}.loss", loss, task, batch["examples"])
-        return {f"{task}_loss": loss + self._unused_task_param_anchor(task, loss)}
+        out = {f"{task}_loss": loss + self._unused_task_param_anchor(task, loss)}
+        out.update(extras)
+        return out
+
+    ######### // code // ##########
+    # 中文注释（CED C4）：effect 任务 = 同批样本 3 次 backbone 前向（policy / fdm⁺ / fdm⁰）。
+    # Δ = v̂(cond⁺) − v̂(cond⁰)：两次 visual head 调用共享 (noise=ε, t=0)，t=0 端 v̂=Ê[z_H|cond]−ε，
+    # 配对相减恰好消去 ε，得到条件均值差（interventional 信号）。Δ 段强制：
+    #   - fp32（visual head 内部已 opt-out autocast，bf16 会让大共享量的小差分灾难性抵消）；
+    #   - visual head 临时 eval()（关 dropout——两支必须共享全部随机性，否则 Δ 被 dropout 噪声污染；
+    #     eval 只关 dropout，梯度照常穿透两支）。
+    # 四个 loss：act（policy 全 batch）+ fdm（change 加权，随机 t）+ λ_i·ident（probe 从 Δ 回归 a）
+    # + λ_a·align（detach 的 teacher 对齐 policy 池化表征；λ_a=0 时仍前向以保证 DDP 参数 ready）。
+    # CED §7 红线：null 分支上不挂任何 flow loss（会重训 marginal、抹平 Δ）。
+    def _effect_forward(self, examples: List[dict]) -> dict:
+        if not self.ced_enabled:
+            raise ValueError("task=effect requires framework.ced.enabled=true")
+        batch = self._examples_to_batch(examples, require_future_dino=True, require_action=True)
+        self._assert_finite("batch.dino_0", batch.get("dino_0"), "effect", batch["examples"])
+        self._assert_finite("batch.dino_1", batch.get("dino_1"), "effect", batch["examples"])
+        self._assert_finite("batch.action", batch.get("action"), "effect", batch["examples"])
+        self._assert_finite("batch.state", batch.get("state"), "effect", batch["examples"])
+
+        fw = self.config.framework
+        ced_cfg = fw.ced
+        losses_cfg = fw.get("losses", {})
+        lam_i = float(losses_cfg.get("lam_i", 0.1))
+        lam_a = float(losses_cfg.get("lam_a", 0.0))
+        teacher = str(losses_cfg.get("teacher", "delta"))
+        delta_prob = float(losses_cfg.get("effect_delta_prob", 1.0))
+        tau = float(ced_cfg.get("tau", 1.0))
+        eps_gate = float(ced_cfg.get("eps_gate", 1.0e-3))
+        val_mod = int(ced_cfg.get("probe_val_mod", 10))
+
+        # ---- (0) policy 路径：effect 样本也喂 policy（loss_act 用全 batch，不受 future_valid 限制）----
+        h_act = self._run_path("policy", batch)
+        target_action = batch["action"][:, -self.action_horizon :, : self.action_dim].float()
+        device_type = h_act.device.type
+        ac = torch.autocast(device_type=device_type, enabled=False) if device_type in {"cuda", "cpu"} else nullcontext()
+        with ac:
+            loss_act = self.action_head(h_act.float(), target_action, state=None, encoder_attention_mask=None)
+        extras: dict = {"loss/act": loss_act.detach()}
+
+        valid_mask = self._future_valid_mask(batch, h_act)
+        if not bool(valid_mask.any()):
+            # 中文注释：本 rank future 全无效 → 只训 loss_act，其余参数 full anchor（DDP ready 一致）。
+            total = loss_act
+            out = {"effect_loss": total + self._all_trainable_anchor(total)}
+            out.update(extras)
+            return out
+
+        # ---- fdm⁺ / fdm⁰：换 batch["action"]=a₀ 走同一条组装路径，参数全共享 ----
+        cond_pos = self._run_path("fdm", batch)
+        batch_nul = dict(batch)
+        batch_nul["action"] = self.make_null_action(batch["action"], batch["examples"])
+        cond_nul = self._run_path("fdm", batch_nul)
+
+        z_h = self._select_future_dino(batch["dino_1"], batch["examples"]).to(cond_pos.device, torch.float32)
+        z_t = self._select_future_dino(batch["dino_0"], batch["examples"]).to(cond_pos.device, torch.float32)
+        cond_pos_v = cond_pos[valid_mask]
+        cond_nul_v = cond_nul[valid_mask]
+        z_h_v = z_h[valid_mask]
+        z_t_v = z_t[valid_mask]
+        h_act_v = h_act[valid_mask]
+        a_v = target_action[valid_mask]
+        examples_v = [ex for ex, keep in zip(batch["examples"], valid_mask.tolist()) if keep]
+
+        # ---- (A) 加权主 FDM（内部随机 t；只挂在 cond⁺ 上，null 分支零 flow loss）----
+        weights = None
+        if str(fw.visual_model.get("patch_weighting", "none")) == "change":
+            weights, clamp_frac = self._change_weights(z_t_v, z_h_v)
+            extras["stat/w_clamp_frac"] = clamp_frac.detach()
+        loss_fdm, _, per_patch = self.visual_head(cond_pos_v, z_h_v, weights=weights, return_pred=True)
+        extras["loss/fdm"] = loss_fdm.detach()
+        extras.update(self._fdm_split_metrics(per_patch, z_t_v, z_h_v))
+
+        # ---- (B)(C)(D) Δ 段（可按 effect_delta_prob 子采样降本；跳过时挂局部 anchor 保 DDP）----
+        do_delta = delta_prob >= 1.0 or bool(torch.rand(()).item() < delta_prob)
+        if do_delta:
+            eps = torch.randn_like(z_h_v)
+            was_training = self.visual_head.training
+            self.visual_head.eval()
+            _, v_pos, _ = self.visual_head(cond_pos_v, z_h_v, noise=eps, t=0.0, return_pred=True)
+            _, v_nul, _ = self.visual_head(cond_nul_v, z_h_v, noise=eps, t=0.0, return_pred=True)
+            if was_training:
+                self.visual_head.train()
+            delta = (v_pos.float() - v_nul.float())  # 保留梯度，穿透两支
+            pool_w = torch.softmax(delta.norm(dim=-1) / max(tau, 1e-6), dim=1)
+            d_vec = (delta * pool_w.unsqueeze(-1)).sum(dim=1)  # [B_v, d_dino]
+            extras["stat/delta_norm_mean"] = d_vec.detach().norm(dim=-1).mean()
+
+            # (C) 可辨识性引擎：probe 从 Δ 回归动作；验证集按轨迹划分（防泄露），只出指标不进 loss
+            a_flat = a_v.reshape(a_v.shape[0], -1)
+            probe_pred = self.probe_mlp(d_vec)
+            is_val = torch.tensor(
+                [int(ex.get("trajectory_id", -1)) % val_mod == 0 for ex in examples_v],
+                device=d_vec.device,
+                dtype=torch.bool,
+            )
+            if bool((~is_val).any()):
+                loss_ident = ((probe_pred[~is_val] - a_flat[~is_val]) ** 2).mean()
+            else:
+                loss_ident = self._zero_grad_anchor_for_modules([self.probe_mlp], loss_fdm)
+            if bool(is_val.any()):
+                with torch.no_grad():
+                    extras["metric/probe_mse_val"] = ((probe_pred[is_val] - a_flat[is_val]) ** 2).mean()
+            extras["loss/ident"] = loss_ident.detach()
+
+            # (D) 蒸馏：teacher 一律 detach；gate 把 Δ 仍是噪声的样本挡在外面（杀手#4 的 per-sample 保险）
+            if teacher == "delta":
+                t_vec = d_vec.detach()
+            elif teacher == "pooled_future":
+                pw = torch.softmax(v_pos.float().norm(dim=-1) / max(tau, 1e-6), dim=1)
+                t_vec = (v_pos.float() * pw.unsqueeze(-1)).sum(dim=1).detach()
+            elif teacher == "delta_shuffled":
+                t_vec = d_vec[torch.randperm(d_vec.shape[0], device=d_vec.device)].detach()
+            else:
+                raise ValueError(f"Unsupported CED teacher `{teacher}`")
+            gate = (t_vec.norm(dim=-1) > eps_gate).float()
+            proj = self.proj_A(h_act_v.mean(dim=1))
+            cos = torch.nn.functional.cosine_similarity(proj.float(), t_vec, dim=-1)
+            loss_align = (gate * (1.0 - cos)).mean()
+            extras["loss/align"] = loss_align.detach()
+            extras["stat/gate_on_frac"] = gate.detach().mean()
+        else:
+            loss_ident = self._zero_grad_anchor_for_modules([self.probe_mlp, self.proj_A], loss_fdm)
+            loss_align = loss_fdm.new_zeros(())
+
+        total = loss_act + loss_fdm + lam_i * loss_ident + lam_a * loss_align
+        self._assert_finite("effect.loss", total, "effect", batch["examples"])
+        out = {"effect_loss": total + self._unused_task_param_anchor("effect", total)}
+        out.update(extras)
+        return out
+    ######### // code // ##########
 
     def compute_loss(self, tag: str, batch, loss_scale: dict = None):
         if tag != "vla":

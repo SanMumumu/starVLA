@@ -10,8 +10,8 @@ REQUIRED:
   WORKER_MAX_NUM: 1
   GPU_PER_WORKER: 8
 
-  # 集群路径：~/aidi_jobs/starvla_dev/starVLA/starVLA/jointflow/eval_aidi/run_client_aidi.sh
-  RUN_SCRIPTS: "${WORKING_PATH}/starVLA/starVLA/jointflow/eval_aidi/run_client_aidi.sh"
+  # 集群路径：~/aidi_jobs/starvla_dev/starVLA/starVLA/jointflow/aidi/eval/run_client_aidi.sh
+  RUN_SCRIPTS: "${WORKING_PATH}/starVLA/starVLA/jointflow/aidi/eval/run_client_aidi.sh"
 
 OPTIONAL:
   FRAMEWORK: "pytorch"
