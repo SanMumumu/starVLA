@@ -1,0 +1,143 @@
+run_id: triflow_libero_object
+run_root_dir: playground/Debug_Checkpoints
+seed: 42
+wandb_entity: sanmumumu
+wandb_project: starVLA_TriFlow
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: TriFlow
+  # 单塔 from-scratch transformer（零 LLM/VLM；双向 SDPA + 4D additive mask；全程 fp32）
+  tower:
+    hidden_size: 768
+    depth: 12
+    num_heads: 12
+    mlp_ratio: 4.0
+    qk_norm: true
+    dropout: 0.0
+  # 语言模态：只用 BPE 分词文件 + 从头学的 embedding 表（紧凑词表）
+  text:
+    tokenizer_path: playground/Pretrained_models/Qwen2.5-0.5B
+    vocab_mode: compact            # compact | full
+    vocab_map_path: playground/Pretrained_models/triflow_assets/vocab_map_libero.json
+    d_text: 256
+    max_len: 32
+  # 视觉模态：冻结 DINOv3-S（训练读离线 latents；eval server live 提特征）
+  dino:
+    name: dinov3_vits16
+    hf_model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+    repo_or_dir: facebookresearch/dinov3
+    weights: null
+    loader: auto
+    image_size: 224
+    patch_size: 16
+    embed_dim: 384
+    n_patches: 196
+    future_view_keys: ["video.primary_image", "observation.images.image", "primary_image", "agentview"]
+    stats_path: null
+    load_live_backbone: false
+  # 动作模态（节点名保留 action_model：PolicyServerWrapper 靠它探测 chunk size）
+  action_model:
+    action_horizon: 8
+    action_dim: 7
+  # ELF 配方 flow matching（t=1 干净；网络预测 x0 → v=(x0_pred-z)/max(1-t,t_eps)）
+  flow:
+    t_eps: 0.05
+    denoiser_p_mean: -1.5
+    denoiser_p_std: 0.8
+    noise_scale:
+      vision: 2.0
+      text: 2.0
+      action: 1.0
+    decoder_prob: 0.2              # L 为目标时：20% 概率走解码 CE 分支（ELF 双分支）
+    decoder_p_mean: 0.8
+    decoder_p_std: 0.8
+    decoder_noise_scale: 2.0
+    self_conditioning: false       # MVP 关；留开关
+  losses:
+    modality_weights:
+      a: 1.0
+      l: 1.0
+      vf: 1.0
+  sampling:
+    method: ode                    # ode | sde
+    sde_gamma: 1.0
+    num_steps:
+      action: 16
+      text: 32
+      future: 32
+      joint: 32
+  # 任务注册表：cond=干净块集合，target=加噪块集合；块名 ∈ {v, l, a, vf}
+  tasks:
+    attention_mask_neg_value: -1.0e4
+    specs:
+      policy:  {cond: [v, l],    target: [a]}
+      v2l:     {cond: [v],       target: [l]}
+      fdm:     {cond: [v, l, a], target: [vf]}
+      passive: {cond: [v],       target: [vf]}
+      idm:     {cond: [v, vf],   target: [a]}
+      joint:   {cond: [v, l],    target: [a, vf]}
+    weights:
+      policy: 1.0
+      v2l: 0.5
+      fdm: 0.0
+      passive: 0.0
+      idm: 0.0
+      joint: 0.5
+  ema:
+    enabled: true
+    decay: 0.9999
+
+datasets:
+  vla_data:
+    dataset_py: jointflow              # 数据管线整体复用 jointflow v1（build_joint_dataloader）
+    data_root_dir: /mnt/hwdata/wangsen/starVLA/DATA/LEBERO/libero
+    data_mix: libero_all          # libero_all / libero_goal / libero_object /...
+    action_type: delta_qpos
+    # 中文注释：LIBERO 的 lerobot `action` 本身已是 delta 控制量，必须 abs 透传，
+    # 不能再用 action_mode=delta 二次差分（v1 血泪教训：roll→-π，eval 全 0% SR）。
+    action_mode: abs
+    action_horizon: 8
+    world_model:
+      future_stride: 8
+    sequential_step_sampling: false
+    include_state: false               # TriFlow：state 完全不输入
+    # 中文注释：v1 joint_dataset 2026-06-10 起默认 online_dino=true（返回原始图像 image_0/1）。
+    # TriFlow 走离线 latents 路径（dino_0/1），必须显式钉住 false。
+    online_dino: false
+    dino_feature_dir: latents
+    dino_feature_layout: lingbot_episode
+    dino_episode_cache_size: 2
+    per_device_batch_size: 32
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+    num_workers: 8
+    prefetch_factor: 2
+    pin_memory: true
+    persistent_workers: true
+
+trainer:
+  resume_from: null
+  max_train_steps: 60000
+  num_warmup_steps: 2000
+  save_interval: 5000
+  logging_frequency: 10
+  task_loss_ema_beta: 0.98
+  learning_rate:
+    base: 1.0e-04                      # from-scratch 单参数组
+  lr_scheduler_type: constant_with_warmup
+  scheduler_specific_kwargs: {}
+  freeze_modules: ""
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  gradient_checkpointing: false        # 88M fp32 小模型，无需
+  weight_decay: 0.0
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 0.0
