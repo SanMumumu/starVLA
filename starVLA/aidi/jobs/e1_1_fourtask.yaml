@@ -1,0 +1,28 @@
+#######
+# 中文注释：实验 e1_1_fourtask 的 AIDI 训练 job（零编辑提交，backbone 全量训不冻结）。科学定义见 aidi/experiments/e1_1_fourtask.sh。
+#######
+REQUIRED:
+  JOB_NAME: "jfced-e1-1-fourtask-8gpu"
+  JOB_PASSWD: "newk8s666"
+
+  UPLOAD_DIR: "/home/users/sen02.wang-labs/aidi_jobs/starvla_dev"
+  PROJECT_ID: "horizon-labs"
+
+  WORKER_MIN_NUM: 1
+  WORKER_MAX_NUM: 1
+  GPU_PER_WORKER: 8
+
+  RUN_SCRIPTS: "${WORKING_PATH}/starVLA/starVLA/aidi/run_aidi.sh e1_1_fourtask"
+
+OPTIONAL:
+  FRAMEWORK: "pytorch"
+  TASK_LABEL: "DEV"
+  PRIORITY: 5
+  DOCKER_IMAGE: "docker.hobot.cc/imagesys/starvla:v1.0"
+  WALL_TIME: 20000
+  JOB_TYPE: "train"
+  REMARK: "E1.1 four-task policy/fdm/idm/passive=1/.1/.1/.1, no CED"
+  DATA_SPACE:
+    DATA_TYPE: "dmp"
+    INPUT: "robot_lab"
+    OUTPUT: "robot_lab"

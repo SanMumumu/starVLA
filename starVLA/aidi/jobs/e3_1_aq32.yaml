@@ -1,0 +1,28 @@
+#######
+# 中文注释：实验 e3_1_aq32 的 AIDI 训练 job（零编辑提交，backbone 全量训不冻结）。科学定义见 aidi/experiments/e3_1_aq32.sh。
+#######
+REQUIRED:
+  JOB_NAME: "jfced-e3-1-aq32-8gpu"
+  JOB_PASSWD: "newk8s666"
+
+  UPLOAD_DIR: "/home/users/sen02.wang-labs/aidi_jobs/starvla_dev"
+  PROJECT_ID: "horizon-labs"
+
+  WORKER_MIN_NUM: 1
+  WORKER_MAX_NUM: 1
+  GPU_PER_WORKER: 8
+
+  RUN_SCRIPTS: "${WORKING_PATH}/starVLA/starVLA/aidi/run_aidi.sh e3_1_aq32"
+
+OPTIONAL:
+  FRAMEWORK: "pytorch"
+  TASK_LABEL: "DEV"
+  PRIORITY: 5
+  DOCKER_IMAGE: "docker.hobot.cc/imagesys/starvla:v1.0"
+  WALL_TIME: 20000
+  JOB_TYPE: "train"
+  REMARK: "E3.1 action query num=32 (E1.2 base, baseline aq=16)"
+  DATA_SPACE:
+    DATA_TYPE: "dmp"
+    INPUT: "robot_lab"
+    OUTPUT: "robot_lab"

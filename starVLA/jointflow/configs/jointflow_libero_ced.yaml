@@ -11,13 +11,14 @@ is_debug: false
 version_id: "0.22-ced"
 
 framework:
-  name: QwenJointFlow
+  # 中文注释：迁移后使用 qwen3vl-gr00t 原生 framework 注册名；JointFlow 逻辑由 jointflow.enabled 开关接入。
+  name: QwenGR00T
+  jointflow:
+    enabled: true
   qwenvl:
-    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen2.5-0.5B
-    attn_implementation: eager
-    torch_dtype: float32
-    fp32_forward: true
-    vl_hidden_dim: 896
+    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    attn_implementation: sdpa
+    vl_hidden_dim: 2048
     max_text_length: 256
   dino:
     name: dinov3_vits16
@@ -106,7 +107,7 @@ framework:
 
 datasets:
   vla_data:
-    dataset_py: jointflow
+    dataset_py: jointflow_lerobot
     data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero
     data_mix: libero_all
     action_type: delta_qpos
@@ -142,13 +143,13 @@ trainer:
   eval_interval: 500
   learning_rate:
     base: 2.0e-04
-    backbone: 2.0e-05
+    qwen_vl_interface: 2.0e-05
     dino_proj: 2.0e-04
     act_ctx: 2.0e-04
     state_enc: 2.0e-04
     action_queries: 2.0e-04
     future_dino_queries: 2.0e-04
-    action_head: 2.0e-04
+    action_model: 2.0e-04
     visual_head: 2.0e-04
     probe_mlp: 2.0e-04
     proj_A: 2.0e-04

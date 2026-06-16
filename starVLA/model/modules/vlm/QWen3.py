@@ -66,6 +66,23 @@ class _QWen3_VL_Interface(nn.Module):
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
+        #######
+        # 中文注释：梯度检查点（Qwen3-VL 此前没接，trainer.gradient_checkpointing 是 dead flag，见 #41）。
+        # 全量训 4B backbone 时若不开，36 层激活全存必 OOM（源 GR00T 冻结 backbone 才不需要）。对齐
+        # Gemma4/MiniCPM/Molmo 的做法：读 framework.qwenvl.enable_gradient_checkpointing，use_reentrant=False
+        # （兼容 DeepSpeed ZeRO 与 nn.Module hook）。jointflow 直接喂 inputs_embeds（已 require grad），可正常重计算。
+        if bool(qwenvl_config.get("enable_gradient_checkpointing", False)):
+            try:
+                model.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": False}
+                )
+                if hasattr(model, "enable_input_require_grads"):
+                    model.enable_input_require_grads()
+                print("[Qwen3] gradient_checkpointing ENABLED (use_reentrant=False)", flush=True)
+            except Exception as e:
+                print(f"[Qwen3] failed to enable gradient_checkpointing: {e}", flush=True)
+        #######
+
         self.model = model
         self.processor = processor
         self.config = config

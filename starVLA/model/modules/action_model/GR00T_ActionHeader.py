@@ -181,6 +181,16 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     vl_self_attention_cfg: dict = field(default=None)
     num_target_vision_tokens: int = field(default=32, metadata={"help": "Number of target vision tokens."})
 
+    #######
+    # 中文注释：E1.3 trick 开关（默认关，不影响其它实验与原生）。参考 behavior-1k 冠军方案：
+    #   use_correlated_noise：flow-matching 噪声从 N(0, βΣ+(1−β)I) 采（Σ=动作协方差），而非独立噪声；
+    #   correlation_beta：上式的 β（0.5=半相关）；Σ 的 Cholesky 训练启动时从 dataloader 算好注入。
+    #   flow_matching_steps：每个 VLM step 对 action expert 跑 N 次不同 (t,noise) 预测并平均，降训练方差（1=关）。
+    use_correlated_noise: bool = field(default=False)
+    correlation_beta: float = field(default=0.5)
+    flow_matching_steps: int = field(default=1)
+    #######
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         for key, value in kwargs.items():
@@ -282,6 +292,19 @@ class FlowmatchingActionHead(nn.Module):
         self.future_tokens = nn.Embedding(config.num_target_vision_tokens, self.input_embedding_dim)
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
+        #######
+        # 中文注释：E1.3 correlated noise 的 Cholesky 缓存（flat=action_horizon·action_dim 的下三角），
+        # 训练启动时由 trainer 算好并 set_action_correlation 注入；未注入时即便开关打开也回退独立噪声。
+        self.use_correlated_noise = bool(getattr(config, "use_correlated_noise", False))
+        self.flow_matching_steps = int(getattr(config, "flow_matching_steps", 1))
+        self.register_buffer(
+            "_action_corr_chol",
+            torch.zeros(self.action_horizon * self.action_dim, self.action_horizon * self.action_dim),
+            persistent=False,
+        )
+        self._action_corr_loaded = False
+        #######
+
         # ------------------------------------------------------------------
         # Positional embedding over the action sequence
         #   add_pos_embed: whether to add sinusoidal-style learned PE
@@ -306,11 +329,37 @@ class FlowmatchingActionHead(nn.Module):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype).clamp(max=self.config.noise_s)
         return (self.config.noise_s - sample) / self.config.noise_s
 
+    #######
+    # 中文注释：E1.3——注入 correlated noise 的 Cholesky（trainer 启动时从 dataloader 算好）。L 形状 [flat,flat]。
+    def set_action_correlation(self, chol: torch.Tensor) -> None:
+        chol = torch.as_tensor(chol, dtype=torch.float32)
+        self._action_corr_chol.copy_(chol.to(self._action_corr_chol.device))
+        self._action_corr_loaded = True
+
+    # 中文注释：采样 flow-matching 噪声。开关开且已注入 Σ-Cholesky 时用相关噪声 z@L^T，否则独立噪声。
+    def _sample_fm_noise(self, actions: torch.Tensor) -> torch.Tensor:
+        if self.use_correlated_noise and self._action_corr_loaded:
+            bsz, horizon, dim = actions.shape
+            z = torch.randn(bsz, horizon * dim, device=actions.device, dtype=actions.dtype)
+            noise = (z @ self._action_corr_chol.to(actions.dtype).T).reshape(bsz, horizon, dim)
+            return noise
+        return torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+    #######
+
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
 
     def forward(
-        self, vl_embs: torch.Tensor, actions: torch.Tensor, state: torch.Tensor = None, encoder_attention_mask=None
+        self,
+        vl_embs: torch.Tensor,
+        actions: torch.Tensor,
+        state: torch.Tensor = None,
+        encoder_attention_mask=None,
+        #######
+        # 中文注释：CED REPA 对齐用——为真时额外返回 DiT 第 repa_layer 层隐藏态做对齐 teacher 的学生特征。
+        return_repa_features: bool = False,
+        repa_layer: int = 4,
+        #######
     ):
         """
         vl_embs: shape (B, seq_length, feature_dim)
@@ -318,8 +367,22 @@ class FlowmatchingActionHead(nn.Module):
         """
         device = vl_embs.device
 
+        #######
+        # 中文注释：E1.3 multi-step Flow Matching——把 (vl_embs, actions, state) 沿 batch 复制 N 份，
+        # 各采独立 (noise,t)、一次 DiT 前向、平均 loss，降训练方差（N=1 即原行为）。
+        # CED REPA 路径(return_repa_features=True)保持单次，避免 repa_feat 批维与 valid_mask 错位。
+        n_fm = int(getattr(self, "flow_matching_steps", 1))
+        if n_fm > 1 and not return_repa_features:
+            vl_embs = vl_embs.repeat(n_fm, 1, 1)
+            actions = actions.repeat(n_fm, 1, 1)
+            if state is not None:
+                state = state.repeat(n_fm, *([1] * (state.ndim - 1)))
+            if encoder_attention_mask is not None and torch.is_tensor(encoder_attention_mask):
+                encoder_attention_mask = encoder_attention_mask.repeat(n_fm, *([1] * (encoder_attention_mask.ndim - 1)))
+        #######
+
         # Embed noised action trajectory.
-        noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+        noise = self._sample_fm_noise(actions)  # 中文注释：E1.3 correlated noise 开关在此生效（默认独立噪声）
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
 
@@ -348,6 +411,24 @@ class FlowmatchingActionHead(nn.Module):
         )
 
         # Join VLM features with state and action embedding along sequence dimension.
+        #######
+        # 中文注释：CED REPA 对齐路径——复用 DiT 已有的 return_all_hidden_states 取早期层隐藏态，
+        # 一并返回 (loss, repa_feat=all_hidden_states[repa_layer])；默认 return_repa_features=False，原行为不变。
+        if return_repa_features:
+            model_output, all_hidden_states = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embs,
+                encoder_attention_mask=encoder_attention_mask,
+                timestep=t_discretized,
+                return_all_hidden_states=True,
+            )
+            layer = max(0, min(int(repa_layer), len(all_hidden_states) - 1))
+            repa_feat = all_hidden_states[layer]
+            pred = self.action_decoder(model_output)
+            pred_actions = pred[:, -actions.shape[1] :]
+            loss = ((pred_actions - velocity) ** 2).mean()
+            return loss, repa_feat
+        #######
         model_output = self.model(
             hidden_states=sa_embs,
             encoder_hidden_states=vl_embs,

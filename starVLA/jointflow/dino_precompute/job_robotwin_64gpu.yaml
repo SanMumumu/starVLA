@@ -14,7 +14,7 @@ REQUIRED:
   WORKER_MAX_NUM: 8
   GPU_PER_WORKER: 8
 
-  RUN_SCRIPTS: "JOINTFLOW_PRECOMPUTE_NUM_NODES=8 JOINTFLOW_PRECOMPUTE_GPUS_PER_WORKER=8 JOINTFLOW_PRECOMPUTE_CONFIG=starVLA/jointflow/configs/jointflow_robotwin_aidi.yaml JOINTFLOW_DATA_ROOT=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin ${WORKING_PATH}/starVLA/starVLA/jointflow/aidi/run_precompute_dino_aidi.sh"
+  RUN_SCRIPTS: "JOINTFLOW_PRECOMPUTE_NUM_NODES=8 JOINTFLOW_PRECOMPUTE_GPUS_PER_WORKER=8 JOINTFLOW_PRECOMPUTE_CONFIG=starVLA/jointflow/configs/jointflow_robotwin_aidi.yaml JOINTFLOW_DATA_ROOT=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin ${WORKING_PATH}/starVLA/starVLA/jointflow/dino_precompute/run_precompute_aidi.sh"
 
 OPTIONAL:
   FRAMEWORK: "pytorch"

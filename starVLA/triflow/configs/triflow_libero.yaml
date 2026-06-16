@@ -64,7 +64,7 @@ framework:
     method: ode                    # ode | sde
     sde_gamma: 1.0
     num_steps:
-      action: 16
+      action: 10
       text: 32
       future: 32
       joint: 32

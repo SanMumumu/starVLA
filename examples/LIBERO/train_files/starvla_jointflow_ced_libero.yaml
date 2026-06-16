@@ -1,0 +1,167 @@
+#######
+# 中文注释：JointFlow + CED（原生 QwenGR00T / Qwen3-VL）训练配置。framework.jointflow.enabled=true 接管多任务。
+# 与 starvla_cotrain_libero.yaml 对齐；仅 JointFlow 专属/必需处加注释，和源一致的字段不注释。
+#######
+run_id: starvla_jointflow_ced
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_jointflow_ced
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: starvla_jointflow
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T
+  qwenvl:
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-4B-Instruct/
+    #######
+    # 中文注释：自定义 block-causal mask 不被 flash 内核支持，必须 sdpa（接受任意 4D mask）。
+    attn_implementation: sdpa
+    #######
+    vl_hidden_dim: 2048
+    max_text_length: 256
+    #######
+    # 中文注释：真正生效的梯度检查点开关（trainer.gradient_checkpointing 是 dead flag，#41）。
+    # 全量训 4B backbone 必须开，否则 36 层激活全存会 OOM；冻结 backbone 时可设 false。
+    enable_gradient_checkpointing: true
+    #######
+  #######
+  # 中文注释：JointFlow 多任务总开关 + 采样权重 + block-causal mask 配置。
+  jointflow:
+    enabled: true
+  tasks:
+    hybrid_mask: true
+    attention_mask_neg_value: -1.0e4
+    weights:
+      policy: 1.0
+      effect: 0.5
+      fdm: 0.0
+      idm: 0.25
+      passive: 0.0
+  dino:
+    name: dinov3_vits16
+    hf_model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+    repo_or_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/dinov3_repo
+    weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/dinov3-vits16-pretrain-lvd1689m/
+    loader: auto
+    image_size: 224
+    patch_size: 16
+    embed_dim: 384
+    future_view_keys: ["video.primary_image", "observation.images.image", "primary_image", "agentview"]
+    stats_path: null
+    load_live_backbone: false
+    dino_pool: 1
+  ced:
+    enabled: true
+    tau: 1.0
+    eps_gate: 1.0e-3
+    probe_hidden: 512
+    probe_val_mod: 10
+    repa_layer: 8              # 对齐动作专家 DiT 早期层（24 层取 8 ≈ REPA 8/28）
+    repa_proj_hidden: 2048
+  losses:
+    lam_i: 0.1
+    lam_a: 0.1
+    teacher: delta            # delta | pooled_future | delta_shuffled | future_dino | delta_dino
+    effect_delta_prob: 1.0
+  #######
+  action_model:
+    action_model_type: DiT-B
+    action_dim: 7
+    state_dim: 7
+    action_horizon: 8
+    n_action_query: 16        # 中文注释：action query token 数（与 chunk 解耦）；基线 16；E3.x sweep 32/64/128
+    #######
+    # 中文注释：E1.3 trick 开关（默认关）。use_correlated_noise+correlation_beta=相关噪声；flow_matching_steps>1=multi-step FM。
+    use_correlated_noise: false
+    correlation_beta: 0.5
+    flow_matching_steps: 1
+    #######
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_inference_timesteps: 10
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    repeated_diffusion_steps: 1
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.1
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 24
+      num_attention_heads: 12
+      attention_head_dim: 64
+      output_dim: 768
+      positional_embeddings: null
+  #######
+  # 中文注释：visual_model = FDM/passive/effect 的未来 DINO flow-matching head（JointFlow 专属）。
+  visual_model:
+    d_dino: 384
+    n_query: 196
+    max_image_queries: 256
+    hidden_size: 1024
+    cross_attention_dim: 2048
+    num_attention_heads: 16
+    attention_head_dim: 64
+    num_layers: 12
+    dropout: 0.1
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_inference_timesteps: 6
+    patch_weighting: change
+  #######
+
+datasets:
+  vla_data:
+    dataset_py: jointflow
+    data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero
+    data_mix: libero_all
+    action_type: delta_qpos
+    sequential_step_sampling: false
+    include_state: false
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
+    per_device_batch_size: 8
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+    #######
+    # 中文注释：JointFlow 必需（原生 lerobot 路径没有）：online_dino（latents 齐全走离线）、future_stride（FDM 未来帧步长）。
+    online_dino: auto
+    world_model:
+      future_stride: 8
+    #######
+
+trainer:
+  max_train_steps: 100000
+  num_warmup_steps: 5000
+  save_interval: 5000
+  #######
+  # 中文注释：JointFlow 走独立 LIBERO server 评测（jointflow/eval/run_libero_eval.sh），关掉原生 in-loop eval。
+  eval_interval: 1000000
+  #######
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  #######
+  # 中文注释：JointFlow VLA-only（无 vlm_data 联合训）；backbone 不冻结，全量训。
+  loss_scale:
+    vla: 1.0
+  freeze_modules: ''
+  #######
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

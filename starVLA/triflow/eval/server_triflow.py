@@ -24,6 +24,7 @@ def main(args) -> None:
         device="cuda",
         use_bf16=False,
         unnorm_key=args.unnorm_key,
+        num_steps=args.num_steps,
     )
     hostname = socket.gethostname()
     try:
@@ -47,6 +48,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--ckpt_path", type=str, required=True, help="Path to <run_dir>/checkpoints/x.pt (建议用 *_ema.pt)")
     parser.add_argument("--port", type=int, default=6500)
     parser.add_argument("--unnorm_key", type=str, default=None)
+    parser.add_argument("--num_steps", type=int, default=None, help="TriFlow action ODE sampling steps; default uses run_dir config.")
     parser.add_argument("--idle_timeout", type=int, default=-1)
     return parser
 

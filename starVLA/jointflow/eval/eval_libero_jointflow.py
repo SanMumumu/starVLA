@@ -104,6 +104,15 @@ SUITE_MAX_STEPS = {
     "libero_10": 520,
     "libero_90": 400,
 }
+# 中文注释：诊断用 env 覆盖某套件 max_steps（不改默认；标准 benchmark 仍是上面的数字）。
+# 例：JOINTFLOW_SUITE_MAX_STEPS="libero_10=800" 排查"长程是否被步数上限卡住"。
+_suite_steps_override = os.environ.get("JOINTFLOW_SUITE_MAX_STEPS", "").strip()
+if _suite_steps_override:
+    for _kv in _suite_steps_override.split(","):
+        _k, _, _v = _kv.partition("=")
+        if _k.strip() and _v.strip():
+            SUITE_MAX_STEPS[_k.strip()] = int(_v.strip())
+            print(f"[eval] SUITE_MAX_STEPS override: {_k.strip()}={_v.strip()}", flush=True)
 
 
 ######### // code // ##########

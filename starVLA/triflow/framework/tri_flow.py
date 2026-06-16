@@ -114,7 +114,7 @@ class TriFlowDefaultConfig:
         default_factory=lambda: {
             "method": "ode",
             "sde_gamma": 1.0,
-            "num_steps": {"action": 16, "text": 32, "future": 32, "joint": 32},
+            "num_steps": {"action": 10, "text": 32, "future": 32, "joint": 32},
         }
     )
     tasks: dict = field(

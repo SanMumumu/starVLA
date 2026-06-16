@@ -928,9 +928,18 @@ class JointFlowTrainer(TrainerUtils):
             if self.completed_steps > 0 and self.completed_steps % self.config.trainer.save_interval == 0:
                 self._save_checkpoint()
         progress.close()
-        if self.accelerator.is_main_process:
-            wandb.finish()
+        # 中文注释（收尾顺序坑）：必须先 barrier、再 rank0 单独 finish。
+        # 反过来（先 rank0 finish 再 barrier）会让 rank1-7 卡在 wait_for_everyone 这个
+        # NCCL barrier 上等 rank0，而 rank0 卡在 swanlab.finish() 的网络上传里 → 超过 NCCL
+        # 超时 → 其它 rank SIGABRT(exitcode -6)，整个 job 被标 failed（虽然 ckpt 早已存好）。
+        # 现在：8 个 rank 跑完 100k 后毫秒级到齐 barrier，之后再无集合通信，rank0 慢慢传日志、
+        # rank1-7 直接退出，互不阻塞。finish 再用 try/except 兜底，避免日志网络异常污染退出码。
         self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            try:
+                wandb.finish()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[jointflow][warn] tracker finish failed (training already complete): {exc}", flush=True)
 ######### // code // ##########
 
 

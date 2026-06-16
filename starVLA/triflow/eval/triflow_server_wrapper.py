@@ -43,6 +43,7 @@ class TriFlowPolicyServerWrapper(PolicyServerWrapper):
         device: str = "cuda",
         use_bf16: bool = False,
         unnorm_key: Optional[str] = None,
+        num_steps: Optional[int] = None,
     ) -> None:
         register_jointflow_mixtures()
         # 中文注释：absolute() 不跟符号链接（resolve() 会把链接展开到别处，run_dir 就算错了）
@@ -58,6 +59,7 @@ class TriFlowPolicyServerWrapper(PolicyServerWrapper):
             use_bf16 = False
         super().__init__(ckpt_path=ckpt_path, device=device, use_bf16=use_bf16, unnorm_key=unnorm_key)
         self._run_dir = run_dir
+        self._num_steps = int(num_steps) if num_steps is not None else None
         self._maybe_rebuild_live_dino()
         self._maybe_refresh_dino_stats()
 
@@ -131,5 +133,7 @@ class TriFlowPolicyServerWrapper(PolicyServerWrapper):
         **kwargs,
     ) -> Dict[str, np.ndarray]:
         examples = self._prepare_examples(examples)
+        if self._num_steps is not None and kwargs.get("num_steps", None) is None:
+            kwargs["num_steps"] = self._num_steps
         return super().predict_action(examples=examples, unnorm_key=unnorm_key, **kwargs)
 ######### // code // ##########

@@ -1,0 +1,34 @@
+######### // code // ##########
+# 中文注释：RoboTwin DINOv3-L 离线 latent 预计算 AIDI job（H20 单机 8 卡，省卡版）。
+# 1 worker × 8 GPU = 8 进程。靠动态认领（默认开）：8 个进程一起扫全量 data_mix、
+# 原子认领未完成的库来做，已完成的自动跳过 → 单机也能把 100 个库全部跑完，只是比多机慢。
+# 提交（注意 -q 用你说的队列）：
+#   aidi-inf-cli job submit \
+#     -f starVLA/jointflow/dino_precompute/job_robotwin_8gpu_h20.yaml \
+#     -q project-h20-horizon-labs-acloud
+######### // code // ##########
+REQUIRED:
+  JOB_NAME: "jointflow-precompute-robotwin-dinol-8gpu-h20"
+  JOB_PASSWD: "newk8s666"
+
+  UPLOAD_DIR: "/home/users/sen02.wang-labs/aidi_jobs/starvla_dev"
+  PROJECT_ID: "horizon-labs"
+
+  WORKER_MIN_NUM: 1
+  WORKER_MAX_NUM: 1
+  GPU_PER_WORKER: 8
+
+  RUN_SCRIPTS: "JOINTFLOW_PRECOMPUTE_NUM_NODES=1 JOINTFLOW_PRECOMPUTE_GPUS_PER_WORKER=8 JOINTFLOW_PRECOMPUTE_BATCH_SIZE=256 JOINTFLOW_PRECOMPUTE_AMP_DTYPE=bf16 JOINTFLOW_PRECOMPUTE_PREFETCH=4 JOINTFLOW_PRECOMPUTE_CONFIG=starVLA/jointflow/configs/jointflow_robotwin_aidi.yaml JOINTFLOW_DATA_ROOT=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin ${WORKING_PATH}/starVLA/starVLA/jointflow/dino_precompute/run_precompute_aidi.sh"
+
+OPTIONAL:
+  FRAMEWORK: "pytorch"
+  TASK_LABEL: "DEV"
+  PRIORITY: 5
+  DOCKER_IMAGE: "docker.hobot.cc/imagesys/starvla:v1.0"
+  WALL_TIME: 86400
+  JOB_TYPE: "train"
+  REMARK: "RoboTwin DINOv3-L latent precompute, single node 8 GPU H20, dynamic claim + resume, bf16+prefetch+ETA"
+  DATA_SPACE:
+    DATA_TYPE: "dmp"
+    INPUT: "robot_lab"
+    OUTPUT: "robot_lab"

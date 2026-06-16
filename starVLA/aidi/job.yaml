@@ -1,0 +1,30 @@
+#######
+# 中文注释：JointFlow/CED（原生 QwenGR00T）AIDI 训练 job 模板。提交新实验改两处：
+#   JOB_NAME → jfced-<实验名>-8gpu；RUN_SCRIPTS 末尾 → 实验名（experiments/<名>.sh 去 .sh）。
+# 每个实验已在 jobs/ 下各有一份零编辑 job，直接 submit。
+#######
+REQUIRED:
+  JOB_NAME: "jfced-e2-1-ced-effect-8gpu"
+  JOB_PASSWD: "newk8s666"
+
+  UPLOAD_DIR: "/home/users/sen02.wang-labs/aidi_jobs/starvla_dev"
+  PROJECT_ID: "horizon-labs"
+
+  WORKER_MIN_NUM: 1
+  WORKER_MAX_NUM: 1
+  GPU_PER_WORKER: 8
+
+  RUN_SCRIPTS: "${WORKING_PATH}/starVLA/starVLA/aidi/run_aidi.sh e2_1_ced_effect"
+
+OPTIONAL:
+  FRAMEWORK: "pytorch"
+  TASK_LABEL: "DEV"
+  PRIORITY: 5
+  DOCKER_IMAGE: "docker.hobot.cc/imagesys/starvla:v1.0"
+  WALL_TIME: 20000
+  JOB_TYPE: "train"
+  REMARK: "jointflow/CED on native QwenGR00T (Qwen3-VL)"
+  DATA_SPACE:
+    DATA_TYPE: "dmp"
+    INPUT: "robot_lab"
+    OUTPUT: "robot_lab"

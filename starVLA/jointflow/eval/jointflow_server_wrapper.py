@@ -115,7 +115,14 @@ class JointFlowPolicyServerWrapper(PolicyServerWrapper):
         if not bundled.exists():
             return  # 中文注释：没有打包统计时，framework __init__ 已尝试从数据根加载。
         try:
-            self._framework._load_dino_stats(str(bundled))
+            #######
+            # 中文注释：迁移后 QwenGR00T 中 DINO stats 方法名为 _load_jointflow_dino_stats；
+            # 兼容旧 QwenJointFlow 的 _load_dino_stats，便于老 ckpt 和新 qwen3vl-gr00t ckpt 共用 eval wrapper。
+            load_stats = getattr(self._framework, "_load_jointflow_dino_stats", None)
+            if load_stats is None:
+                load_stats = getattr(self._framework, "_load_dino_stats")
+            load_stats(str(bundled))
+            #######
             logger.info("JointFlow eval: refreshed DINO stats from %s", bundled)
         except Exception as exc:  # pragma: no cover
             logger.warning("JointFlow eval: failed to refresh DINO stats from %s: %s", bundled, exc)
@@ -237,8 +244,16 @@ class JointFlowPolicyServerWrapper(PolicyServerWrapper):
             new = dict(ex)
             if new.get("image", None) is not None:
                 new["image"] = self._to_pil_images(new["image"])
-            if self._state_normalizer is not None and new.get("state", None) is not None:
+            #######
+            # 中文注释：迁移后的 QwenGR00T checkpoint 会在原生 PolicyServerWrapper 里做 state 归一化；
+            # 旧 QwenJointFlow checkpoint 没有 jointflow.enabled 元数据，仍由本 wrapper 归一化，避免双重归一化。
+            if (
+                self._state_normalizer is not None
+                and not getattr(self, "_jointflow_expects_state", False)
+                and new.get("state", None) is not None
+            ):
                 new["state"] = self._normalize_state(new["state"])
+            #######
             out.append(new)
         return out
 

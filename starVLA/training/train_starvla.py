@@ -14,6 +14,10 @@ Conventions:
 import argparse
 import json
 import os
+#######
+# 中文注释：JointFlow 多任务训练需要在原生 trainer 内按 framework.tasks.weights 采样任务。
+import random
+#######
 import time
 from pathlib import Path
 from typing import Tuple
@@ -124,6 +128,31 @@ class VLATrainer(TrainerUtils):
 
         self.completed_steps = 0
         self.total_batch_size = self._calculate_total_batch_size()
+        #######
+        # 中文注释：JointFlow 任务采样器只在配置含 framework.tasks.weights 时启用。
+        # 一任务/优化步（累积窗口内同 task）+ rank0 采样后 dist.broadcast 任务索引到各 rank，
+        # 彻底避免"靠同种子保持一致"的脆弱性（步数不齐/跳步会失同步 → DDP 参数 ready 不一致挂死）。
+        self._jointflow_rng = random.Random(int(getattr(cfg, "seed", 42)))
+        self._jointflow_tasks = None
+        self._jointflow_weights = None
+        self._jointflow_cur_task = None
+        self._jointflow_resample = True  # 新优化步起点置 True，窗口内复用已广播的 task
+        framework_cfg = getattr(cfg, "framework", None)
+        jointflow_cfg = getattr(framework_cfg, "jointflow", None) if framework_cfg is not None else None
+        tasks_cfg = getattr(framework_cfg, "tasks", None) if framework_cfg is not None else None
+        if (
+            jointflow_cfg is not None
+            and bool(jointflow_cfg.get("enabled", False))
+            and tasks_cfg is not None
+            and hasattr(tasks_cfg, "get")
+        ):
+            weights = tasks_cfg.get("weights", None)
+            if weights:
+                self._jointflow_tasks = [str(k) for k, v in weights.items() if float(v) > 0]
+                self._jointflow_weights = [float(weights[k]) for k in self._jointflow_tasks]
+                if not self._jointflow_tasks:
+                    raise ValueError("framework.tasks.weights must contain at least one positive task weight.")
+        #######
 
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
@@ -300,6 +329,50 @@ class VLATrainer(TrainerUtils):
 
         return batch_vla
 
+    #######
+    # 中文注释：JointFlow 任务采样：未配置 tasks.weights 时返回 None（回落旧 action_loss）。
+    # 一任务/优化步——仅在 _jointflow_resample=True（新优化步起点）时由 rank0 采样并 dist.broadcast
+    # 任务索引到各 rank，累积窗口内复用同一 task；保证 DDP 各 rank 每步选同一任务、参数 ready 集合一致。
+    def _sample_jointflow_task(self) -> str | None:
+        if not self._jointflow_tasks:
+            return None
+        if not self._jointflow_resample and self._jointflow_cur_task is not None:
+            return self._jointflow_cur_task
+        idx = self._jointflow_rng.choices(range(len(self._jointflow_tasks)), weights=self._jointflow_weights, k=1)[0]
+        if dist.is_available() and dist.is_initialized():
+            idx_t = torch.tensor([idx], device=self.accelerator.device, dtype=torch.long)
+            dist.broadcast(idx_t, src=0)  # 以 rank0 选择为准
+            idx = int(idx_t.item())
+        self._jointflow_cur_task = self._jointflow_tasks[idx]
+        self._jointflow_resample = False
+        return self._jointflow_cur_task
+
+    # 中文注释：把模型返回的 tensor 指标转成可记录标量，同时保留用户要求的关键 loss 名称。
+    @staticmethod
+    def _collect_jointflow_metrics(output_dict: dict, task: str, total_loss: torch.Tensor) -> dict:
+        metrics = {"task": task, "loss": float(total_loss.detach().cpu())}
+        alias = {
+            "policy_loss": "policy_loss",
+            "fdm_loss": "loss_fdm",
+            "idm_loss": "idm_loss",
+            "passive_loss": "passive_loss",
+            "effect_loss": "effect_loss",
+            "loss_act": "loss_act",
+            "loss_fdm": "loss_fdm",
+            "loss_ident": "loss_ident",
+            "loss_align": "loss_align",
+        }
+        for key, value in output_dict.items():
+            if torch.is_tensor(value):
+                clean_key = key.replace("/", "_")
+                metrics[clean_key] = float(value.detach().cpu())
+                if key in alias:
+                    metrics[alias[key]] = metrics[clean_key]
+        if task == "policy" and "policy_loss" not in metrics:
+            metrics["policy_loss"] = metrics.get("loss", float(total_loss.detach().cpu()))
+        return metrics
+    #######
+
     def train(self):
         """Execute training loop."""
         self._log_training_config()
@@ -380,9 +453,27 @@ class VLATrainer(TrainerUtils):
             self.optimizer.zero_grad()
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output_dict = self.model.forward(batch_vla)
-                action_loss = output_dict["action_loss"]
-                total_loss = action_loss
+                #######
+                # 中文注释：JointFlow-style 训练复用原生 trainer；配置 tasks.weights 时每步采样一个任务，
+                # 模型返回 *_loss / loss_* 指标。没有配置时保持旧 QwenGR00T action_loss 路径。
+                jointflow_task = self._sample_jointflow_task()
+                if jointflow_task is not None:
+                    output_dict = self.model.forward(batch_vla, task=jointflow_task)
+                    loss_values = [
+                        value
+                        for key, value in output_dict.items()
+                        if torch.is_tensor(value) and key.endswith("_loss")
+                    ]
+                    if not loss_values:
+                        raise KeyError(
+                            f"JointFlow task `{jointflow_task}` returned no tensor loss keys: {output_dict.keys()}"
+                        )
+                    total_loss = sum(loss_values)
+                else:
+                    output_dict = self.model.forward(batch_vla)
+                    action_loss = output_dict["action_loss"]
+                    total_loss = action_loss
+                #######
 
             self.accelerator.backward(total_loss)
 
@@ -397,10 +488,19 @@ class VLATrainer(TrainerUtils):
             # at min_lr well before max_train_steps is reached.
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
+                #######
+                # 中文注释：优化步完成 → 标记下一步起点重新采样 JointFlow 任务（一任务/优化步，累积窗口内同 task）。
+                self._jointflow_resample = True
+                #######
 
+        #######
+        # 中文注释：JointFlow 分支记录 policy/fdm/idm/effect/CED 关键 loss；旧分支保持 action_dit_loss。
+        if jointflow_task is not None:
+            return self._collect_jointflow_metrics(output_dict, jointflow_task, total_loss)
         return {
             "action_dit_loss": action_loss.item(),
         }
+        #######
 
     def _finalize_training(self):
         """Training end processing."""
@@ -434,6 +534,43 @@ def main(cfg) -> None:
     output_dir = setup_directories(cfg=cfg)
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    #######
+    # 中文注释：CED effect 任务需要按数据集构造归一化空间 no-op action 表。
+    # 这里在原生训练入口中完成注入，保持 qwen3vl-gr00t 的 trainer/config/dataloader 主流程不变。
+    ced_cfg = getattr(getattr(cfg, "framework", None), "ced", None)
+    jointflow_cfg = getattr(getattr(cfg, "framework", None), "jointflow", None)
+    if (
+        jointflow_cfg is not None
+        and bool(jointflow_cfg.get("enabled", False))
+        and ced_cfg is not None
+        and bool(ced_cfg.get("enabled", False))
+        and hasattr(vla, "set_null_action_table")
+    ):
+        from starVLA.dataloader.jointflow.joint_dataset import compute_null_action_table
+
+        null_table = compute_null_action_table(vla_train_dataloader.dataset)
+        vla.set_null_action_table(null_table)
+        if accelerator.is_main_process:
+            logger.info(f"JointFlow CED null-action table ready for datasets: {sorted(null_table)}")
+    #######
+    #######
+    # 中文注释：E1.3 correlated noise——若 action_model.use_correlated_noise=true，启动时从 dataloader 估计动作协方差
+    # 的 Cholesky 并注入 action head（同 null 表范式，免离线脚本）。开关关时此段不执行，不影响其它实验。
+    action_cfg = getattr(getattr(cfg, "framework", None), "action_model", None)
+    if (
+        action_cfg is not None
+        and bool(action_cfg.get("use_correlated_noise", False))
+        and hasattr(vla, "set_action_correlation")
+    ):
+        from starVLA.dataloader.jointflow.joint_dataset import compute_action_correlation_cholesky
+
+        chol = compute_action_correlation_cholesky(
+            vla_train_dataloader.dataset, beta=float(action_cfg.get("correlation_beta", 0.5))
+        )
+        vla.set_action_correlation(chol)
+        if accelerator.is_main_process:
+            logger.info(f"E1.3 correlated-noise Cholesky ready: shape={chol.shape}, beta={action_cfg.get('correlation_beta', 0.5)}")
+    #######
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
     trainer = VLATrainer(

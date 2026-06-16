@@ -95,7 +95,7 @@ datasets:
     action_horizon: 16
     # 中文注释："有 latent 就 latent，没有就在线"：auto = 混合内全部数据集存在
     # 维度匹配（1024）的离线 latents 才走离线，否则整体在线提特征。
-    # 预计算 L-latents：python -m starVLA.jointflow.data.dino_precompute --config_yaml 本文件
+    # 预计算 L-latents：python -m starVLA.jointflow.dino_precompute.dino_precompute --config_yaml 本文件
     online_dino: auto
     world_model:
       future_stride: 16           # 15fps ≈ 1.07s 后的未来帧，与 action chunk 对齐
