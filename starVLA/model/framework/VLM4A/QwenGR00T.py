@@ -11,7 +11,7 @@ Flow-matching header is copyright from GR00T N1.5,
 import sys
 from pathlib import Path
 #######
-# 中文注释：JointFlow 分支需要在局部禁用 autocast，并为 CED unused-parameter anchor 遍历模块参数。
+# 中文注释：JointFlow 分支需要在局部禁用 autocast，并为 unused-parameter anchor 遍历模块参数。
 from contextlib import nullcontext
 import json
 #######
@@ -47,10 +47,9 @@ from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 #######
-# 中文注释：复用 JointFlow 已验证的 DINO token、query token、visual flow head 和 CED probe 小模块；
+# 中文注释：复用 JointFlow 已验证的 DINO token、query token、visual flow head 模块；
 # 这些模块只在 framework.jointflow.enabled=true 时实例化，默认不影响原生 QwenGR00T。
 from starVLA.model.framework.VLM4A.jointflow.attention_mask import build_block_causal_mask
-from starVLA.model.framework.VLM4A.jointflow.ced_probe import CedProbeMLP, RepaProjector
 from starVLA.model.framework.VLM4A.jointflow.dino_v3 import DINOv3Backbone, resolve_dino_spec
 from starVLA.model.framework.VLM4A.jointflow.joint_modules import (
     ActionContextEncoder,
@@ -178,7 +177,7 @@ class QwenGR00TDefaultConfig:
         }
     )
 
-    # 中文注释：future DINO flow-matching head 配置，fdm/passive/effect 任务使用。
+    # 中文注释：future DINO flow-matching head 配置，fdm/passive 任务使用。
     visual_model: dict = field(
         default_factory=lambda: {
             "d_dino": 384,
@@ -201,26 +200,6 @@ class QwenGR00TDefaultConfig:
         }
     )
 
-    # 中文注释：CED 默认关闭；打开后构造 no-op action / delta effect / ident / align 相关模块和 loss。
-    ced: dict = field(
-        default_factory=lambda: {
-            "enabled": False,
-            "tau": 1.0,
-            "eps_gate": 1.0e-3,
-            "probe_hidden": 512,
-            "probe_val_mod": 10,
-        }
-    )
-
-    # 中文注释：CED loss 权重。lam_i 控制 loss_ident，lam_a 控制 loss_align。
-    losses: dict = field(
-        default_factory=lambda: {
-            "lam_i": 0.1,
-            "lam_a": 0.0,
-            "teacher": "delta",
-            "effect_delta_prob": 1.0,
-        }
-    )
     #######
 
     # # === Training precision flag === This is unnecessary, unused parameter
@@ -267,6 +246,13 @@ class Qwen_GR00T(baseframework):
         if self.jointflow_enabled:
             self.config.framework.visual_model.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
         #######
+        #######
+        # 中文注释：WAM 分支开关（参考 LaWAM）：qwenvl-gr00t 原生视觉 policy + DINO 只做监督头。
+        # 与 jointflow 互斥——jointflow 把 DINO 当 policy 视觉；wam 用 Qwen 原生视觉，DINO 仅作 future 监督 target，推理不碰。
+        self.wam_enabled = bool(self.config.framework.get("wam", {}).get("enabled", False))
+        if self.wam_enabled:
+            self.config.framework.visual_model.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
+        #######
 
         self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)
 
@@ -280,10 +266,21 @@ class Qwen_GR00T(baseframework):
         if self.jointflow_enabled:
             self._init_jointflow_modules()
         #######
+        #######
+        if self.wam_enabled:
+            self._init_wam_modules()
+        #######
+
+    def _uses_action_state(self) -> bool:
+        datasets_cfg = getattr(self.config, "datasets", None)
+        vla_cfg = getattr(datasets_cfg, "vla_data", None) if datasets_cfg is not None else None
+        if vla_cfg is None:
+            return False
+        return vla_cfg.get("include_state", False) not in ["False", "false", False, 0, None]
 
     #######
     # 中文注释：初始化 JointFlow 迁移模块。这里复用原生 Qwen3-VL 的 language_model 作为 joint sequence
-    # backbone，复用原生 GR00T action_model 作为 policy/idm 动作流头，只新增 DINO/FDM/CED 必需模块。
+    # backbone，复用原生 GR00T action_model 作为 policy/idm 动作流头，只新增 DINO/FDM 必需模块。
     def _init_jointflow_modules(self) -> None:
         hidden_size = int(self.qwen_vl_interface.model.config.hidden_size)
         dino_cfg = self.config.framework.dino
@@ -310,35 +307,10 @@ class Qwen_GR00T(baseframework):
         )
         self.visual_head = VisualFlowMatchingHead(self.config)
 
-        ced_cfg = self.config.framework.get("ced", {})
-        self.ced_enabled = bool(ced_cfg.get("enabled", False))
-        self.probe_mlp = None
-        self.repa_proj = None
-        #######
-        # 中文注释：REPA 对齐——repa_layer 取动作专家 DiT 的早期层（默认 4，≈12 层的 28%，对齐 REPA 配方）。
-        self.repa_layer = int(ced_cfg.get("repa_layer", 4))
-        #######
-        if self.ced_enabled:
-            self.probe_mlp = CedProbeMLP(
-                d_in=self.d_dino,
-                hidden=int(ced_cfg.get("probe_hidden", 512)),
-                d_out=self.action_horizon * self.action_dim,
-            )
-            #######
-            # 中文注释：REPA 投影头输入维 = 动作专家 DiT 的 inner_dim；把 DiT 早期层池化态投到 Δ 空间，
-            # 与 detach 的 teacher 做 cosine（对齐 DiT 早期层，而非原先的 Qwen query 特征）。
-            dit_inner = int(self.action_model.model.inner_dim)
-            self.repa_proj = RepaProjector(
-                d_in=dit_inner,
-                d_out=self.d_dino,
-                hidden=int(ced_cfg.get("repa_proj_hidden", 2048)),
-            )
-            #######
 
         self.dino = None
         if bool(dino_cfg.get("load_live_backbone", False)):
             self.dino = DINOv3Backbone(**self._jointflow_dino_spec)
-        self._null_action_table: dict[str, torch.Tensor] = {}
         self.register_buffer("_dino_mean", torch.zeros(self.d_dino), persistent=False)
         self.register_buffer("_dino_std", torch.ones(self.d_dino), persistent=False)
         self._load_jointflow_dino_stats(dino_cfg.get("stats_path", None))
@@ -382,13 +354,11 @@ class Qwen_GR00T(baseframework):
     def _unused_jointflow_param_anchor(self, task: str, ref: torch.Tensor) -> torch.Tensor:
         modules: list[nn.Module | None] = []
         if task in {"policy", "idm"}:
-            modules.extend([self.visual_head, self.future_dino_queries, self.act_ctx, self.probe_mlp, self.repa_proj])
+            modules.extend([self.visual_head, self.future_dino_queries, self.act_ctx])
         elif task == "fdm":
-            modules.extend([self.action_model, self.action_queries, self.probe_mlp, self.repa_proj])
+            modules.extend([self.action_model, self.action_queries])
         elif task == "passive":
-            modules.extend([self.action_model, self.action_queries, self.act_ctx, self.probe_mlp, self.repa_proj])
-        elif task == "effect":
-            pass
+            modules.extend([self.action_model, self.action_queries, self.act_ctx])
         else:
             raise ValueError(f"Unsupported JointFlow task `{task}`")
         return self._zero_grad_anchor_for_modules(modules, ref)
@@ -402,8 +372,6 @@ class Qwen_GR00T(baseframework):
             self.future_dino_queries,
             self.action_model,
             self.visual_head,
-            self.probe_mlp,
-            self.repa_proj,
         ]
         return self._zero_grad_anchor_for_modules(modules, ref)
 
@@ -616,37 +584,19 @@ class Qwen_GR00T(baseframework):
             batch["future_valid"] = torch.ones(len(examples), device=self.device, dtype=torch.float32)
         return batch
 
-    def set_null_action_table(self, table: dict) -> None:
-        self._null_action_table = {
-            str(name): torch.as_tensor(np.asarray(vec), dtype=torch.float32) for name, vec in table.items()
-        }
-
     #######
     # 中文注释：E1.3 correlated noise——把 trainer 算好的 Σ-Cholesky 透传给 action head。
     def set_action_correlation(self, chol) -> None:
         self.action_model.set_action_correlation(chol)
     #######
 
-    def make_null_action(self, action: torch.Tensor, examples: List[dict]) -> torch.Tensor:
-        bsz, horizon, dim = action.shape
-        bases = []
-        for ex in examples:
-            name = str(ex.get("dataset_name", ""))
-            if name not in self._null_action_table:
-                raise KeyError(
-                    f"[CED] dataset `{name}` missing from null-action table "
-                    f"(have: {sorted(self._null_action_table)})."
-                )
-            base = self._null_action_table[name]
-            if base.shape[0] != dim:
-                raise ValueError(f"[CED] null-action dim mismatch for `{name}`: table {base.shape[0]} vs action {dim}")
-            bases.append(base)
-        bases = torch.stack(bases).to(device=action.device, dtype=action.dtype)
-        nan_mask = torch.isnan(bases).unsqueeze(1).expand(bsz, horizon, dim)
-        null = bases.unsqueeze(1).expand(bsz, horizon, dim).clone()
-        first = action[:, :1, :].expand(bsz, horizon, dim)
-        null[nan_mask] = first[nan_mask]
-        return null
+    #######
+    # 中文注释：评测时设置在线 DINO 的 per-suite 归一化 stats（dino_v3_stats.json）。训练用的是离线精算特征
+    # （已按各 suite 的 stats 标准化），而 eval 走在线提取——必须用同一份 stats 归一化，否则 dino_proj 收到
+    # 原始尺度特征→视觉条件失效→SR≈0。每个 suite 的 stats 不同，评测前按 suite 注入对应文件。
+    def set_dino_stats(self, stats_path: str) -> None:
+        self._load_jointflow_dino_stats(stats_path)
+    #######
 
     @staticmethod
     def _jointflow_change_weights(z_t: torch.Tensor, z_h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -767,8 +717,6 @@ class Qwen_GR00T(baseframework):
         return hidden[:, query_slice].float()
 
     def _jointflow_forward(self, examples: List[dict], task: str = "policy") -> dict:
-        if task == "effect":
-            return self._jointflow_effect_forward(examples)
         batch = self._jointflow_examples_to_batch(
             examples,
             require_future_dino=task in {"fdm", "idm", "passive"},
@@ -799,7 +747,7 @@ class Qwen_GR00T(baseframework):
                 loss = self.action_model(
                     cond.to(dtype=head_dtype),
                     target.to(dtype=head_dtype),
-                    state=batch.get("state"),  # 中文注释：与源一致，state 透传 action head；include_state=false 时为 None（惰性）
+                    state=batch.get("state") if self._uses_action_state() else None,
                     encoder_attention_mask=None,
                 )
         else:
@@ -829,156 +777,6 @@ class Qwen_GR00T(baseframework):
         out.update(extras)
         return out
 
-    def _jointflow_effect_forward(self, examples: List[dict]) -> dict:
-        if not self.ced_enabled:
-            raise ValueError("task=effect requires framework.ced.enabled=true")
-        batch = self._jointflow_examples_to_batch(examples, require_future_dino=True, require_action=True)
-        fw = self.config.framework
-        ced_cfg = fw.ced
-        losses_cfg = fw.get("losses", {})
-        lam_i = float(losses_cfg.get("lam_i", 0.1))
-        lam_a = float(losses_cfg.get("lam_a", 0.0))
-        teacher = str(losses_cfg.get("teacher", "delta"))
-        delta_prob = float(losses_cfg.get("effect_delta_prob", 1.0))
-        tau = float(ced_cfg.get("tau", 1.0))
-        eps_gate = float(ced_cfg.get("eps_gate", 1.0e-3))
-        val_mod = int(ced_cfg.get("probe_val_mod", 10))
-
-        h_act = self._run_jointflow_path("policy", batch)
-        target_action = batch["action"][:, -self.action_horizon :, : self.action_dim].float()
-        device_type = h_act.device.type
-        ac = torch.autocast(device_type=device_type, enabled=False) if device_type in {"cuda", "cpu"} else nullcontext()
-        with ac:
-            head_dtype = self._jointflow_module_dtype(self.action_model)
-            #######
-            # 中文注释：CED 用 REPA 对齐——loss_act 这次前向顺便取回 DiT 第 repa_layer 层隐藏态做 align 学生特征，
-            # 复用同一次 DiT 前向，不额外多跑。
-            loss_act, repa_feat = self.action_model(
-                h_act.to(dtype=head_dtype),
-                target_action.to(dtype=head_dtype),
-                state=batch.get("state"),  # 中文注释：与源一致；include_state=false 时为 None（惰性）
-                encoder_attention_mask=None,
-                return_repa_features=True,
-                repa_layer=self.repa_layer,
-            )
-            #######
-        extras: dict = {"loss/act": loss_act.detach(), "loss_act": loss_act.detach()}
-
-        valid_mask = self._jointflow_future_valid_mask(batch, h_act)
-        if not bool(valid_mask.any()):
-            total = loss_act
-            out = {"effect_loss": total + self._all_jointflow_trainable_anchor(total)}
-            out.update(extras)
-            return out
-
-        cond_pos = self._run_jointflow_path("fdm", batch)
-        batch_nul = dict(batch)
-        batch_nul["action"] = self.make_null_action(batch["action"], batch["examples"])
-        cond_nul = self._run_jointflow_path("fdm", batch_nul)
-
-        z_h = self._select_jointflow_future_dino(batch["dino_1"], batch["examples"]).to(cond_pos.device, torch.float32)
-        z_t = self._select_jointflow_future_dino(batch["dino_0"], batch["examples"]).to(cond_pos.device, torch.float32)
-        cond_pos_v = cond_pos[valid_mask]
-        cond_nul_v = cond_nul[valid_mask]
-        z_h_v = z_h[valid_mask]
-        z_t_v = z_t[valid_mask]
-        #######
-        # 中文注释：REPA 学生特征取 valid 样本的 DiT 早期层隐藏态（取代原 Qwen policy query 特征 h_act_v）。
-        repa_feat_v = repa_feat[valid_mask]
-        #######
-        a_v = target_action[valid_mask]
-        examples_v = [ex for ex, keep in zip(batch["examples"], valid_mask.tolist()) if keep]
-
-        weights = None
-        if str(fw.visual_model.get("patch_weighting", "none")) == "change":
-            weights, clamp_frac = self._jointflow_change_weights(z_t_v, z_h_v)
-            extras["stat/w_clamp_frac"] = clamp_frac.detach()
-        loss_fdm, _, per_patch = self.visual_head(cond_pos_v, z_h_v, weights=weights, return_pred=True)
-        extras["loss/fdm"] = loss_fdm.detach()
-        extras["loss_fdm"] = loss_fdm.detach()
-        extras.update(self._jointflow_fdm_split_metrics(per_patch, z_t_v, z_h_v))
-
-        do_delta = delta_prob >= 1.0 or bool(torch.rand(()).item() < delta_prob)
-        if do_delta:
-            eps = torch.randn_like(z_h_v)
-            was_training = self.visual_head.training
-            self.visual_head.eval()
-            _, v_pos, _ = self.visual_head(cond_pos_v, z_h_v, noise=eps, t=0.0, return_pred=True)
-            _, v_nul, _ = self.visual_head(cond_nul_v, z_h_v, noise=eps, t=0.0, return_pred=True)
-            if was_training:
-                self.visual_head.train()
-            delta = v_pos.float() - v_nul.float()
-            pool_w = torch.softmax(delta.norm(dim=-1) / max(tau, 1e-6), dim=1)
-            d_vec = (delta * pool_w.unsqueeze(-1)).sum(dim=1)
-            extras["stat/delta_norm_mean"] = d_vec.detach().norm(dim=-1).mean()
-
-            a_flat = a_v.reshape(a_v.shape[0], -1)
-            #######
-            # 中文注释：CED probe/proj 在 bf16 eval 或手动 bf16 smoke 中参数 dtype 会变化；
-            # 输入按各自模块 dtype 前向，loss/余弦计算再转 fp32，兼顾兼容性和数值日志。
-            probe_dtype = self._jointflow_module_dtype(self.probe_mlp, fallback=d_vec.dtype)
-            probe_pred = self.probe_mlp(d_vec.to(dtype=probe_dtype)).float()
-            #######
-            is_val = torch.tensor(
-                [int(ex.get("trajectory_id", -1)) % val_mod == 0 for ex in examples_v],
-                device=d_vec.device,
-                dtype=torch.bool,
-            )
-            if bool((~is_val).any()):
-                loss_ident = ((probe_pred[~is_val] - a_flat[~is_val]) ** 2).mean()
-            else:
-                loss_ident = self._zero_grad_anchor_for_modules([self.probe_mlp], loss_fdm)
-            if bool(is_val.any()):
-                with torch.no_grad():
-                    extras["metric/probe_mse_val"] = ((probe_pred[is_val] - a_flat[is_val]) ** 2).mean()
-            extras["loss/ident"] = loss_ident.detach()
-            extras["loss_ident"] = loss_ident.detach()
-
-            if teacher == "delta":
-                t_vec = d_vec.detach()
-            elif teacher == "pooled_future":
-                pw = torch.softmax(v_pos.float().norm(dim=-1) / max(tau, 1e-6), dim=1)
-                t_vec = (v_pos.float() * pw.unsqueeze(-1)).sum(dim=1).detach()
-            elif teacher == "delta_shuffled":
-                t_vec = d_vec[torch.randperm(d_vec.shape[0], device=d_vec.device)].detach()
-            #######
-            # 中文注释（实验 E2.2/E2.3 的对照 teacher，只新增 teacher 选项、均 detach，不改 CED 机制/不加 trick）：
-            #   future_dino → 原始未来 DINO 特征 z_h 的范数 softmax 池化（"用 future DINO 与 DiT 对齐"的对照）
-            #   delta_dino  → 原始 (未来−当前) DINO 特征 (z_h−z_t) 的范数 softmax 池化（"用 delta DINO 对齐"的对照）
-            # 三者池化方式与 teacher=delta 完全一致，保证 E2.1/E2.2/E2.3 仅 teacher 不同、其余严格同构。
-            elif teacher == "future_dino":
-                pw = torch.softmax(z_h_v.float().norm(dim=-1) / max(tau, 1e-6), dim=1)
-                t_vec = (z_h_v.float() * pw.unsqueeze(-1)).sum(dim=1).detach()
-            elif teacher == "delta_dino":
-                z_diff = z_h_v.float() - z_t_v.float()
-                pw = torch.softmax(z_diff.norm(dim=-1) / max(tau, 1e-6), dim=1)
-                t_vec = (z_diff * pw.unsqueeze(-1)).sum(dim=1).detach()
-            #######
-            else:
-                raise ValueError(f"Unsupported CED teacher `{teacher}`")
-            gate = (t_vec.norm(dim=-1) > eps_gate).float()
-            #######
-            # 中文注释：REPA 对齐学生 = DiT 早期层（repa_layer）在 valid 样本上按 token 池化 → repa_proj 投到 Δ 空间，
-            # 再 fp32 与 detach 的 teacher 算 cosine。这样 align 真正作用在动作专家 DiT 的早期表征上。
-            proj_dtype = self._jointflow_module_dtype(self.repa_proj, fallback=repa_feat_v.dtype)
-            proj = self.repa_proj(repa_feat_v.mean(dim=1).to(dtype=proj_dtype)).float()
-            #######
-            cos = torch.nn.functional.cosine_similarity(proj.float(), t_vec, dim=-1)
-            loss_align = (gate * (1.0 - cos)).mean()
-            extras["loss/align"] = loss_align.detach()
-            extras["loss_align"] = loss_align.detach()
-            extras["stat/gate_on_frac"] = gate.detach().mean()
-        else:
-            loss_ident = self._zero_grad_anchor_for_modules([self.probe_mlp, self.repa_proj], loss_fdm)
-            loss_align = loss_fdm.new_zeros(())
-            extras["loss_ident"] = loss_ident.detach()
-            extras["loss_align"] = loss_align.detach()
-
-        total = loss_act + loss_fdm + lam_i * loss_ident + lam_a * loss_align
-        out = {"effect_loss": total + self._unused_jointflow_param_anchor("effect", total)}
-        out.update(extras)
-        return out
-
     @torch.inference_mode()
     def _jointflow_predict_action(self, examples: List[dict], **kwargs) -> dict:
         batch = self._jointflow_examples_to_batch(examples, require_future_dino=False, require_action=False)
@@ -989,11 +787,194 @@ class Qwen_GR00T(baseframework):
         head_dtype = self._jointflow_module_dtype(self.action_model, fallback=cond.dtype)
         pred_actions = self.action_model.predict_action(
             cond.to(dtype=head_dtype),
-            state=batch.get("state"),  # 中文注释：与源一致；include_state=false 时为 None（惰性）
+            state=batch.get("state") if self._uses_action_state() else None,
             encoder_attention_mask=None,
         )
         #######
         return {"normalized_actions": pred_actions.float().detach().cpu().numpy()}
+    #######
+
+    #######
+    # 中文注释：WAM 模块初始化（qwenvl-gr00t 原生视觉 policy + DINO 只做监督头，参考 LaWAM 占位 token 方案）。
+    # 占位 token：act/flow query 共用一个特殊 token，按出现顺序前 n_act 为 act、其后 n_flow 为 flow（同 LaWAM build_placeholder_masks）。
+    def _init_wam_modules(self) -> None:
+        dino_cfg = self.config.framework.dino
+        visual_cfg = self.config.framework.visual_model
+        action_cfg = self.config.framework.action_model
+        wam_cfg = self.config.framework.get("wam", {})
+        self.action_dim = int(action_cfg.action_dim)
+        self.wam_n_act = int(action_cfg.get("n_action_query", self.action_horizon))
+        self.wam_n_flow = int(visual_cfg.get("n_flow_query", 8))
+        self.wam_dino_loss_weight = float(wam_cfg.get("dino_loss_weight", 1.0))
+        # 占位 token 注册 + 词表 resize（参考 LaWAM configure_latent_world_processor）。
+        self.wam_ph = str(wam_cfg.get("placeholder_token", "<ACT_PH>"))
+        tok = self.qwen_vl_interface.processor.tokenizer
+        tok.add_special_tokens({"additional_special_tokens": [self.wam_ph]})
+        self.wam_ph_id = int(tok.convert_tokens_to_ids(self.wam_ph))
+        self.qwen_vl_interface.model.resize_token_embeddings(len(tok))
+        # DINO 仅作监督 target：复用 jointflow 的 DINO 提取(在线) + 未来帧 flow 头；推理完全不用。
+        self._jointflow_dino_spec = resolve_dino_spec(dino_cfg)
+        self.d_dino = int(self._jointflow_dino_spec["embed_dim"])
+        self.config.framework.visual_model.d_dino = self.d_dino
+        self.register_buffer("_dino_mean", torch.zeros(self.d_dino), persistent=False)
+        self.register_buffer("_dino_std", torch.ones(self.d_dino), persistent=False)
+        self._load_jointflow_dino_stats(dino_cfg.get("stats_path", None))
+        self.dino = None  # 中文注释：DINO backbone 懒加载（仅训练算 target 时用），与 jointflow 一致
+        self.wam_visual_head = VisualFlowMatchingHead(self.config)
+        # 中文注释：fdm（前向动力学）范式需要动作上下文——把 act_ctx(动作) 拼到 flow-query 作为 DINO 头的 cross-attn 条件。
+        self.wam_act_ctx = ActionContextEncoder(
+            action_dim=self.action_dim, hidden_size=int(self.qwen_vl_interface.model.config.hidden_size)
+        )
+
+    @staticmethod
+    def _wam_view_list(v):
+        if v is None:
+            return []
+        if isinstance(v, (list, tuple)):
+            return list(v)
+        v = np.asarray(v)
+        return [v[i] for i in range(v.shape[0])] if v.ndim == 4 else [v]
+
+    # 中文注释：取 (当前所有视角 list, future_main) PIL——当前帧用 image_0(在线 raw [V,H,W,C])/eval 用 image；
+    # 未来帧用 image_1（idm 用，取第 0 视角）。支持任意相机数：LIBERO 2 路(agentview+wrist)、RoboTwin 3 路(head+left+right)。
+    def _wam_views(self, ex: dict):
+        cur = self._wam_view_list(ex.get("image_0", ex.get("image")))
+        views = [to_pil_preserve(v) for v in cur]
+        fut = self._wam_view_list(ex.get("image_1"))
+        future_main = to_pil_preserve(fut[0]) if fut else None
+        return views, future_main
+
+    # 中文注释：构 Qwen 原生视觉 prompt：[main 图, CoT 文本+act 占位×n_act, wrist 图, flow 占位×n_flow]；
+    # 返回 processor 输入 + act/flow 占位 mask（cumsum 分前后段，同 LaWAM）。
+    def _build_wam_inputs(self, examples: List[dict], include_future: bool = False):
+        proc = self.qwen_vl_interface.processor
+        ph_act = " ".join([self.wam_ph] * self.wam_n_act)
+        ph_flow = " ".join([self.wam_ph] * self.wam_n_flow)
+        cot = self.config.datasets.vla_data.get("CoT_prompt", "{instruction}")
+        messages = []
+        for ex in examples:
+            views, future_main = self._wam_views(ex)
+            text = str(cot).replace("{instruction}", str(ex.get("lang", "")))
+            # 中文注释：所有输入视角先放（LIBERO 2 / RoboTwin 3；含 idm 的未来帧），再放文本+act占位+flow占位——
+            # 保证 act/flow 占位（native causal）能 attend 到全部图像。
+            imgs = list(views)
+            if include_future and future_main is not None:
+                imgs.append(future_main)
+            content = [{"type": "image", "image": im} for im in imgs]
+            content.append({"type": "text", "text": f"{text}\n{ph_act}\n{ph_flow}"})
+            messages.append([{"role": "user", "content": content}])
+        old = proc.tokenizer.padding_side
+        proc.tokenizer.padding_side = "left"
+        try:
+            inputs = proc.apply_chat_template(
+                messages, tokenize=True, padding=True, add_generation_prompt=True,
+                return_dict=True, return_tensors="pt",
+            )
+        finally:
+            proc.tokenizer.padding_side = old
+        inputs = inputs.to(self.qwen_vl_interface.model.device)
+        ph = inputs["input_ids"] == self.wam_ph_id
+        order = ph.cumsum(dim=1)
+        act_mask = ph & (order <= self.wam_n_act)
+        flow_mask = ph & (order > self.wam_n_act) & (order <= self.wam_n_act + self.wam_n_flow)
+        return inputs, act_mask, flow_mask
+
+    def _wam_backbone(self, examples: List[dict], include_future: bool = False):
+        inputs, act_mask, flow_mask = self._build_wam_inputs(examples, include_future=include_future)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = self.qwen_vl_interface.model(
+                **inputs, output_hidden_states=True, return_dict=True, use_cache=False,
+            )
+        hidden = out.hidden_states[-1]
+        bsz = len(examples)
+        d = hidden.shape[-1]
+        h_act = hidden[act_mask].view(bsz, self.wam_n_act, d)
+        h_flow = hidden[flow_mask].view(bsz, self.wam_n_flow, d)
+        #######
+        # 中文注释：除两组 query 外再返回完整隐藏序列 + padding mask——action head 的 memory 用
+        # [act-query ⊕ 完整序列]（见 _wam_action_memory），让动作条件享受 native 的全上下文（稳 libero_10）。
+        attn = inputs.get("attention_mask", None)
+        return h_act, h_flow, hidden, attn
+        #######
+
+    #######
+    # 中文注释：wam action head 的 cross-attn memory = act-query（显式保留 metaquery，创新点1）⊕ 完整 VLM 隐藏序列
+    # （native 全上下文）。mask = [act-query 全 1] ⊕ [完整序列 padding mask]。与 baseline 的
+    # action_model(完整 last_hidden + encoder_attention_mask) 对齐，让 wam 动作路径继承 baseline 的 libero_10 表现。
+    def _wam_action_memory(self, h_act: torch.Tensor, hidden: torch.Tensor, attn):
+        mem = torch.cat([h_act, hidden.to(h_act.dtype)], dim=1)
+        mem_mask = None
+        if attn is not None:
+            act_ones = torch.ones(h_act.shape[0], h_act.shape[1], device=attn.device, dtype=attn.dtype)
+            mem_mask = torch.cat([act_ones, attn.to(act_ones.device)], dim=1).to(torch.bool)
+        return mem, mem_mask
+    #######
+
+    #######
+    # 中文注释：wam 多任务每步只跑一个 task，未用到的子模块（DINO 头/act_ctx 或 action head）拿不到梯度 →
+    # DeepSpeed/DDP 的 unused-parameter 会卡死/报错（同 jointflow 的坑 [[jointflow-multigpu-ddp]]）。
+    # 给每步「未用模块」加零梯度 anchor 覆盖：policy/idm 未用 visual_head+act_ctx；passive 未用 action_model+act_ctx；fdm 未用 action_model。
+    # 这样单任务（如 exp2/exp3 只 policy）也能多卡训练不挂。
+    def _wam_unused_anchor(self, task: str, ref: torch.Tensor) -> torch.Tensor:
+        if task in ("policy", "idm"):
+            modules = [self.wam_visual_head, self.wam_act_ctx]
+        elif task == "passive":
+            modules = [self.action_model, self.wam_act_ctx]
+        elif task == "fdm":
+            modules = [self.action_model]
+        else:
+            modules = []
+        return self._zero_grad_anchor_for_modules(modules, ref)
+    #######
+
+    # 中文注释：WAM 四范式前向（每步一种，由 trainer 按 tasks.weights 广播采样）：
+    #   policy: 当前图 → act-query → action（→ "action_loss"，兼容无 tasks 的 else 分支）
+    #   idm   : 当前图+未来图 → act-query → action（逆动力学，→ "idm_loss"）
+    #   passive: 当前图 → flow-query → 预测未来 DINO（→ "passive_loss"）
+    #   fdm   : 当前图 + 动作上下文 → flow-query → 预测未来 DINO（前向动力学，→ "fdm_loss"）
+    # 两组 query 依托不同范式：act-query 服务 policy/idm（预测 action）；flow-query 服务 passive/fdm（预测 DINO）。
+    def _wam_forward(self, examples: List[dict], task: str = "policy", **kwargs) -> dict:
+        task = str(task)
+        h_act, h_flow, hidden, attn = self._wam_backbone(examples, include_future=(task == "idm"))
+        if task in ("policy", "idm"):
+            actions = self._stack_jointflow_field(examples, "action", required=True)
+            actions = actions[:, -self.action_horizon :, : self.action_dim].float()
+            state = self._stack_jointflow_field(examples, "state", required=False) if self._uses_action_state() else None
+            #######
+            # 中文注释：action 条件 = act-query ⊕ 完整序列 + mask（native 全上下文，见 _wam_action_memory）。
+            mem, mem_mask = self._wam_action_memory(h_act, hidden, attn)
+            hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
+            loss = self.action_model(mem.to(hd), actions.to(hd), state, encoder_attention_mask=mem_mask)
+            #######
+            return {("action_loss" if task == "policy" else "idm_loss"): loss + self._wam_unused_anchor(task, loss)}
+        # passive / fdm：flow-query → 预测未来帧 DINO；fdm 额外把 act_ctx(动作) 拼进 cross-attn 条件。
+        z_gt = self._run_jointflow_dino_on_images(examples, ["image_1"], required=True)
+        if z_gt.ndim == 4:
+            z_gt = z_gt[:, 0]
+        cond = h_flow
+        if task == "fdm":
+            actions = self._stack_jointflow_field(examples, "action", required=True)
+            actions = actions[:, -self.action_horizon :, : self.action_dim]
+            ad = self._jointflow_module_dtype(self.wam_act_ctx, fallback=h_flow.dtype)
+            actx = self.wam_act_ctx(actions.to(ad)).to(h_flow.dtype)
+            cond = torch.cat([h_flow, actx], dim=1)
+        vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=cond.dtype)
+        loss = self.wam_dino_loss_weight * self.wam_visual_head(cond.to(vh), z_gt)
+        return {f"{task}_loss": loss + self._wam_unused_anchor(task, loss)}
+
+    # 中文注释：WAM 推理 = 只走原生视觉 policy（act-query→action head 采样）；DINO/监督头完全不碰。
+    @torch.inference_mode()
+    def _wam_predict_action(self, examples: List[dict], **kwargs) -> dict:
+        if not isinstance(examples, list):
+            examples = [examples]
+        #######
+        # 中文注释：推理 action 条件与训练一致 = act-query ⊕ 完整序列 + mask（native 全上下文）。
+        h_act, _h_flow, hidden, attn = self._wam_backbone(examples)
+        mem, mem_mask = self._wam_action_memory(h_act, hidden, attn)
+        head_dtype = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
+        pred = self.action_model.predict_action(mem.to(head_dtype), state=None, encoder_attention_mask=mem_mask)
+        #######
+        return {"normalized_actions": pred.float().detach().cpu().numpy()}
     #######
 
     def forward(
@@ -1003,6 +984,9 @@ class Qwen_GR00T(baseframework):
     ) -> Tuple:
         """ """
         #######
+        # 中文注释：WAM 优先接管（原生视觉 policy + DINO 监督头）；其次 JointFlow；都关则原生 action_loss。
+        if self.wam_enabled:
+            return self._wam_forward(examples, **kwargs)
         # 中文注释：JointFlow-style 训练只在显式启用时接管 forward；原生 QwenGR00T 保持 action_loss 路径。
         if self.jointflow_enabled:
             return self._jointflow_forward(examples, task=str(kwargs.get("task", "policy")))
@@ -1073,7 +1057,10 @@ class Qwen_GR00T(baseframework):
                 normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
         """
         #######
-        # 中文注释：评估/部署阶段只走 JointFlow 的 policy 路径，禁止触发 fdm/idm/effect 辅助任务。
+        # 中文注释：WAM 推理只走原生视觉 policy（不碰 DINO）；其次 JointFlow。
+        if self.wam_enabled:
+            return self._wam_predict_action(examples=examples, **kwargs)
+        # 中文注释：评估/部署阶段只走 JointFlow 的 policy 路径，禁止触发 fdm/idm 辅助任务。
         if self.jointflow_enabled:
             return self._jointflow_predict_action(examples=examples, **kwargs)
         #######

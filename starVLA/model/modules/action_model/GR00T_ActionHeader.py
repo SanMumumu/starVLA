@@ -330,20 +330,24 @@ class FlowmatchingActionHead(nn.Module):
         return (self.config.noise_s - sample) / self.config.noise_s
 
     #######
-    # 中文注释：E1.3——注入 correlated noise 的 Cholesky（trainer 启动时从 dataloader 算好）。L 形状 [flat,flat]。
+    # 中文注释：E1.3——注入 correlated noise 的 Cholesky。训练时 trainer 启动算好注入；评测时 server 从
+    # <run_dir>/action_correlation_cholesky.npy 读出注入（buffer persistent=False 不进 ckpt）。L 形状 [flat,flat]。
     def set_action_correlation(self, chol: torch.Tensor) -> None:
         chol = torch.as_tensor(chol, dtype=torch.float32)
         self._action_corr_chol.copy_(chol.to(self._action_corr_chol.device))
         self._action_corr_loaded = True
 
-    # 中文注释：采样 flow-matching 噪声。开关开且已注入 Σ-Cholesky 时用相关噪声 z@L^T，否则独立噪声。
-    def _sample_fm_noise(self, actions: torch.Tensor) -> torch.Tensor:
+    # 中文注释：采样 flow-matching 初始噪声（按 shape）。开关开且已注入 Σ-Cholesky 时用相关噪声 z@L^T，否则独立噪声。
+    # 训练 forward 与推理 predict_action 必须走同一个分布，否则 flow 从错误起点积分（E1.3 之前推理误用 randn → 0% SR）。
+    def _sample_initial_noise(self, batch_size: int, device, dtype) -> torch.Tensor:
         if self.use_correlated_noise and self._action_corr_loaded:
-            bsz, horizon, dim = actions.shape
-            z = torch.randn(bsz, horizon * dim, device=actions.device, dtype=actions.dtype)
-            noise = (z @ self._action_corr_chol.to(actions.dtype).T).reshape(bsz, horizon, dim)
-            return noise
-        return torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+            z = torch.randn(batch_size, self.action_horizon * self.action_dim, device=device, dtype=dtype)
+            L = self._action_corr_chol.to(device=device, dtype=dtype)
+            return (z @ L.T).reshape(batch_size, self.action_horizon, self.action_dim)
+        return torch.randn(batch_size, self.action_horizon, self.action_dim, device=device, dtype=dtype)
+
+    def _sample_fm_noise(self, actions: torch.Tensor) -> torch.Tensor:
+        return self._sample_initial_noise(actions.shape[0], actions.device, actions.dtype)
     #######
 
     def prepare_input(self, batch: dict) -> BatchFeature:
@@ -355,11 +359,6 @@ class FlowmatchingActionHead(nn.Module):
         actions: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
-        #######
-        # 中文注释：CED REPA 对齐用——为真时额外返回 DiT 第 repa_layer 层隐藏态做对齐 teacher 的学生特征。
-        return_repa_features: bool = False,
-        repa_layer: int = 4,
-        #######
     ):
         """
         vl_embs: shape (B, seq_length, feature_dim)
@@ -370,9 +369,8 @@ class FlowmatchingActionHead(nn.Module):
         #######
         # 中文注释：E1.3 multi-step Flow Matching——把 (vl_embs, actions, state) 沿 batch 复制 N 份，
         # 各采独立 (noise,t)、一次 DiT 前向、平均 loss，降训练方差（N=1 即原行为）。
-        # CED REPA 路径(return_repa_features=True)保持单次，避免 repa_feat 批维与 valid_mask 错位。
         n_fm = int(getattr(self, "flow_matching_steps", 1))
-        if n_fm > 1 and not return_repa_features:
+        if n_fm > 1:
             vl_embs = vl_embs.repeat(n_fm, 1, 1)
             actions = actions.repeat(n_fm, 1, 1)
             if state is not None:
@@ -411,24 +409,6 @@ class FlowmatchingActionHead(nn.Module):
         )
 
         # Join VLM features with state and action embedding along sequence dimension.
-        #######
-        # 中文注释：CED REPA 对齐路径——复用 DiT 已有的 return_all_hidden_states 取早期层隐藏态，
-        # 一并返回 (loss, repa_feat=all_hidden_states[repa_layer])；默认 return_repa_features=False，原行为不变。
-        if return_repa_features:
-            model_output, all_hidden_states = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs,
-                encoder_attention_mask=encoder_attention_mask,
-                timestep=t_discretized,
-                return_all_hidden_states=True,
-            )
-            layer = max(0, min(int(repa_layer), len(all_hidden_states) - 1))
-            repa_feat = all_hidden_states[layer]
-            pred = self.action_decoder(model_output)
-            pred_actions = pred[:, -actions.shape[1] :]
-            loss = ((pred_actions - velocity) ** 2).mean()
-            return loss, repa_feat
-        #######
         model_output = self.model(
             hidden_states=sa_embs,
             encoder_hidden_states=vl_embs,
@@ -453,11 +433,10 @@ class FlowmatchingActionHead(nn.Module):
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
-        actions = torch.randn(
-            size=(batch_size, self.action_horizon, self.action_dim),
-            dtype=vl_embs.dtype,
-            device=device,
-        )
+        #######
+        # 中文注释：E1.3——推理初始噪声必须与训练同分布（correlated noise 开时用 z@L^T，否则 randn）。
+        actions = self._sample_initial_noise(batch_size, device, vl_embs.dtype)
+        #######
 
         num_steps = self.num_inference_timesteps
         dt = 1.0 / num_steps

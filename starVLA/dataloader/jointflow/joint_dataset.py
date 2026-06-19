@@ -534,46 +534,9 @@ def build_joint_dataloader(cfg, mode: str = "train") -> DataLoader:
 ######### // code // ##########
 
 
-######### // code // ##########
-# 中文注释（CED C2）：构造"归一化空间的空动作"查表。
-# 语义（杀手#1——a₀ 必须在 raw 空间构造再归一化）：
-#   - LIBERO 的 lerobot action 本身是 delta 控制量，"原地不动" = raw 平动/旋转维 == 0；
-#     min_max 等逐维单调仿射归一化下，norm(raw 0) 是每个数据集一个常数 → 直接用该数据集
-#     **活的 Normalizer 对象**对 raw 0 做 normalize（不重新实现公式，杜绝 drift）。
-#   - 无归一化模式的维（如 LIBERO gripper 直接透传）填 NaN，由 framework 侧解释为
-#     "复制 batch 动作首步的归一化值"（单调映射下与 raw 空间'保持首步指令'等价）。
-# 返回 {dataset_name: np.ndarray[action_dim]}，维序与 _pack_sample 的 action 拼接顺序一致。
-def compute_null_action_table(mixture_dataset: LeRobotMixtureDataset) -> dict[str, np.ndarray]:
-    table: dict[str, np.ndarray] = {}
-    for ds in mixture_dataset.datasets:
-        # 收集该数据集 transforms 里所有作用在 action.* 的 StateActionTransform 的 normalizer
-        normalizers = {}
-        transforms = getattr(ds, "transforms", None)
-        transform_list = getattr(transforms, "transforms", [transforms] if transforms is not None else [])
-        for tr in transform_list:
-            if isinstance(tr, StateActionTransform):
-                for key in tr.apply_to:
-                    if str(key).startswith("action.") and key in tr._normalizers:
-                        normalizers[key] = tr._normalizers[key]
-
-        parts: list[np.ndarray] = []
-        for key in ds.modality_keys["action"]:
-            subkey = str(key).split(".", 1)[1]
-            stats = ds.metadata.statistics.action[subkey]
-            dim = int(np.asarray(stats.min).reshape(-1).shape[0])
-            if key in normalizers:
-                zero = torch.zeros(dim, dtype=torch.float32)
-                parts.append(normalizers[key].forward(zero).numpy().astype(np.float32).reshape(-1))
-            else:
-                parts.append(np.full(dim, np.nan, dtype=np.float32))
-        table[str(ds.dataset_name)] = np.concatenate(parts)
-    return table
-######### // code // ##########
-
-
 #######
 # 中文注释：E1.3 correlated noise——从数据集采样归一化动作 chunk，估计 flat(=horizon·action_dim) 的协方差 Σ，
-# 返回正则化协方差 βΣ+(1−β)I 的下三角 Cholesky（[flat,flat]）。训练启动时算一次，注入 action head（同 null 表范式）。
+# 返回正则化协方差 βΣ+(1−β)I 的下三角 Cholesky（[flat,flat]）。训练启动时算一次，注入 action head。
 def compute_action_correlation_cholesky(
     mixture_dataset: LeRobotMixtureDataset, num_samples: int = 20000, beta: float = 0.5, seed: int = 0
 ) -> np.ndarray:

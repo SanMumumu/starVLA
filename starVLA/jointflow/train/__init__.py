@@ -1,2 +1,0 @@
-"""JointFlow training entry points."""
-

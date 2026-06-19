@@ -1,10 +1,8 @@
 #######
-# 中文注释：QwenGR00T(wam/jointflow/baseline) AIDI 训练 job 模板。提交新实验改两处：
-#   JOB_NAME → <实验名>-8gpu；RUN_SCRIPTS 末尾 → 实验名（experiments/<名>.sh 去 .sh）。
-# 每个实验已在 jobs/ 下各有一份零编辑 job，直接 submit。
+# 中文注释：RoboTwin E1 WAM 四范式 job（零编辑提交，backbone 全量训）。科学定义见 aidi/experiments/robotwin_wam_e1_4task.sh。
 #######
 REQUIRED:
-  JOB_NAME: "wam-e1-4task-8gpu"
+  JOB_NAME: "robotwin-wam-e1-4task-8gpu"
   JOB_PASSWD: "newk8s666"
 
   UPLOAD_DIR: "/home/users/sen02.wang-labs/aidi_jobs/starvla_dev"
@@ -14,7 +12,7 @@ REQUIRED:
   WORKER_MAX_NUM: 1
   GPU_PER_WORKER: 8
 
-  RUN_SCRIPTS: "${WORKING_PATH}/starVLA/starVLA/aidi/run_aidi.sh e1_wam_4task"
+  RUN_SCRIPTS: "${WORKING_PATH}/starVLA/starVLA/aidi/run_aidi.sh robotwin_wam_e1_4task"
 
 OPTIONAL:
   FRAMEWORK: "pytorch"
@@ -23,7 +21,7 @@ OPTIONAL:
   DOCKER_IMAGE: "docker.hobot.cc/imagesys/starvla:v1.0"
   WALL_TIME: 20000
   JOB_TYPE: "train"
-  REMARK: "QwenGR00T wam/jointflow on native Qwen3-VL"
+  REMARK: "RoboTwin WAM E1: four paradigms policy/passive/fdm/idm (creativity #1)"
   DATA_SPACE:
     DATA_TYPE: "dmp"
     INPUT: "robot_lab"

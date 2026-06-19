@@ -62,6 +62,18 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logger = get_logger(__name__)
 
 
+def configure_torch_runtime() -> None:
+    """Configure optional CUDA speed knobs controlled by launch env vars."""
+    allow_tf32 = os.getenv("STARVLA_ALLOW_TF32", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+    if allow_tf32:
+        precision = os.getenv("STARVLA_FLOAT32_MATMUL_PRECISION", "high")
+        torch.set_float32_matmul_precision(precision)
+        logger.info("STARVLA torch runtime: TF32 enabled, float32_matmul_precision=%s", precision)
+
+
 def load_fast_tokenizer():
     return AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
 
@@ -140,18 +152,30 @@ class VLATrainer(TrainerUtils):
         framework_cfg = getattr(cfg, "framework", None)
         jointflow_cfg = getattr(framework_cfg, "jointflow", None) if framework_cfg is not None else None
         tasks_cfg = getattr(framework_cfg, "tasks", None) if framework_cfg is not None else None
+        #######
+        # 中文注释：多任务采样既服务 jointflow，也服务 wam（四范式 policy/passive/fdm/idm）；任一开关开 + tasks.weights 即生效。
+        wam_cfg = getattr(framework_cfg, "wam", None) if framework_cfg is not None else None
+        _multitask_on = (jointflow_cfg is not None and bool(jointflow_cfg.get("enabled", False))) or (
+            wam_cfg is not None and bool(wam_cfg.get("enabled", False))
+        )
         if (
-            jointflow_cfg is not None
-            and bool(jointflow_cfg.get("enabled", False))
+            _multitask_on
             and tasks_cfg is not None
             and hasattr(tasks_cfg, "get")
         ):
+        #######
             weights = tasks_cfg.get("weights", None)
             if weights:
                 self._jointflow_tasks = [str(k) for k, v in weights.items() if float(v) > 0]
                 self._jointflow_weights = [float(weights[k]) for k in self._jointflow_tasks]
                 if not self._jointflow_tasks:
                     raise ValueError("framework.tasks.weights must contain at least one positive task weight.")
+                if self.accelerator.is_main_process:
+                    logger.info(
+                        "Active QwenGR00T task sampler: tasks=%s weights=%s",
+                        self._jointflow_tasks,
+                        self._jointflow_weights,
+                    )
         #######
 
     def prepare_training(self):
@@ -356,11 +380,7 @@ class VLATrainer(TrainerUtils):
             "fdm_loss": "loss_fdm",
             "idm_loss": "idm_loss",
             "passive_loss": "passive_loss",
-            "effect_loss": "effect_loss",
-            "loss_act": "loss_act",
             "loss_fdm": "loss_fdm",
-            "loss_ident": "loss_ident",
-            "loss_align": "loss_align",
         }
         for key, value in output_dict.items():
             if torch.is_tensor(value):
@@ -494,7 +514,7 @@ class VLATrainer(TrainerUtils):
                 #######
 
         #######
-        # 中文注释：JointFlow 分支记录 policy/fdm/idm/effect/CED 关键 loss；旧分支保持 action_dit_loss。
+        # 中文注释：JointFlow 分支记录 policy/fdm/idm/passive 关键 loss；旧分支保持 action_dit_loss。
         if jointflow_task is not None:
             return self._collect_jointflow_metrics(output_dict, jointflow_task, total_loss)
         return {
@@ -535,27 +555,8 @@ def main(cfg) -> None:
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
     #######
-    # 中文注释：CED effect 任务需要按数据集构造归一化空间 no-op action 表。
-    # 这里在原生训练入口中完成注入，保持 qwen3vl-gr00t 的 trainer/config/dataloader 主流程不变。
-    ced_cfg = getattr(getattr(cfg, "framework", None), "ced", None)
-    jointflow_cfg = getattr(getattr(cfg, "framework", None), "jointflow", None)
-    if (
-        jointflow_cfg is not None
-        and bool(jointflow_cfg.get("enabled", False))
-        and ced_cfg is not None
-        and bool(ced_cfg.get("enabled", False))
-        and hasattr(vla, "set_null_action_table")
-    ):
-        from starVLA.dataloader.jointflow.joint_dataset import compute_null_action_table
-
-        null_table = compute_null_action_table(vla_train_dataloader.dataset)
-        vla.set_null_action_table(null_table)
-        if accelerator.is_main_process:
-            logger.info(f"JointFlow CED null-action table ready for datasets: {sorted(null_table)}")
-    #######
-    #######
     # 中文注释：E1.3 correlated noise——若 action_model.use_correlated_noise=true，启动时从 dataloader 估计动作协方差
-    # 的 Cholesky 并注入 action head（同 null 表范式，免离线脚本）。开关关时此段不执行，不影响其它实验。
+    # 的 Cholesky 并注入 action head（启动时算好注入，免离线脚本）。开关关时此段不执行，不影响其它实验。
     action_cfg = getattr(getattr(cfg, "framework", None), "action_model", None)
     if (
         action_cfg is not None
@@ -569,7 +570,13 @@ def main(cfg) -> None:
         )
         vla.set_action_correlation(chol)
         if accelerator.is_main_process:
-            logger.info(f"E1.3 correlated-noise Cholesky ready: shape={chol.shape}, beta={action_cfg.get('correlation_beta', 0.5)}")
+            #######
+            # 中文注释：把 Cholesky 落盘到 run 根目录（buffer persistent=False 不进 ckpt）；评测时 server 读它注入，
+            # 保证推理初始噪声分布与训练一致。文件名与 PolicyServerWrapper 约定一致。
+            import numpy as _np
+            _np.save(os.path.join(output_dir, "action_correlation_cholesky.npy"), _np.asarray(chol))
+            logger.info(f"E1.3 correlated-noise Cholesky ready: shape={chol.shape}, beta={action_cfg.get('correlation_beta', 0.5)} → saved to {output_dir}/action_correlation_cholesky.npy")
+            #######
     #######
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 

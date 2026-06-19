@@ -1,0 +1,159 @@
+#######
+# 中文注释：QwenWAM RoboTwin 训练配置——qwenvl-gr00t 原生视觉 policy + DINO 只做监督头（参考 LaWAM）。
+# 与 examples/LIBERO/train_files/starvla_qwenwam_libero.yaml 同构,仅换 RoboTwin 维度/数据:
+#   双臂 Agilex action_dim/state_dim=14、action_horizon=16、abs_qpos、3 相机(cam_high/left_wrist/right_wrist)。
+# framework.wam.enabled=true 接管四范式;DINO 不进 policy、推理不碰。
+# wam _wam_views 已支持多相机：3 路(head/left/right)全部喂进 Qwen 原生视觉 prompt（训练+评测一致）。
+# 真实数据 smoke 已过：image_0/1=[3,480,640,3]、action=[16,14]、四范式 + predict(2,16,14) 全 OK。
+#
+# ⚠️ 提交前确认:
+#  1) data_root_dir 用占位集群路径,需按实际 RoboTwin lerobot 根目录改(本机已验 /mnt/hwdata/.../DATA/RoboTwin);
+#  2) datasets.vla_data.action_horizon 必须 = framework.action_model.action_horizon(=16);jointflow dataset 读前者(默认8);
+#  3) future_stride=16 对齐 horizon;data_mix=robotwin_clean(50 Clean 任务),可换 robotwin_all(含 Randomized)/robotwin_clean_task1(单任务调试)。
+#######
+run_id: starvla_qwenwam_robotwin
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_qwenwam_robotwin
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: starvla_qwenwam_robotwin
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T
+  qwenvl:
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B-Instruct/
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: true
+    vl_hidden_dim: 2048
+    max_text_length: 256
+  #######
+  # 中文注释：WAM 总开关 + 占位 token + DINO 监督权重。
+  wam:
+    enabled: true
+    placeholder_token: "<ACT_PH>"
+    dino_loss_weight: 1.0
+  #######
+  #######
+  # 中文注释：四范式（创新点1）采样权重——policy/passive/fdm/idm。act-query 服务 policy/idm，flow-query 服务 passive/fdm。
+  tasks:
+    weights:
+      policy: 1.0
+      passive: 0.5
+      fdm: 0.5
+      idm: 0.5
+  #######
+  #######
+  # 中文注释：DINO 仅作监督头预测 target（未来帧 DINO，取第 0 个 view=cam_high），policy/推理不用；stats_path=null 自洽。
+  dino:
+    name: dinov3_vits16
+    hf_model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+    repo_or_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/dinov3_repo
+    weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/dinov3-vits16-pretrain-lvd1689m/
+    loader: auto
+    image_size: 224
+    patch_size: 16
+    embed_dim: 384
+    future_view_keys: ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
+    stats_path: null
+    load_live_backbone: false
+    dino_pool: 1
+  #######
+  action_model:
+    action_model_type: DiT-B
+    action_dim: 14            # 中文注释：RoboTwin 双臂 Agilex（左/右 6 关节 + 左/右 gripper = 14）
+    state_dim: 14
+    action_horizon: 16        # 中文注释：RoboTwin chunk 长度
+    n_action_query: 32        # 中文注释：act 占位 query 数（与 chunk 解耦，留足条件容量）
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_inference_timesteps: 10
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    repeated_diffusion_steps: 1
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.1
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 24
+      num_attention_heads: 12
+      attention_head_dim: 64
+      output_dim: 768
+      positional_embeddings: null
+  #######
+  # 中文注释：visual_model = DINO 监督头（flow 占位 query→预测未来 DINO 特征）。
+  visual_model:
+    d_dino: 384
+    n_query: 196
+    n_flow_query: 64
+    max_image_queries: 256
+    hidden_size: 1024
+    cross_attention_dim: 2048
+    num_attention_heads: 16
+    attention_head_dim: 64
+    num_layers: 12
+    dropout: 0.1
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_inference_timesteps: 6
+    patch_weighting: change
+  #######
+
+datasets:
+  vla_data:
+    dataset_py: jointflow
+    data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin   # ⚠️ 按实际 RoboTwin 根目录改
+    data_mix: robotwin_clean          # 50 Clean 任务；可换 robotwin_all(含 Randomized) / robotwin_clean_task1(单任务调试)
+    action_type: abs_qpos             # 中文注释：RoboTwin 是绝对关节角（非 delta）
+    action_horizon: 16                # 中文注释：dataset 侧 chunk 长度——jointflow dataset 读 data_cfg.action_horizon(默认8)，
+                                      # 必须与 framework.action_model.action_horizon=16 一致，否则 action[B,8,14] vs 模型期望[B,16,14] 维度不匹配。
+    sequential_step_sampling: false
+    include_state: false
+    obs_image_size: [224, 224]
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
+    per_device_batch_size: 8
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+    #######
+    # 中文注释：WAM 必需：online_dino=true 产 raw image_0(当前)+image_1(未来帧);future_stride 对齐 horizon。
+    online_dino: true
+    world_model:
+      future_stride: 16
+    #######
+
+trainer:
+  max_train_steps: 100000
+  num_warmup_steps: 5000
+  save_interval: 5000
+  #######
+  # 中文注释：走独立 RoboTwin sim 评测（examples/Robotwin/eval_files），关 in-loop eval。
+  eval_interval: 1000000
+  #######
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  #######
+  # 中文注释：backbone 不冻结，全量训；VLA-only。
+  loss_scale:
+    vla: 1.0
+  freeze_modules: ''
+  #######
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

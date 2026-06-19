@@ -73,21 +73,16 @@ class VisualFlowMatchingHead(nn.Module):
         return x
 
     ######### // code // ##########
-    # 中文注释（CED C1）：forward 扩展三个可选入参，全部缺省时与旧实现逐位等价：
-    #   noise [B,N,D]：外部共享噪声（CED 的 Δ 路径要求 fdm⁺/fdm⁰ 两次调用共享同一 ε）；
-    #   t：外部时间（标量或 [B]）。t=0 即纯噪声端（noisy=ε），此时 v̂=Ê[z_H|cond]−ε，
-    #      共享 ε 的配对相减恰好消去 ε，得到条件均值差 Δ；
-    #   weights [B,N]：逐 patch 权重（change-based 加权）。None 时 mean 与旧标量数值一致
+    # 中文注释：forward 两个可选入参：
+    #   weights [B,N]：逐 patch 权重（change-based 加权）。None 时 mean 与标量数值一致
     #      （先对 D 取 mean 再对 B,N 取 mean == 对全部元素取 mean）。
-    # return_pred=True 时返回 (loss, pred_velocity, per_patch_loss[B,N])，否则只返回 loss（旧调用点零改动）；
+    # return_pred=True 时返回 (loss, pred_velocity, per_patch_loss[B,N])，否则只返回 loss；
     # per_patch_loss 供 fdm 静/动态 patch 拆分日志直接使用，免额外前向。
-    # 关闭 autocast 后输入 dtype 跟随模块参数，避免 DeepSpeed bf16 Linear mismatch；loss/Δ 日志用 fp32。
+    # 关闭 autocast 后输入 dtype 跟随模块参数，避免 DeepSpeed bf16 Linear mismatch；loss 日志用 fp32。
     def forward(
         self,
         cond: torch.Tensor,
         z_gt: torch.Tensor,
-        noise: torch.Tensor | None = None,
-        t: torch.Tensor | float | None = None,
         weights: torch.Tensor | None = None,
         return_pred: bool = False,
     ):
@@ -100,14 +95,8 @@ class VisualFlowMatchingHead(nn.Module):
             compute_dtype = self._module_dtype(self)
             z_gt = z_gt.to(dtype=compute_dtype)
             cond = cond.to(dtype=compute_dtype)
-            noise = torch.randn_like(z_gt) if noise is None else noise.to(dtype=compute_dtype, device=z_gt.device)
-            #######
-            if t is None:
-                t = self.sample_time(z_gt.shape[0], z_gt.device, z_gt.dtype)[:, None, None]
-            else:
-                if not torch.is_tensor(t):
-                    t = torch.full((z_gt.shape[0],), float(t), device=z_gt.device, dtype=z_gt.dtype)
-                t = t.to(device=z_gt.device, dtype=z_gt.dtype).reshape(-1)[:, None, None]
+            noise = torch.randn_like(z_gt)
+            t = self.sample_time(z_gt.shape[0], z_gt.device, z_gt.dtype)[:, None, None]
             noisy = (1 - t) * noise + t * z_gt
             velocity = z_gt - noise
             t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()

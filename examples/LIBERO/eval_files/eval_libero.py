@@ -5,6 +5,7 @@ import math
 import os
 import pathlib
 import time
+from typing import Optional, Union
 
 import imageio
 import numpy as np
@@ -20,7 +21,7 @@ LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 
-def _binarize_gripper_open(open_val: np.ndarray | float) -> np.ndarray:
+def _binarize_gripper_open(open_val: Union[np.ndarray, float]) -> np.ndarray:
     arr = np.asarray(open_val, dtype=np.float32).reshape(-1)
     v = float(arr[0])
     bin_val = 1.0 - 2.0 * (v > 0.5)
@@ -46,13 +47,14 @@ class Args:
     # Utils
     #################################################################################################################
     video_out_path: str = "experiments/libero/logs"  # Path to save videos
+    save_video: bool = True  # set False (--args.no-save-video) to skip writing rollout mp4s
 
     seed: int = 7  # Random Seed (for reproducibility)
 
     pretrained_path: str = ""
 
     # Dataset key for un-normalization. None = auto (only if model trained on a single dataset).
-    unnorm_key: str | None = None
+    unnorm_key: Optional[str] = None
 
     post_process_action: bool = True
 
@@ -146,7 +148,8 @@ def eval_libero(args: Args) -> None:
                 wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
 
                 # Save preprocessed image for replay video
-                replay_images.append(img)
+                if args.save_video:
+                    replay_images.append(img)
 
                 state = np.concatenate(
                     (
@@ -167,6 +170,7 @@ def eval_libero(args: Args) -> None:
                 example_dict = {
                     "image": [observation["observation.primary"][0], observation["observation.wrist_image"][0]],
                     "lang": observation["instruction"][0],
+                    "state": observation["observation.state"][0].astype(np.float32),
                 }
 
                 start_time = time.time()
@@ -215,11 +219,12 @@ def eval_libero(args: Args) -> None:
             # Save a replay video of the episode
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
-            )
+            if args.save_video:
+                imageio.mimwrite(
+                    pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.mp4",
+                    [np.asarray(x) for x in replay_images],
+                    fps=10,
+                )
 
             full_actions = np.stack(full_actions)
             # np.save(pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.npy", full_actions)
