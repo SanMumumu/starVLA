@@ -77,12 +77,39 @@ GPUS="${GPUS:-$(seq -s, 0 $(( $(nvidia-smi -L | wc -l) - 1 )))}"
 NGPU="$(awk -F, '{print NF}' <<<"$GPUS")"
 DS_CONFIG="${DS_CONFIG:-starVLA/config/deepseeds/deepspeed_zero2.yaml}"
 
+#######
+# 中文注释：多机支持。AIDI(多 worker)注入标准 PyTorch 分布式变量：MASTER_ADDR / MASTER_PORT /
+#   WORLD_SIZE(总进程数=总卡数) / RANK(全局rank) / LOCAL_RANK；每节点 GPU 数 = 本机 NGPU。
+#   据此换算 accelerate 多机参数：
+#     --num_machines = WORLD_SIZE / NGPU；--machine_rank = 优先 NODE_RANK/GROUP_RANK，否则 RANK/NGPU；
+#     --num_processes = WORLD_SIZE(全局总进程)；--main_process_ip/port = MASTER_ADDR/MASTER_PORT。
+#   单机(WORLD_SIZE 未设或 ≤ NGPU)退回 --num_processes NGPU，与原行为一致（LIBERO 等单机 job 不受影响）。
+#   ⚠️ 若平台把 RANK 设成「节点序号」而非「全局rank」，看下面日志 machine_rank 是否每节点不同；
+#      若各节点都是 0，把 --machine_rank 改成 "${RANK}" 即可。
+WS="${WORLD_SIZE:-${NGPU}}"
+if [[ "${WS}" -gt "${NGPU}" ]]; then
+  NNODES=$(( WS / NGPU ))
+  NODE_RANK="${NODE_RANK:-${GROUP_RANK:-$(( ${RANK:-0} / NGPU ))}}"
+  LAUNCH_ARGS=(
+    --num_machines "${NNODES}"
+    --machine_rank "${NODE_RANK}"
+    --main_process_ip "${MASTER_ADDR:?多机需要 MASTER_ADDR(平台未注入)}"
+    --main_process_port "${MASTER_PORT:-29500}"
+    --num_processes "${WS}"
+  )
+  echo "[aidi][multinode] WORLD_SIZE=${WS} NGPU/node=${NGPU} RANK=${RANK:-0} -> num_machines=${NNODES} machine_rank=${NODE_RANK} num_processes=${WS} master=${MASTER_ADDR}:${MASTER_PORT:-29500}"
+else
+  LAUNCH_ARGS=(--num_processes "${NGPU}")
+  echo "[aidi][singlenode] num_processes=${NGPU}"
+fi
+#######
+
 echo "[aidi] EXP=${EXP} RUN_NAME=${RUN_NAME} CONFIG=${CONFIG} GPUS=${GPUS} OUT_ROOT=${OUT_ROOT} VIDEO_BACKEND=${AIDI_VIDEO_BACKEND} NUM_WORKERS=${AIDI_NUM_WORKERS}"
 
 export CUDA_VISIBLE_DEVICES="$GPUS"
 exec accelerate launch \
   --config_file "$DS_CONFIG" \
-  --num_processes "$NGPU" \
+  "${LAUNCH_ARGS[@]}" \
   starVLA/training/train_starvla.py \
   --config_yaml "$CONFIG" \
   --run_root_dir "$OUT_ROOT" \

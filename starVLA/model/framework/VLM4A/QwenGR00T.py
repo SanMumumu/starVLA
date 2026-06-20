@@ -806,6 +806,12 @@ class Qwen_GR00T(baseframework):
         self.wam_n_act = int(action_cfg.get("n_action_query", self.action_horizon))
         self.wam_n_flow = int(visual_cfg.get("n_flow_query", 8))
         self.wam_dino_loss_weight = float(wam_cfg.get("dino_loss_weight", 1.0))
+        #######
+        # 中文注释：fdm 预测 delta-DINO 开关（默认 False=预测绝对未来 DINO）。
+        # 开启后 fdm target = DINO(image_1) - DINO(image_0)，让监督头学「动作引起的特征变化」而非整张未来特征，
+        # 与 idm/世界模型差分思路一致；只影响 fdm 范式（passive 仍预测绝对未来 DINO）。
+        self.wam_fdm_delta = bool(wam_cfg.get("fdm_delta_dino", False))
+        #######
         # 占位 token 注册 + 词表 resize（参考 LaWAM configure_latent_world_processor）。
         self.wam_ph = str(wam_cfg.get("placeholder_token", "<ACT_PH>"))
         tok = self.qwen_vl_interface.processor.tokenizer
@@ -844,24 +850,31 @@ class Qwen_GR00T(baseframework):
         future_main = to_pil_preserve(fut[0]) if fut else None
         return views, future_main
 
-    # 中文注释：构 Qwen 原生视觉 prompt：[main 图, CoT 文本+act 占位×n_act, wrist 图, flow 占位×n_flow]；
-    # 返回 processor 输入 + act/flow 占位 mask（cumsum 分前后段，同 LaWAM）。
-    def _build_wam_inputs(self, examples: List[dict], include_future: bool = False):
+    # 中文注释：task-aware Qwen 原生视觉 prompt（每个任务只放它自己需要的 query 占位）：
+    #   action 任务(policy/idm)：[图(idm 含未来帧), 文本, act 占位×n_act]   —— 只放 action query；
+    #   visual 任务(passive/fdm)：[图,            文本, flow 占位×n_flow]   —— 只放 future query。
+    # 这样 action/future query 不再互相出现在对方任务里：flow query 不会被迫 attend act query（passive 更干净），
+    # action head 也不会吃到 flow 占位。只有 idm 把未来帧也当输入（逆动力学：当前+未来→动作）。
+    # 返回 processor 输入 + 占位 mask（= 本任务唯一一组占位 = query 位置；用于取 query hidden + 在 action memory 屏蔽 raw 占位）。
+    def _build_wam_inputs(self, examples: List[dict], task: str = "policy"):
+        task = str(task)
+        is_action = task in ("policy", "idm")
+        n_ph = self.wam_n_act if is_action else self.wam_n_flow
+        ph_str = " ".join([self.wam_ph] * n_ph)
+        include_future = task == "idm"
         proc = self.qwen_vl_interface.processor
-        ph_act = " ".join([self.wam_ph] * self.wam_n_act)
-        ph_flow = " ".join([self.wam_ph] * self.wam_n_flow)
         cot = self.config.datasets.vla_data.get("CoT_prompt", "{instruction}")
         messages = []
         for ex in examples:
             views, future_main = self._wam_views(ex)
             text = str(cot).replace("{instruction}", str(ex.get("lang", "")))
-            # 中文注释：所有输入视角先放（LIBERO 2 / RoboTwin 3；含 idm 的未来帧），再放文本+act占位+flow占位——
-            # 保证 act/flow 占位（native causal）能 attend 到全部图像。
+            # 中文注释：所有当前视角（LIBERO 2 / RoboTwin 3）先放，idm 再加未来帧，最后文本 + 单组 query 占位——
+            # 保证 query 占位（native causal）能 attend 到全部图像。
             imgs = list(views)
             if include_future and future_main is not None:
                 imgs.append(future_main)
             content = [{"type": "image", "image": im} for im in imgs]
-            content.append({"type": "text", "text": f"{text}\n{ph_act}\n{ph_flow}"})
+            content.append({"type": "text", "text": f"{text}\n{ph_str}"})
             messages.append([{"role": "user", "content": content}])
         old = proc.tokenizer.padding_side
         proc.tokenizer.padding_side = "left"
@@ -873,14 +886,11 @@ class Qwen_GR00T(baseframework):
         finally:
             proc.tokenizer.padding_side = old
         inputs = inputs.to(self.qwen_vl_interface.model.device)
-        ph = inputs["input_ids"] == self.wam_ph_id
-        order = ph.cumsum(dim=1)
-        act_mask = ph & (order <= self.wam_n_act)
-        flow_mask = ph & (order > self.wam_n_act) & (order <= self.wam_n_act + self.wam_n_flow)
-        return inputs, act_mask, flow_mask
+        ph_mask = inputs["input_ids"] == self.wam_ph_id  # 本任务唯一占位组 = query 位置
+        return inputs, ph_mask
 
-    def _wam_backbone(self, examples: List[dict], include_future: bool = False):
-        inputs, act_mask, flow_mask = self._build_wam_inputs(examples, include_future=include_future)
+    def _wam_backbone(self, examples: List[dict], task: str = "policy"):
+        inputs, ph_mask = self._build_wam_inputs(examples, task=task)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = self.qwen_vl_interface.model(
                 **inputs, output_hidden_states=True, return_dict=True, use_cache=False,
@@ -888,25 +898,25 @@ class Qwen_GR00T(baseframework):
         hidden = out.hidden_states[-1]
         bsz = len(examples)
         d = hidden.shape[-1]
-        h_act = hidden[act_mask].view(bsz, self.wam_n_act, d)
-        h_flow = hidden[flow_mask].view(bsz, self.wam_n_flow, d)
+        n_q = self.wam_n_act if str(task) in ("policy", "idm") else self.wam_n_flow
+        h_query = hidden[ph_mask].view(bsz, n_q, d)
         #######
-        # 中文注释：除两组 query 外再返回完整隐藏序列 + padding mask——action head 的 memory 用
-        # [act-query ⊕ 完整序列]（见 _wam_action_memory），让动作条件享受 native 的全上下文（稳 libero_10）。
+        # 中文注释：返回本任务 query hidden（act 或 flow）+ 完整隐藏序列 + padding mask + 占位 mask。
+        # 占位 mask 供 action memory 屏蔽 raw hidden 里的占位 token（只保留图文 hidden + 显式 query）。
         attn = inputs.get("attention_mask", None)
-        return h_act, h_flow, hidden, attn
+        return h_query, hidden, attn, ph_mask
         #######
 
     #######
-    # 中文注释：wam action head 的 cross-attn memory = act-query（显式保留 metaquery，创新点1）⊕ 完整 VLM 隐藏序列
-    # （native 全上下文）。mask = [act-query 全 1] ⊕ [完整序列 padding mask]。与 baseline 的
-    # action_model(完整 last_hidden + encoder_attention_mask) 对齐，让 wam 动作路径继承 baseline 的 libero_10 表现。
-    def _wam_action_memory(self, h_act: torch.Tensor, hidden: torch.Tensor, attn):
+    # 中文注释：wam action head 的 cross-attn memory = act-query（显式保留 metaquery，创新点1）⊕ 图文 hidden。
+    # mask = [act-query 全 1] ⊕ [padding mask AND-NOT 占位]——即屏蔽掉 raw hidden 里的占位 token（task-aware 后只会是 act 占位），
+    # action DiT 只看「显式 h_act + 非占位图文上下文」，与 baseline action_model(完整 last_hidden + mask) 同口径但去掉占位污染。
+    def _wam_action_memory(self, h_act: torch.Tensor, hidden: torch.Tensor, attn, ph_mask):
         mem = torch.cat([h_act, hidden.to(h_act.dtype)], dim=1)
-        mem_mask = None
-        if attn is not None:
-            act_ones = torch.ones(h_act.shape[0], h_act.shape[1], device=attn.device, dtype=attn.dtype)
-            mem_mask = torch.cat([act_ones, attn.to(act_ones.device)], dim=1).to(torch.bool)
+        non_ph = ~ph_mask.to(torch.bool)
+        keep = (attn.to(torch.bool) & non_ph) if attn is not None else non_ph
+        act_ones = torch.ones(h_act.shape[0], h_act.shape[1], device=mem.device, dtype=torch.bool)
+        mem_mask = torch.cat([act_ones, keep.to(mem.device)], dim=1)
         return mem, mem_mask
     #######
 
@@ -935,19 +945,20 @@ class Qwen_GR00T(baseframework):
     # 两组 query 依托不同范式：act-query 服务 policy/idm（预测 action）；flow-query 服务 passive/fdm（预测 DINO）。
     def _wam_forward(self, examples: List[dict], task: str = "policy", **kwargs) -> dict:
         task = str(task)
-        h_act, h_flow, hidden, attn = self._wam_backbone(examples, include_future=(task == "idm"))
+        h_query, hidden, attn, ph_mask = self._wam_backbone(examples, task=task)
         if task in ("policy", "idm"):
             actions = self._stack_jointflow_field(examples, "action", required=True)
             actions = actions[:, -self.action_horizon :, : self.action_dim].float()
             state = self._stack_jointflow_field(examples, "state", required=False) if self._uses_action_state() else None
             #######
-            # 中文注释：action 条件 = act-query ⊕ 完整序列 + mask（native 全上下文，见 _wam_action_memory）。
-            mem, mem_mask = self._wam_action_memory(h_act, hidden, attn)
+            # 中文注释：action 条件 = act-query ⊕ 图文 hidden（屏蔽 raw 占位，见 _wam_action_memory）。
+            mem, mem_mask = self._wam_action_memory(h_query, hidden, attn, ph_mask)
             hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
             loss = self.action_model(mem.to(hd), actions.to(hd), state, encoder_attention_mask=mem_mask)
             #######
             return {("action_loss" if task == "policy" else "idm_loss"): loss + self._wam_unused_anchor(task, loss)}
         # passive / fdm：flow-query → 预测未来帧 DINO；fdm 额外把 act_ctx(动作) 拼进 cross-attn 条件。
+        h_flow = h_query
         z_gt = self._run_jointflow_dino_on_images(examples, ["image_1"], required=True)
         if z_gt.ndim == 4:
             z_gt = z_gt[:, 0]
@@ -958,6 +969,14 @@ class Qwen_GR00T(baseframework):
             ad = self._jointflow_module_dtype(self.wam_act_ctx, fallback=h_flow.dtype)
             actx = self.wam_act_ctx(actions.to(ad)).to(h_flow.dtype)
             cond = torch.cat([h_flow, actx], dim=1)
+            #######
+            # 中文注释：delta-DINO（exp6）——target 改成「未来 - 当前」DINO 差分，监督头只学动作引起的变化。
+            if self.wam_fdm_delta:
+                z_0 = self._run_jointflow_dino_on_images(examples, ["image_0", "image"], required=True)
+                if z_0.ndim == 4:
+                    z_0 = z_0[:, 0]
+                z_gt = z_gt - z_0.to(z_gt.device, z_gt.dtype)
+            #######
         vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=cond.dtype)
         loss = self.wam_dino_loss_weight * self.wam_visual_head(cond.to(vh), z_gt)
         return {f"{task}_loss": loss + self._wam_unused_anchor(task, loss)}
@@ -968,9 +987,9 @@ class Qwen_GR00T(baseframework):
         if not isinstance(examples, list):
             examples = [examples]
         #######
-        # 中文注释：推理 action 条件与训练一致 = act-query ⊕ 完整序列 + mask（native 全上下文）。
-        h_act, _h_flow, hidden, attn = self._wam_backbone(examples)
-        mem, mem_mask = self._wam_action_memory(h_act, hidden, attn)
+        # 中文注释：推理 action 条件与训练 policy 一致 = act-query ⊕ 图文 hidden（屏蔽 raw 占位）；走 policy prompt（仅 act 占位）。
+        h_act, hidden, attn, ph_mask = self._wam_backbone(examples, task="policy")
+        mem, mem_mask = self._wam_action_memory(h_act, hidden, attn, ph_mask)
         head_dtype = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
         pred = self.action_model.predict_action(mem.to(head_dtype), state=None, encoder_attention_mask=mem_mask)
         #######

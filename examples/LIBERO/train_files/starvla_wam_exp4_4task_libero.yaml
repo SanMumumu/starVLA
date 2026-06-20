@@ -67,14 +67,14 @@ framework:
     repeated_diffusion_steps: 1
     diffusion_model_cfg:
       cross_attention_dim: 2048
-      dropout: 0.1
+      dropout: 0.2    # 与 gr00t baseline 同结构(原 0.1)
       final_dropout: true
       interleave_self_attention: true
       norm_type: ada_norm
-      num_layers: 24
+      num_layers: 16    # 与 gr00t baseline 同结构(原 24)
       num_attention_heads: 12
       attention_head_dim: 64
-      output_dim: 768
+      output_dim: 1024    # 与 gr00t baseline 同结构(原 768)
       positional_embeddings: null
   visual_model:
     d_dino: 384
@@ -116,7 +116,7 @@ trainer:
   learning_rate:
     base: 2.5e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 1.0e-04
+    action_model: 5.0e-05    # 稳定性修复: action head lr 1e-4→5e-5(发散组件是 action head)
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
@@ -132,5 +132,5 @@ trainer:
   optimizer:
     name: AdamW
     betas: [0.9, 0.95]
-    eps: 1.0e-08
-    weight_decay: 1.0e-08
+    eps: 1.0e-06    # 稳定性修复: Adam eps 1e-8→1e-6(bf16 近收敛梯度极小→Adam 更新爆炸,是 action_loss 收敛后飞了的主因)
+    weight_decay: 0.01    # 稳定性修复: wd 1e-8→0.01,抑制全量FT后期漂移出收敛盆地
