@@ -18,7 +18,7 @@ config_yaml=./examples/LIBERO/train_files/starvla_wam_exp6_2b_bigbs_policy_fdm_l
 libero_data_root=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero/
 data_mix=libero_all
 run_root_dir=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero
-run_id=0619_wam_exp6_2b_bigbs_policy_fdm
+run_id=0620_wam_exp6_2b_bigbs_policy_fdm
 # === End of environment variable configuration ===
 ###########################################################################################
 

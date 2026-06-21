@@ -937,6 +937,19 @@ class Qwen_GR00T(baseframework):
         return self._zero_grad_anchor_for_modules(modules, ref)
     #######
 
+    #######
+    # 中文注释：WAM 世界模型 target 取法——优先用数据集预存的 DINO latent（dino_target_latents 开时数据集会
+    # 在线出 raw 图的同时附带 dino_0/dino_1），没有再在线抽（兜底）。这样存了 latent 就省掉每步在线 DINO；
+    # LIBERO/RobotWin/以后任何数据集统一这套，存没存 latent 都能跑。取第 0 个 view（cam_high）与在线一致。
+    def _wam_dino_target(self, examples: List[dict], precomp_key: str, online_keys: list[str]) -> torch.Tensor:
+        z = self._stack_jointflow_field(examples, precomp_key, required=False)
+        if z is None:
+            z = self._run_jointflow_dino_on_images(examples, online_keys, required=True)
+        if z.ndim == 4:
+            z = z[:, 0]
+        return z
+    #######
+
     # 中文注释：WAM 四范式前向（每步一种，由 trainer 按 tasks.weights 广播采样）：
     #   policy: 当前图 → act-query → action（→ "action_loss"，兼容无 tasks 的 else 分支）
     #   idm   : 当前图+未来图 → act-query → action（逆动力学，→ "idm_loss"）
@@ -959,9 +972,7 @@ class Qwen_GR00T(baseframework):
             return {("action_loss" if task == "policy" else "idm_loss"): loss + self._wam_unused_anchor(task, loss)}
         # passive / fdm：flow-query → 预测未来帧 DINO；fdm 额外把 act_ctx(动作) 拼进 cross-attn 条件。
         h_flow = h_query
-        z_gt = self._run_jointflow_dino_on_images(examples, ["image_1"], required=True)
-        if z_gt.ndim == 4:
-            z_gt = z_gt[:, 0]
+        z_gt = self._wam_dino_target(examples, "dino_1", ["image_1"])
         cond = h_flow
         if task == "fdm":
             actions = self._stack_jointflow_field(examples, "action", required=True)
@@ -972,10 +983,14 @@ class Qwen_GR00T(baseframework):
             #######
             # 中文注释：delta-DINO（exp6）——target 改成「未来 - 当前」DINO 差分，监督头只学动作引起的变化。
             if self.wam_fdm_delta:
-                z_0 = self._run_jointflow_dino_on_images(examples, ["image_0", "image"], required=True)
-                if z_0.ndim == 4:
-                    z_0 = z_0[:, 0]
+                z_0 = self._wam_dino_target(examples, "dino_0", ["image_0", "image"])
                 z_gt = z_gt - z_0.to(z_gt.device, z_gt.dtype)
+                #######
+                # 中文注释：残差幅值远小于 flow matching 的 N(0,1) 噪声→不归一化 head 学不到动态。
+                # 按通道(在 B,N 维)标准化到≈单位方差,与噪声同量级。DINO 头纯监督、推理不用→无需反归一化,
+                # 故就地缩放即可,不必存 stats（保持简单）。
+                z_gt = z_gt / (z_gt.std(dim=(0, 1), keepdim=True) + 1e-6)
+                #######
             #######
         vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=cond.dtype)
         loss = self.wam_dino_loss_weight * self.wam_visual_head(cond.to(vh), z_gt)

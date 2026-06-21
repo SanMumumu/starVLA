@@ -113,10 +113,17 @@ class JointLiberoDataset(LeRobotSingleDataset):
         online_dino: bool = True,
         dino_feature_dir: str = "latents",
         dino_episode_cache_size: int = 2,
+        dino_target_latents: bool = False,
         **kwargs,
     ):
         self.online_dino = bool(online_dino)
         self.dino_feature_dir_name = dino_feature_dir
+        #######
+        # 中文注释：hybrid 开关——在线模式(出 raw 图给 Qwen 原生视觉)的同时,额外读预存 DINO latent 当
+        # 世界模型 target(dino_0/dino_1)。这样 WAM 既有 raw 图喂 policy、又用上预存 latent,
+        # 不用每步在线跑 DINO backbone(省算力 + 不必加载大 backbone 权重)。需 latents/ store 存在。
+        self._dino_target_latents = bool(dino_target_latents)
+        #######
         self._dino_episode_cache_size = max(int(dino_episode_cache_size), 0)
         self._dino_layout = None
         self._dino_memmap = None
@@ -349,6 +356,13 @@ class JointLiberoDataset(LeRobotSingleDataset):
             sample["image_0"] = np.stack(img0, axis=0)
             sample["image_1"] = np.stack(img1, axis=0)
             sample["dino_view_keys"] = view_keys
+            #######
+            # 中文注释：hybrid——在线出 raw 图的同时,再读预存的 DINO latent（已按 store stats 标准化）当 target。
+            # dino_0=当前帧(delta 用)、dino_1=未来帧。wam 优先用它当世界模型 target,省掉在线 DINO 抽取。
+            if self._dino_target_latents:
+                sample["dino_0"] = self._read_dino(trajectory_id, base_index)
+                sample["dino_1"] = self._read_dino(trajectory_id, future_index)
+            #######
         else:
             # 中文注释：离线模式读取预计算 + 标准化后的 DINO 特征。
             sample["dino_0"] = self._read_dino(trajectory_id, base_index)
@@ -422,6 +436,7 @@ def _make_joint_single_dataset(
         online_dino=online_dino,
         dino_feature_dir=_cfg_get(data_cfg, "dino_feature_dir", "latents"),
         dino_episode_cache_size=int(_cfg_get(data_cfg, "dino_episode_cache_size", 2)),
+        dino_target_latents=bool(_cfg_get(data_cfg, "dino_target_latents", False)),
     )
 
 

@@ -22,6 +22,7 @@ def main(args) -> None:
         ckpt_path=args.ckpt_path,
         device="cuda",
         use_bf16=args.use_bf16,
+        dino_stats_path=args.dino_stats_path,
     )
 
     hostname = socket.gethostname()
@@ -45,6 +46,12 @@ def build_argparser():
     parser.add_argument("--ckpt_path", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct")
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
+    #######
+    # 中文注释：jointflow 评测专用——在线 DINO 的 per-suite 归一化 stats（dino_v3_stats.json）。
+    # 训练用离线精算特征（按各 suite stats 标准化），eval 在线提取必须用同一份 stats，否则视觉条件失效 SR≈0。
+    parser.add_argument("--dino_stats_path", type=str, default=None,
+                        help="per-suite dino_v3_stats.json for online DINO normalization (jointflow eval)")
+    #######
     parser.add_argument("--idle_timeout", type=int, default=1800, help="Idle timeout in seconds, -1 means never close")
     return parser
 

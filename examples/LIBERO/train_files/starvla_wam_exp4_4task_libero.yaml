@@ -102,9 +102,18 @@ datasets:
     include_state: false
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     per_device_batch_size: 8
-    load_all_data_for_training: true
+    load_all_data_for_training: false
     video_backend: torchvision_av
+    #######
+    # 中文注释：⚠️64卡集群 OOM 防护。默认 num_workers=16 → 64×16=1024 worker 会把节点 CPU 内存打爆,
+    # worker 被 OOM-killed(报 "DataLoader worker killed by signal: Killed")→该 rank 退出→其它 rank NCCL 连带崩。
+    num_workers: 1
+    prefetch_factor: 1
+    pin_memory: false
+    persistent_workers: false
+    #######
     online_dino: true
+    dino_target_latents: true    # hybrid: 在线出 raw 图给 Qwen 原生视觉 + 读预存 DINO latent 当世界模型 target(省在线抽取)
     world_model:
       future_stride: 8
 
@@ -132,5 +141,5 @@ trainer:
   optimizer:
     name: AdamW
     betas: [0.9, 0.95]
-    eps: 1.0e-06    # 稳定性修复: Adam eps 1e-8→1e-6(bf16 近收敛梯度极小→Adam 更新爆炸,是 action_loss 收敛后飞了的主因)
-    weight_decay: 0.01    # 稳定性修复: wd 1e-8→0.01,抑制全量FT后期漂移出收敛盆地
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

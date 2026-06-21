@@ -564,19 +564,39 @@ def main(cfg) -> None:
         and hasattr(vla, "set_action_correlation")
     ):
         from starVLA.dataloader.jointflow.joint_dataset import compute_action_correlation_cholesky
+        import numpy as _np
 
-        chol = compute_action_correlation_cholesky(
-            vla_train_dataloader.dataset, beta=float(action_cfg.get("correlation_beta", 0.5))
-        )
-        vla.set_action_correlation(chol)
+        #######
+        # 中文注释：⚠️多机必须只在 rank0 估一次。估计要逐样本 __getitem__（解码视频 + 读 latent），
+        # 64 卡各扫 20000 条 = 把 bucket I/O 打爆、启动卡死 30min+。改成：rank0 算(num_samples 可调，默认 4096)
+        # → 落盘 → barrier → 所有 rank 从盘读。已有缓存直接加载，免重算（resume/重跑秒过）。
+        # 落盘文件供评测 server 读，保证推理初始噪声分布与训练一致（buffer persistent=False 不进 ckpt）。
+        cache_path = os.path.join(output_dir, "action_correlation_cholesky.npy")
         if accelerator.is_main_process:
             #######
-            # 中文注释：把 Cholesky 落盘到 run 根目录（buffer persistent=False 不进 ckpt）；评测时 server 读它注入，
-            # 保证推理初始噪声分布与训练一致。文件名与 PolicyServerWrapper 约定一致。
-            import numpy as _np
-            _np.save(os.path.join(output_dir, "action_correlation_cholesky.npy"), _np.asarray(chol))
-            logger.info(f"E1.3 correlated-noise Cholesky ready: shape={chol.shape}, beta={action_cfg.get('correlation_beta', 0.5)} → saved to {output_dir}/action_correlation_cholesky.npy")
+            # 中文注释：缓存复用——文件存在且维度=action_horizon×action_dim 就直接用,免重扫(秒过)；
+            # 维度不符(改了 horizon/action_dim/数据)则重算,防止用到过期 Cholesky。
+            _exp = int(action_cfg.get("action_horizon", 0)) * int(action_cfg.get("action_dim", 0))
+            _reuse = (
+                os.path.exists(cache_path)
+                and _exp > 0
+                and tuple(_np.load(cache_path).shape) == (_exp, _exp)
+            )
             #######
+            if _reuse:
+                logger.info(f"correlated-noise: 复用已缓存 Cholesky({_exp}x{_exp}) → {cache_path}")
+            else:
+                chol = compute_action_correlation_cholesky(
+                    vla_train_dataloader.dataset,
+                    num_samples=int(action_cfg.get("correlation_num_samples", 4096)),
+                    beta=float(action_cfg.get("correlation_beta", 0.5)),
+                )
+                _np.save(cache_path, _np.asarray(chol))
+                logger.info(f"correlated-noise Cholesky ready: shape={chol.shape}, beta={action_cfg.get('correlation_beta', 0.5)} → {cache_path}")
+        if dist.is_initialized():
+            dist.barrier()  # 等 rank0 算好/存好,其余 rank 再读
+        vla.set_action_correlation(_np.load(cache_path))
+        #######
     #######
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
 
