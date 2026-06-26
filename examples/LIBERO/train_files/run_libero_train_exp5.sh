@@ -7,6 +7,7 @@ export NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=10000  # timeout set to 1 hour (unit: seconds)
 export NCCL_SOCKET_TIMEOUT_MS=360000
+export WANDB_MODE=offline
 ###########################################################################################
 # exp5 = WAM policy + tricks，换 Qwen3-VL-2B + 大 batch（per_device=16）。
 # 与官方 run_libero_train.sh(exp1) 同结构，只换 config_yaml / base_vlm(2B) / batch / steps。
@@ -17,8 +18,8 @@ base_vlm=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B
 config_yaml=./examples/LIBERO/train_files/starvla_wam_exp5_2b_bigbs_policy_libero.yaml
 libero_data_root=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero/
 data_mix=libero_all
-run_root_dir=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero
-run_id=0620_wam_exp5_2b_bigbs_policy
+run_root_dir=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
+run_id=0625_wam_exp5_2b_bigbs_policy
 # === End of environment variable configuration ===
 ###########################################################################################
 

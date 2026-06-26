@@ -545,3 +545,125 @@ def is_main_process():
 def _is_safetensors_path(path):
     """Check if a path refers to a safetensors file."""
     return str(path).endswith(".safetensors")
+
+
+# ============================================================================
+# 中文注释：多任务梯度范数日志辅助（配合 train_starvla 的 per-task loss/grad 日志）。
+#
+# 关键事实：WAM 训练是**一任务/优化步**（trainer 每步采一个 task → 模型只返回该 task 一个 *_loss →
+# 单 task backward）。因此 backward 后共享骨干上的梯度**就是该任务的单任务梯度**，不是多任务合并梯度。
+# 这里的在线 grad_norm 全部是「当前步那个任务」的单任务梯度范数；不存在需要从合并梯度里分离每任务的情况。
+#
+# 模块分组（去重、互不相交、只取可训练参数）：
+#   shared            = qwen_vl_interface（共享表征骨干）
+#   policy_head       = action_model (+ action_queries)         —— policy / idm 任务用
+#   world_model_head  = wam_visual_head + wam_act_ctx (+ future_dino_queries) —— fdm / passive 任务用
+# ============================================================================
+def _module_trainable_params(model, path):
+    m = model
+    for attr in path.split("."):
+        if not hasattr(m, attr):
+            return []
+        m = getattr(m, attr)
+    if not isinstance(m, torch.nn.Module):
+        return []
+    return [p for p in m.parameters() if p.requires_grad]
+
+
+def build_task_grad_groups(model):
+    """构 {组名: [param,...]}（按模块子树、去重、只取可训练）。返回 (groups, task_head, task_logname)。
+
+    task_head: task -> 该任务实际产生非零梯度的 head 组名；task_logname: task -> 日志用名（idm→inverse）。
+    只收录实际存在的模块；不存在的组不创建（避免无意义零值日志）。
+    """
+    seen = set()
+
+    def collect(paths):
+        out = []
+        for path in paths:
+            for p in _module_trainable_params(model, path):
+                if id(p) in seen:
+                    continue
+                seen.add(id(p))
+                out.append(p)
+        return out
+
+    groups = {}
+    shared = collect(["qwen_vl_interface"])
+    if shared:
+        groups["shared"] = shared
+    policy_head = collect(["action_model", "action_queries"])
+    if policy_head:
+        groups["policy_head"] = policy_head
+    world_model_head = collect(["wam_visual_head", "wam_act_ctx", "future_dino_queries"])
+    if world_model_head:
+        groups["world_model_head"] = world_model_head
+
+    task_head = {"policy": "policy_head", "idm": "policy_head", "fdm": "world_model_head", "passive": "world_model_head"}
+    task_logname = {"policy": "policy", "idm": "inverse", "fdm": "fdm", "passive": "passive"}
+    return groups, task_head, task_logname
+
+
+def _full_grad(p, prefer_ds: bool):
+    """取参数的**完整(全局)**梯度：ZeRO-2/3 下 p.grad 是分片/None → 用 deepspeed.safe_get_full_grad
+    （collective all-gather，所有 rank 必须一致调用）；非 DeepSpeed 时 p.grad 已是全局梯度。返回 tensor 或 None。"""
+    if prefer_ds:
+        try:
+            from deepspeed.utils import safe_get_full_grad
+
+            g = safe_get_full_grad(p)
+            if g is not None:
+                return g
+        except Exception:
+            pass
+    return getattr(p, "grad", None)
+
+
+@torch.no_grad()
+def group_grad_sqnorm(params, prefer_ds: bool):
+    """该组参数梯度的 L2 平方和（GPU 标量 tensor）。无任何梯度返回 None。
+    用 _full_grad 取全局梯度 → 各 rank 结果一致（DeepSpeed 路径含 collective，须所有 rank 同调）。
+    全程在 GPU 聚合，不逐参数 .item()（调用方最后只对最终标量同步一次）。"""
+    total = None
+    for p in params:
+        g = _full_grad(p, prefer_ds)
+        if g is None:
+            continue
+        s = g.detach().float().pow(2).sum()
+        total = s if total is None else total + s
+    return total
+
+
+@torch.no_grad()
+def group_grad_local_sqnorm(params):
+    """该组参数梯度的**本地分片**平方和（GPU 标量，**零 collective**）。
+
+    ZeRO-2 下梯度 reduce-scatter 进各 rank 分片：用 deepspeed `safe_get_local_grad(p)` 取本 rank 那一片
+    （不通信），各 param 本地分片平方和累加。调用方对该标量做**1 次** `all_reduce(SUM)`（各分片不相交 → 求和即全局）。
+    非 DeepSpeed 时退回 p.grad（已是全局，调用方不要再 reduce）。
+    始终返回**张量**（无任何梯度时返回 0 张量），保证调用方的 all_reduce 在各 rank 一致可调（不会失同步）。
+    """
+    try:
+        from deepspeed.utils import safe_get_local_grad
+    except Exception:
+        safe_get_local_grad = None
+    total = None
+    device = None
+    for p in params:
+        if device is None and hasattr(p, "device"):
+            device = p.device
+        g = None
+        if safe_get_local_grad is not None:
+            try:
+                g = safe_get_local_grad(p)
+            except Exception:
+                g = None
+        if g is None:
+            g = getattr(p, "grad", None)
+        if g is None or g.numel() == 0:
+            continue
+        s = g.detach().float().pow(2).sum()
+        total = s if total is None else total + s
+    if total is None:
+        total = torch.zeros((), dtype=torch.float32, device=(device or "cpu"))
+    return total

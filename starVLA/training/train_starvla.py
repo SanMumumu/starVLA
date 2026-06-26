@@ -49,7 +49,15 @@ from starVLA.dataloader import build_dataloader
 from starVLA.model.framework.base_framework import build_framework
 from starVLA.model.framework.share_tools import apply_config_compat
 from starVLA.training.trainer_utils.config_tracker import AccessTrackedConfig, wrap_config
-from starVLA.training.trainer_utils.trainer_tools import TrainerUtils, build_param_lr_groups, setup_optimizer_and_scheduler, normalize_dotlist_args
+from starVLA.training.trainer_utils.trainer_tools import (
+    TrainerUtils,
+    build_param_lr_groups,
+    setup_optimizer_and_scheduler,
+    normalize_dotlist_args,
+    build_task_grad_groups,
+    group_grad_sqnorm,
+    group_grad_local_sqnorm,
+)
 
 deepspeed_plugin = DeepSpeedPlugin()
 accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
@@ -178,6 +186,24 @@ class VLATrainer(TrainerUtils):
                     )
         #######
 
+        #######
+        # 中文注释：per-task loss + 梯度范数日志状态。一任务/优化步 → 在线 grad_norm 都是**单任务**梯度。
+        # **梯度记录总开关** `trainer.log_grad_norms`（别名 log_grad_norm_per_head 兼容旧名）。
+        #   true  → 记全部 per-task 梯度（grad_norm_total/<task> + shared/<task> + head/<task>）；
+        #   false → **一概不算**（连 grad_norm_total 都不取）→ 训练零梯度开销。loss 不受影响、始终记（很便宜）。
+        # 需要看梯度时置 true、不需要时 false。默认 false（最快）。
+        _gflag = getattr(cfg.trainer, "log_grad_norms", None)
+        if _gflag is None:
+            _gflag = getattr(cfg.trainer, "log_grad_norm_per_head", False)
+        self._log_grad_norms = bool(_gflag)
+        self._grad_groups = None          # {shared, policy_head, world_model_head} -> [param,...]（prepare 后构建）
+        self._task_head = {}              # task -> 该任务非零梯度的 head 组名
+        self._task_logname = {}           # task -> 日志名（idm→inverse）
+        self._using_deepspeed = "DEEPSPEED" in str(getattr(accelerator, "distributed_type", "")).upper()
+        self._last_clip_norm = None       # 非 DeepSpeed 时 clip_grad_norm_ 的返回（总范数）兜底
+        self._grad_warned = False
+        #######
+
     def prepare_training(self):
         rank = dist.get_rank() if dist.is_initialized() else 0
         seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
@@ -205,6 +231,24 @@ class VLATrainer(TrainerUtils):
             self.optimizer,
             self.vla_train_dataloader,
         )
+
+        #######
+        # 中文注释：在 accelerator 包装后，从**未包装**模型构建梯度分组（shared/policy_head/world_model_head）。
+        if self._log_grad_norms:
+            try:
+                base_model = self.accelerator.unwrap_model(self.model)
+                self._grad_groups, self._task_head, self._task_logname = build_task_grad_groups(base_model)
+                if self.accelerator.is_main_process:
+                    logger.info(
+                        "Grad-norm groups: %s (deepspeed=%s)",
+                        {k: len(v) for k, v in self._grad_groups.items()},
+                        self._using_deepspeed,
+                    )
+            except Exception as e:  # 构建失败 → 关闭 per-head 梯度日志，训练照常
+                logger.warning("build_task_grad_groups failed (%s); disabling per-head grad logging.", e)
+                self._log_grad_norms = False
+                self._grad_groups = None
+        #######
 
         self._init_wandb()
 
@@ -371,26 +415,85 @@ class VLATrainer(TrainerUtils):
         self._jointflow_resample = False
         return self._jointflow_cur_task
 
-    # 中文注释：把模型返回的 tensor 指标转成可记录标量，同时保留用户要求的关键 loss 名称。
-    @staticmethod
-    def _collect_jointflow_metrics(output_dict: dict, task: str, total_loss: torch.Tensor) -> dict:
-        metrics = {"task": task, "loss": float(total_loss.detach().cpu())}
-        alias = {
-            "policy_loss": "policy_loss",
-            "fdm_loss": "loss_fdm",
-            "idm_loss": "idm_loss",
-            "passive_loss": "passive_loss",
-            "loss_fdm": "loss_fdm",
-        }
-        for key, value in output_dict.items():
-            if torch.is_tensor(value):
-                clean_key = key.replace("/", "_")
-                metrics[clean_key] = float(value.detach().cpu())
-                if key in alias:
-                    metrics[alias[key]] = metrics[clean_key]
-        if task == "policy" and "policy_loss" not in metrics:
-            metrics["policy_loss"] = metrics.get("loss", float(total_loss.detach().cpu()))
-        return metrics
+    # 中文注释：模型每个 task 返回的 loss key 名 / 日志名（idm→inverse，对齐需求）。
+    _TASK_LOSS_KEY = {"policy": "action_loss", "idm": "idm_loss", "fdm": "fdm_loss", "passive": "passive_loss"}
+    _TASK_LOGNAME = {"policy": "policy", "idm": "inverse", "fdm": "fdm", "passive": "passive"}
+
+    @classmethod
+    def _build_loss_metrics(cls, output_dict: dict, task: str, total_loss: torch.Tensor) -> dict:
+        """per-task 原始/加权/total loss（train/ 前缀）。一任务/优化步 → 每步只记当前 task，
+        **不为未启用任务写零值**。区分 raw（视觉头原始 MSE，模型返回的 *_loss_raw）与 weighted（× 权重，实际反传）。
+        policy/idm 无内部权重 → raw == weighted。"""
+        logname = cls._TASK_LOGNAME.get(task, task)
+        loss_key = cls._TASK_LOSS_KEY.get(task, f"{task}_loss")
+        weighted = output_dict.get(loss_key)
+        if weighted is None:  # 兜底：取任一以 _loss 结尾的张量
+            for k, v in output_dict.items():
+                if torch.is_tensor(v) and k.endswith("_loss"):
+                    weighted = v
+                    break
+        raw = output_dict.get(f"{task}_loss_raw", weighted)
+        m = {"train/task": task, "train/loss_total": float(total_loss.detach())}
+        m[f"train/loss_{logname}"] = float(weighted.detach())
+        m[f"train/loss_{logname}_weighted"] = float(weighted.detach())
+        m[f"train/loss_{logname}_raw"] = float(raw.detach())
+        return m
+
+    # ---- 梯度范数日志（全部单任务梯度；ZeRO-2 下从 DeepSpeed 取全局范数 + 仅 gather 小 head）----
+    def _is_log_step(self, sync_gradients: bool) -> bool:
+        """与 _log_metrics 对齐：仅 sync 步、且本步完成后 completed_steps(+1) 命中 logging_frequency 才记。"""
+        return bool(sync_gradients) and (self.completed_steps + 1) % self.config.trainer.logging_frequency == 0
+
+    def _global_grad_norm(self):
+        """DeepSpeed 全局梯度范数（已 unscale、已跨 rank 规约、已 clip 前）；拿不到回退非-DS 的 clip 返回值。"""
+        try:
+            m = self.model
+            if hasattr(m, "get_global_grad_norm"):
+                v = m.get_global_grad_norm()
+                if v is not None:
+                    return float(v)
+            eng = getattr(getattr(self.accelerator, "deepspeed_engine_wrapped", None), "engine", None)
+            if eng is not None and hasattr(eng, "get_global_grad_norm"):
+                v = eng.get_global_grad_norm()
+                if v is not None:
+                    return float(v)
+        except Exception:
+            pass
+        return self._last_clip_norm
+
+    def _compute_head_sqnorms(self, task):
+        """当前任务那个 head 的梯度**本地分片**平方和（GPU 标量，**零 collective**）。backward 后、step 前调用。
+        一任务/优化步 → 非活跃 head 梯度精确=0（anchor，已验证）→ 只需活跃 head；shared=√(total²−active²) 仍精确。
+        返回 (head_logname, local_sq_tensor)；local 平方和由调用方做 **1 次** all_reduce 汇成全局（失同步面=1 次匹配标量规约）。"""
+        active = self._task_head.get(task) if task is not None else None
+        if active is None or active not in self._grad_groups:
+            return None, None
+        local_sq = group_grad_local_sqnorm(self._grad_groups[active])   # 零通信；始终返回张量
+        logname = self._task_logname.get(task, task)
+        return logname, local_sq
+
+    def _finalize_grad_metrics(self, task, head_logname, head_local_sq) -> dict:
+        """step 后汇总。**一任务/优化步 → 全部按采样到的任务分曲线**（`.../<task>`），4 任务 1:1:1:1 时
+        wandb 每个机制各一条线，可直接叠加对比"每个任务对梯度的影响"。
+
+        全部受总开关 log_grad_norms 控（off 时本函数根本不会被调到，零开销）。on 时：
+        - `train/grad_norm_total/<task>`：该任务整步总梯度范数（取自 DeepSpeed 全局，无 collective）；
+        - `train/grad_norm_shared/<task>`：该任务对**共享 Qwen 骨干**的梯度（= sqrt(total²−head²)，参数集互不相交 Pythagoras）；
+        - `train/grad_norm_head/<task>`：该任务**自己 head** 的梯度（本地分片平方和 + 1 次 all_reduce 汇全局）。"""
+        m = {}
+        logname = head_logname or (self._task_logname.get(task, task) if task is not None else "action")
+        total = self._global_grad_norm()
+        if total is not None:
+            m[f"train/grad_norm_total/{logname}"] = total
+        if head_local_sq is not None:
+            # 中文注释：唯一的在线 collective——1 次标量 all_reduce(SUM)，把本地分片平方和汇成全局。各 rank 由 will_log 一致触发 → 匹配、不失同步。
+            if self._using_deepspeed and dist.is_available() and dist.is_initialized():
+                dist.all_reduce(head_local_sq, op=dist.ReduceOp.SUM)
+            head_sq = float(head_local_sq.item())
+            m[f"train/grad_norm_head/{logname}"] = head_sq ** 0.5
+            if total is not None:
+                m[f"train/grad_norm_shared/{logname}"] = max(total * total - head_sq, 0.0) ** 0.5
+        return m
     #######
 
     def train(self):
@@ -497,8 +600,36 @@ class VLATrainer(TrainerUtils):
 
             self.accelerator.backward(total_loss)
 
+            #######
+            # 中文注释：梯度统计时序——必须 backward 之后、step/zero_grad 之前。
+            # ① 先做 clip（DeepSpeed 下 accelerate clip 实为 no-op/返回 None，真正 clip 在 engine.step 内；
+            #    非-DS 时返回总范数，留作 grad_norm_total 兜底）。
+            self._last_clip_norm = None
             if self.config.trainer.gradient_clipping is not None:
-                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+                clipped = self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+                if clipped is not None:
+                    try:
+                        self._last_clip_norm = float(clipped)
+                    except Exception:
+                        self._last_clip_norm = None
+
+            sync = bool(self.accelerator.sync_gradients)        # 在 accumulate 块内捕获，块外可能失效
+            will_log = self._is_log_step(sync)
+            # 中文注释：**梯度记录总开关**——log_grad_norms=false 时 want_grad 恒 False → 既不取 grad_norm_total、
+            # 也不算 per-head，训练**零梯度开销**；true 时才在 logging 步算全部 per-task 梯度。
+            want_grad = will_log and self._log_grad_norms and self._grad_groups is not None
+
+            # ② step 前：取当前任务 head 的梯度**本地分片**平方和（零 collective）；汇成全局留到 step 后做 1 次 all_reduce。
+            head_logname, head_local_sq = None, None
+            if want_grad:
+                try:
+                    head_logname, head_local_sq = self._compute_head_sqnorms(jointflow_task)
+                except Exception as e:
+                    if not self._grad_warned and self.accelerator.is_main_process:
+                        logger.warning("per-head grad-norm failed (%s); skipping per-head grad logs hereafter.", e)
+                    self._grad_warned = True
+                    head_logname, head_local_sq = None, None
+            #######
 
             self.optimizer.step()
             # Only step the LR scheduler when gradients are actually synced
@@ -506,20 +637,41 @@ class VLATrainer(TrainerUtils):
             # runs gradient_accumulation_steps times faster than intended,
             # causing warmup to end too early and cosine decay to bottom out
             # at min_lr well before max_train_steps is reached.
-            if self.accelerator.sync_gradients:
+            if sync:
                 self.lr_scheduler.step()
                 #######
                 # 中文注释：优化步完成 → 标记下一步起点重新采样 JointFlow 任务（一任务/优化步，累积窗口内同 task）。
                 self._jointflow_resample = True
                 #######
 
+            #######
+            # 中文注释：step 后（grad_norm_total 此时可从 DeepSpeed 取）汇总梯度指标。仍在 accumulate 块内以保证 engine 状态有效。
+            grad_metrics = {}
+            if want_grad:  # 受总开关控制：off 时连 grad_norm_total 都不取（零开销）
+                try:
+                    grad_metrics = self._finalize_grad_metrics(jointflow_task, head_logname, head_local_sq)
+                except Exception as e:
+                    if not self._grad_warned and self.accelerator.is_main_process:
+                        logger.warning("grad-norm finalize failed (%s); skipping.", e)
+                    self._grad_warned = True
+            #######
+
         #######
-        # 中文注释：JointFlow 分支记录 policy/fdm/idm/passive 关键 loss；旧分支保持 action_dit_loss。
+        # 中文注释：只在「即将记录」的步做 .item()/.cpu()（减少 GPU→CPU 同步）；其余步返回 {}。
+        if not will_log:
+            return {}
         if jointflow_task is not None:
-            return self._collect_jointflow_metrics(output_dict, jointflow_task, total_loss)
-        return {
-            "action_dit_loss": action_loss.item(),
-        }
+            metrics = self._build_loss_metrics(output_dict, jointflow_task, total_loss)
+        else:  # 原生（非多任务）路径
+            metrics = {
+                "train/task": "action",
+                "train/loss_total": float(total_loss.detach()),
+                "train/loss_action": float(total_loss.detach()),
+                "train/loss_action_raw": float(total_loss.detach()),
+                "train/loss_action_weighted": float(total_loss.detach()),
+            }
+        metrics.update(grad_metrics)
+        return metrics
         #######
 
     def _finalize_training(self):

@@ -3,7 +3,6 @@ import json
 import logging
 import math
 import os
-os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 import pathlib
 import time
 
@@ -32,7 +31,6 @@ def _binarize_gripper_open(open_val: np.ndarray | float) -> np.ndarray:
 class Args:
     host: str = "127.0.0.1"
     port: int = 10093
-    resize_size = [224, 224]
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -42,16 +40,24 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    max_tasks: int = -1  # If > 0, limit the number of tasks evaluated (smoke / quick check). -1 = run all.
+
+    # New: task-level sharding for parallel LIBERO eval.
+    # Split tasks, not trials, so every task still runs full num_trials_per_task.
+    task_shard_index: int = 0
+    num_task_shards: int = 1
 
     #################################################################################################################
     # Utils
     #################################################################################################################
     video_out_path: str = "experiments/libero/logs"  # Path to save videos
-    log_path: str = "experiments/libero/logs"
 
     seed: int = 7  # Random Seed (for reproducibility)
 
     pretrained_path: str = ""
+
+    # Dataset key for un-normalization. None = auto (only if model trained on a single dataset).
+    unnorm_key: str | None = None
 
     post_process_action: bool = True
 
@@ -72,7 +78,7 @@ def eval_libero(args: Args) -> None:
 
     # args.video_out_path = f"{date_base}+{args.job_name}"
 
-    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    # pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -90,27 +96,35 @@ def eval_libero(args: Args) -> None:
     client_model = ModelClient(
         host=args.host,
         port=args.port,
-        image_size=args.resize_size,
+        unnorm_key=args.unnorm_key,
     )
 
-    disturb_res = {}
-    LIBERO_HOME = os.environ.get("LIBERO_HOME", "path_to_LIBERO-plus_home")
-    with open(os.path.join(LIBERO_HOME, "libero/libero/benchmark/task_classification.json")) as f:
-        TASK_MAPPING = json.load(f)[args.task_suite_name]
-    ID2CATEGORY = {}
-    for item in TASK_MAPPING:
-        category = item["category"]
-        item_name = item["name"]
-        ID2CATEGORY[item["id"]] = (category, item_name)
-        if category not in disturb_res:
-            disturb_res[category] = {"total_count": 0, "success_count": 0}
-        disturb_res[category]["total_count"] += 1
+    # Optional smoke-test cap + task-level sharding.
+    if args.num_task_shards < 1:
+        raise ValueError(f"num_task_shards must be >= 1, got {args.num_task_shards}")
+    if not (0 <= args.task_shard_index < args.num_task_shards):
+        raise ValueError(
+            f"task_shard_index must be in [0, {args.num_task_shards}), got {args.task_shard_index}"
+        )
+
+    base_task_ids = list(range(num_tasks_in_suite))
+    if args.max_tasks > 0:
+        base_task_ids = base_task_ids[: min(args.max_tasks, num_tasks_in_suite)]
+
+    task_ids = base_task_ids[args.task_shard_index :: args.num_task_shards]
+    logging.info(
+        f"Evaluating task ids {task_ids} from {len(base_task_ids)} capped tasks "
+        f"/ {num_tasks_in_suite} total tasks "
+        f"(max_tasks={args.max_tasks}, shard={args.task_shard_index}/{args.num_task_shards})"
+    )
+
+    if len(task_ids) == 0:
+        logging.info("No tasks assigned to this shard. Exit.")
+        return
 
     # Start evaluation
-
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
-
+    for task_id in tqdm.tqdm(task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -123,7 +137,6 @@ def eval_libero(args: Args) -> None:
         # Start episodes
         task_episodes, task_successes = 0, 0
         for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
-
             logging.info(f"\nTask: {task_description}")
 
             # Reset environment
@@ -144,7 +157,6 @@ def eval_libero(args: Args) -> None:
             # full_actions = np.load("./debug/action.npy")
 
             while t < max_steps + args.num_steps_wait:
-
                 # try:
                 # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                 # and we need to wait for them to fall
@@ -158,7 +170,7 @@ def eval_libero(args: Args) -> None:
                 wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
 
                 # Save preprocessed image for replay video
-                replay_images.append(img)
+                # replay_images.append(img)
 
                 state = np.concatenate(
                     (
@@ -183,7 +195,6 @@ def eval_libero(args: Args) -> None:
 
                 start_time = time.time()
 
-                # response = client_model.step(example=example_dict)
                 response = client_model.step(example=example_dict, step=step)
 
                 end_time = time.time()
@@ -218,7 +229,6 @@ def eval_libero(args: Args) -> None:
                 if done:
                     task_successes += 1
                     total_successes += 1
-                    disturb_res[ID2CATEGORY[task_id + 1][0]]["success_count"] += 1
                     break
                 t += 1
                 step += 1
@@ -227,15 +237,13 @@ def eval_libero(args: Args) -> None:
             total_episodes += 1
 
             # Save a replay video of the episode
-            suffix = "success" if done else "failure"
-            task_segment = task_description.replace(" ", "_")
-
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path)
-                / f"rollout_{ID2CATEGORY[task_id+1][1]}_episode{episode_idx}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=25,
-            )
+            # suffix = "success" if done else "failure"
+            # task_segment = task_description.replace(" ", "_")
+            # imageio.mimwrite(
+            #     pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.mp4",
+            #     [np.asarray(x) for x in replay_images],
+            #     fps=10,
+            # )
 
             full_actions = np.stack(full_actions)
             # np.save(pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_episode{episode_idx}_{suffix}.npy", full_actions)
@@ -249,8 +257,7 @@ def eval_libero(args: Args) -> None:
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
-    with open(os.path.join(args.log_path, f"{args.task_suite_name}.json"), "w", encoding="utf-8") as f:
-        json.dump(disturb_res, f)
+
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
 
@@ -260,7 +267,7 @@ def _get_libero_env(task, resolution, seed):
     task_description = task.language
     task_bddl_file = pathlib.Path(get_libero_path("bddl_files")) / task.problem_folder / task.bddl_file
     env_args = {
-        "bddl_file_name": str(task_bddl_file),
+        "bddl_file_name": task_bddl_file,
         "camera_heights": resolution,
         "camera_widths": resolution,
     }

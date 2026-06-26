@@ -57,7 +57,7 @@ framework:
     # 中文注释：tricks 开——correlated noise（β=0.5）+ multi-step FM（20）。
     use_correlated_noise: true
     correlation_beta: 0.5
-    flow_matching_steps: 20
+    flow_matching_steps: 4
     #######
     add_pos_embed: true
     max_seq_len: 1024
@@ -108,17 +108,17 @@ datasets:
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     #######
     # 中文注释：2B 省显存 per_device 提到 8；大 batch 靠多机多卡（global=per_device×总卡，grad_accum=1）。
-    per_device_batch_size: 8
+    per_device_batch_size: 6
     #######
     load_all_data_for_training: false
     video_backend: torchvision_av
     #######
     # 中文注释：⚠️64卡集群 OOM 防护。默认 num_workers=16 → 64×16=1024 worker 会把节点 CPU 内存打爆,
     # worker 被 OOM-killed(报 "DataLoader worker killed by signal: Killed")→该 rank 退出→其它 rank NCCL 连带崩。
-    num_workers: 1
-    prefetch_factor: 1
+    num_workers: 2
+    prefetch_factor: 2
     pin_memory: false
-    persistent_workers: false
+    persistent_workers: true
     #######
     online_dino: true
     dino_target_latents: true    # hybrid: 在线出 raw 图给 Qwen 原生视觉 + 读预存 DINO latent 当世界模型 target(省在线抽取)

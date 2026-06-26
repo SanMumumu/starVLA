@@ -4,10 +4,10 @@
 # act-query 服务 policy/idm，flow-query 服务 passive/fdm；trainer 按 tasks.weights 每步广播采一个范式。
 #######
 run_id: starvla_wam_exp4_4task
-run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
 seed: 42
 wandb_entity: your_wandb_entity
-wandb_project: starvla_wam_libero
+wandb_project: starvla_wam_libero_w_grad
 is_debug: false
 version_id: "0.21"
 
@@ -22,15 +22,15 @@ framework:
   wam:
     enabled: true
     placeholder_token: "<ACT_PH>"
-    dino_loss_weight: 1.0
+    dino_loss_weight: 0.05
   #######
   # 中文注释：exp4 四范式全开。
   tasks:
     weights:
       policy: 1.0
-      passive: 0.5
-      fdm: 0.5
-      idm: 0.5
+      passive: 1.0
+      fdm: 1.0
+      idm: 1.0
   #######
   dino:
     name: dinov3_vits16
@@ -102,16 +102,8 @@ datasets:
     include_state: false
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     per_device_batch_size: 8
-    load_all_data_for_training: false
+    load_all_data_for_training: true
     video_backend: torchvision_av
-    #######
-    # 中文注释：⚠️64卡集群 OOM 防护。默认 num_workers=16 → 64×16=1024 worker 会把节点 CPU 内存打爆,
-    # worker 被 OOM-killed(报 "DataLoader worker killed by signal: Killed")→该 rank 退出→其它 rank NCCL 连带崩。
-    num_workers: 1
-    prefetch_factor: 1
-    pin_memory: false
-    persistent_workers: false
-    #######
     online_dino: true
     dino_target_latents: true    # hybrid: 在线出 raw 图给 Qwen 原生视觉 + 读预存 DINO latent 当世界模型 target(省在线抽取)
     world_model:
@@ -135,6 +127,12 @@ trainer:
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 100
+  #######
+  # 中文注释：梯度记录总开关。true=每 logging_frequency 步记 per-task 梯度
+  #   train/grad_norm_{total,shared,head}/<task>（4 任务 policy/inverse/fdm/passive 各一条线）；
+  #   false=完全不记（零梯度开销）。不需要时改回 false。
+  log_grad_norms: true
+  #######
   gradient_clipping: 1.0
   gradient_accumulation_steps: 8
   gradient_checkpointing: true

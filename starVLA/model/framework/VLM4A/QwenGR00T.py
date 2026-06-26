@@ -254,7 +254,18 @@ class Qwen_GR00T(baseframework):
             self.config.framework.visual_model.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
         #######
 
-        self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)
+        #######
+        # 中文注释：动作头骨干选择——默认 GR00T DiT-B；`framework.action_model.backbone: wan` 时换成
+        # Wan-初始化动作头（Wan DiTBlock 架构 + Wan 视频 DiT 骨干截断/插值初始化，参考 FastWAM）。
+        # 对外接口与 FlowmatchingActionHead 完全一致（forward/predict_action/set_action_correlation），
+        # 所以 wam/native 调用处都不用改。
+        action_backbone = str(self.config.framework.action_model.get("backbone", "gr00t")).lower()
+        if action_backbone == "wan":
+            from starVLA.model.modules.action_model.wan_action_head import WanFlowMatchingActionHead
+            self.action_model = WanFlowMatchingActionHead(self.config)
+        else:
+            self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)
+        #######
 
         # `action_horizon` is the single source of truth for chunk length.
         # Legacy aliases (`future_action_window_size`, `past_action_window_size`)
@@ -812,6 +823,11 @@ class Qwen_GR00T(baseframework):
         # 与 idm/世界模型差分思路一致；只影响 fdm 范式（passive 仍预测绝对未来 DINO）。
         self.wam_fdm_delta = bool(wam_cfg.get("fdm_delta_dino", False))
         #######
+        #######
+        # 中文注释：world_model_no_language——fdm/passive 的 prompt 去掉语言指令(消融:显式动作条件 vs 语言对未来动态建模的作用)。
+        # 默认 False(带语言)；policy/idm 不受影响,永远带语言。
+        self.wam_world_model_no_language = bool(wam_cfg.get("world_model_no_language", False))
+        #######
         # 占位 token 注册 + 词表 resize（参考 LaWAM configure_latent_world_processor）。
         self.wam_ph = str(wam_cfg.get("placeholder_token", "<ACT_PH>"))
         tok = self.qwen_vl_interface.processor.tokenizer
@@ -862,12 +878,17 @@ class Qwen_GR00T(baseframework):
         n_ph = self.wam_n_act if is_action else self.wam_n_flow
         ph_str = " ".join([self.wam_ph] * n_ph)
         include_future = task == "idm"
+        #######
+        # 中文注释：world_model_no_language=true 时,visual 任务(fdm/passive)的 prompt **去掉语言指令**(只 image+flow 占位),
+        # 用来消融「世界模型分支是否需要语言」。policy/idm(动作任务)**永远带语言**(动作必须条件在指令上)。
+        drop_lang = (not is_action) and bool(getattr(self, "wam_world_model_no_language", False))
+        #######
         proc = self.qwen_vl_interface.processor
         cot = self.config.datasets.vla_data.get("CoT_prompt", "{instruction}")
         messages = []
         for ex in examples:
             views, future_main = self._wam_views(ex)
-            text = str(cot).replace("{instruction}", str(ex.get("lang", "")))
+            text = "" if drop_lang else str(cot).replace("{instruction}", str(ex.get("lang", "")))
             # 中文注释：所有当前视角（LIBERO 2 / RoboTwin 3）先放，idm 再加未来帧，最后文本 + 单组 query 占位——
             # 保证 query 占位（native causal）能 attend 到全部图像。
             imgs = list(views)
@@ -980,21 +1001,29 @@ class Qwen_GR00T(baseframework):
             ad = self._jointflow_module_dtype(self.wam_act_ctx, fallback=h_flow.dtype)
             actx = self.wam_act_ctx(actions.to(ad)).to(h_flow.dtype)
             cond = torch.cat([h_flow, actx], dim=1)
-            #######
-            # 中文注释：delta-DINO（exp6）——target 改成「未来 - 当前」DINO 差分，监督头只学动作引起的变化。
-            if self.wam_fdm_delta:
-                z_0 = self._wam_dino_target(examples, "dino_0", ["image_0", "image"])
-                z_gt = z_gt - z_0.to(z_gt.device, z_gt.dtype)
-                #######
-                # 中文注释：残差幅值远小于 flow matching 的 N(0,1) 噪声→不归一化 head 学不到动态。
-                # 按通道(在 B,N 维)标准化到≈单位方差,与噪声同量级。DINO 头纯监督、推理不用→无需反归一化,
-                # 故就地缩放即可,不必存 stats（保持简单）。
-                z_gt = z_gt / (z_gt.std(dim=(0, 1), keepdim=True) + 1e-6)
-                #######
-            #######
+        #######
+        # 中文注释：delta-DINO target（未来 - 当前 DINO 差分）——**对 fdm 和 passive 都生效**（由 fdm_delta_dino 控）。
+        # 这样 fdm(有 act_ctx 动作条件) 与 passive(无动作条件) 用**同一监督 target**，单变量只差「动作条件」，
+        # 干净判断「动作能否塑造更好表征」（用户意图：判断动作时 target 不应改变）。
+        # 历史名 fdm_delta_dino,语义其实是「世界模型 target 用差分」,对两个 visual 范式通用。
+        # 残差幅值远小于 N(0,1) 噪声→按通道(B,N 维)标准化到≈单位方差;DINO 头纯监督、推理不用→无需反归一化。
+        if self.wam_fdm_delta:
+            z_0 = self._wam_dino_target(examples, "dino_0", ["image_0", "image"])
+            z_gt = z_gt - z_0.to(z_gt.device, z_gt.dtype)
+            z_gt = z_gt / (z_gt.std(dim=(0, 1), keepdim=True) + 1e-6)
+        #######
         vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=cond.dtype)
-        loss = self.wam_dino_loss_weight * self.wam_visual_head(cond.to(vh), z_gt)
-        return {f"{task}_loss": loss + self._wam_unused_anchor(task, loss)}
+        #######
+        # 中文注释：拆出 raw（视觉头原始 MSE）与 weighted（× dino_loss_weight，= 实际反传的）两份，
+        # 供 trainer 分别记录 loss_<task>_raw / loss_<task>_weighted。raw 仅作日志（detach，不进反传）；
+        # backward 只用 weighted（key 以 _loss 结尾才会被 total_loss = sum(*_loss) 计入，raw 以 _loss_raw 结尾不计入）。
+        raw_dino = self.wam_visual_head(cond.to(vh), z_gt)
+        loss = self.wam_dino_loss_weight * raw_dino
+        return {
+            f"{task}_loss": loss + self._wam_unused_anchor(task, loss),
+            f"{task}_loss_raw": raw_dino.detach(),
+        }
+        #######
 
     # 中文注释：WAM 推理 = 只走原生视觉 policy（act-query→action head 采样）；DINO/监督头完全不碰。
     @torch.inference_mode()

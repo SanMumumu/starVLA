@@ -7,6 +7,7 @@ export NCCL_BLOCKING_WAIT=1
 export NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_TIMEOUT=10000  # timeout set to 1 hour (unit: seconds)
 export NCCL_SOCKET_TIMEOUT_MS=360000
+export WANDB_MODE=offline
 ###########################################################################################
 # exp3 = WAM policy + tricks（exp2 只-policy 基础上加 correlated noise + multi-step FM(20)）。
 # 与官方 run_libero_train.sh(exp1) 同结构，只换 config_yaml / run_id。base_vlm 用 4B 与 exp1 对齐。
@@ -16,8 +17,8 @@ base_vlm=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-4B
 config_yaml=./examples/LIBERO/train_files/starvla_wam_exp3_policy_tricks_libero.yaml
 libero_data_root=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero/
 data_mix=libero_all
-run_root_dir=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero
-run_id=0618_wam_exp3_policy_tricks
+run_root_dir=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
+run_id=0625_wam_exp3_policy_tricks
 # === End of environment variable configuration ===
 ###########################################################################################
 
@@ -37,7 +38,7 @@ accelerate launch \
   --framework.qwenvl.base_vlm ${base_vlm} \
   --datasets.vla_data.data_root_dir ${libero_data_root}\
   --datasets.vla_data.data_mix ${data_mix} \
-  --datasets.vla_data.per_device_batch_size 8 \
+  --datasets.vla_data.per_device_batch_size 16 \
   --trainer.freeze_modules ${freeze_module_list} \
   --trainer.max_train_steps 100000 \
   --trainer.save_interval 10000 \
