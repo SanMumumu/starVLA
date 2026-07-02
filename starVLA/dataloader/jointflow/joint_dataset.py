@@ -290,7 +290,7 @@ class JointLiberoDataset(LeRobotSingleDataset):
         actual_stride = min(requested_stride, remaining_steps)
         return int(base_index) + actual_stride, actual_stride, requested_stride
 
-    def get_step_data(self, trajectory_id: int, base_index: int) -> dict:
+    def get_step_data(self, trajectory_id: int, base_index: int, decode_video: bool = True) -> dict:
         self._last_trajectory_id = int(trajectory_id)
         self._last_base_index = int(base_index)
         data = {}
@@ -300,7 +300,8 @@ class JointLiberoDataset(LeRobotSingleDataset):
         # 当前帧 s_t 和未来帧 s_{t+stride}）。原始帧直接暂存到 self，不放进 data，
         # 这样 transforms（已 drop video）不会碰它们，避免缺 key 报错 / 重复处理。
         # DINO 不在 worker 里跑，只解码 RGB → 模型 forward 在 GPU 上在线提特征。
-        if self.online_dino:
+        # decode_video=False：只取 state/action（如启动估协方差），跳过 PyAV 解码。
+        if self.online_dino and decode_video:
             self._last_video_frames = {}
             for key in self.modality_keys.get("video", []):
                 self._last_video_frames[key] = self.get_data_by_modality(trajectory_id, "video", key, base_index)
@@ -310,6 +311,15 @@ class JointLiberoDataset(LeRobotSingleDataset):
             for key in self.modality_keys.get(modality, []):
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
         return self._apply_action_mode(data)
+
+    def read_action_only(self, trajectory_id: int, base_index: int) -> np.ndarray:
+        """返回单样本归一化 action [H, action_dim]，与 __getitem__ 完全同 transform，但**不解码视频/不读 latent**。
+        中文注释：供启动时估 correlated-noise 协方差用——只读 parquet 里的 state/action（走同一 get_step_data +
+        transforms 路径，只是 decode_video=False），避免逐样本 PyAV 解码在多机 bucket I/O 下挂起/超时。"""
+        raw = self.get_step_data(trajectory_id, base_index, decode_video=False)
+        data = self.transforms(raw)
+        action = [_to_numpy(data[k]) for k in self.modality_keys["action"]]
+        return np.concatenate(action, axis=1).astype(np.float32)
 
     def __getitem__(self, index: int) -> dict:
         trajectory_id, base_index = self.all_steps[index]
@@ -555,12 +565,32 @@ def build_joint_dataloader(cfg, mode: str = "train") -> DataLoader:
 def compute_action_correlation_cholesky(
     mixture_dataset: LeRobotMixtureDataset, num_samples: int = 20000, beta: float = 0.5, seed: int = 0
 ) -> np.ndarray:
-    n = len(mixture_dataset)
+    """估动作协方差的 Cholesky（correlated-noise 用）。
+
+    中文注释：**只读 action，不解码视频**——按各子数据集步数比例随机取样，走子数据集的 `read_action_only`
+    （同 __getitem__ 的 transform，但跳过 PyAV 视频解码 + latent 读取）。这样在多机 bucket I/O 下 rank0 估计
+    只碰 parquet，避免逐样本视频解码挂起/超时（见 train_starvla 启动 barrier）。子数据集若无 `read_action_only`
+    （非 jointflow）则回退到全量 __getitem__。逐样本 try/except 跳过坏样本，单个坏轨迹不再拖垮启动。
+    """
     rng = np.random.default_rng(seed)
-    idxs = rng.choice(n, size=min(int(num_samples), n), replace=False)
+    datasets = list(getattr(mixture_dataset, "datasets", None) or [mixture_dataset])
+    lengths = np.array([max(int(len(d)), 1) for d in datasets], dtype=np.float64)
+    probs = lengths / lengths.sum()
+    target = int(num_samples)
     rows: list[np.ndarray] = []
-    for i in idxs:
-        a = mixture_dataset[int(i)].get("action")
+    tries = 0
+    max_tries = max(target * 4, 16)
+    while len(rows) < target and tries < max_tries:
+        tries += 1
+        d = datasets[int(rng.choice(len(datasets), p=probs))]
+        try:
+            if hasattr(d, "read_action_only"):
+                traj_id, base_index = d.all_steps[int(rng.integers(0, len(d)))]
+                a = d.read_action_only(int(traj_id), int(base_index))
+            else:  # 回退：非 jointflow 数据集，走全量 __getitem__
+                a = mixture_dataset[int(rng.integers(0, len(mixture_dataset)))].get("action")
+        except Exception:
+            continue  # 坏样本/坏轨迹直接跳过，不拖垮启动
         if a is None:
             continue
         a = a.detach().cpu().numpy() if torch.is_tensor(a) else np.asarray(a)

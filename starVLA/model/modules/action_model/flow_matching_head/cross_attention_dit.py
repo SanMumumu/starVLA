@@ -88,6 +88,14 @@ class BasicTransformerBlock(nn.Module):
         ff_inner_dim: Optional[int] = None,
         ff_bias: bool = True,
         attention_out_bias: bool = True,
+        #######
+        # 中文注释：World→Action guidance（M5/M6+）——可选的 world cross-attention（gated）。
+        #   world_cross_attention=True 时本 block 额外做一路对 world memory 的 cross-attn，
+        #   X' = X + CA_action(X, M_a) + tanh(gate)·CA_world(X, M_w)；gate 初值=world_gate_init（默认 0 → 等价 baseline）。
+        world_cross_attention: bool = False,
+        world_cross_attention_dim: Optional[int] = None,
+        world_gate_init: float = 0.0,
+        #######
     ):
         super().__init__()
         self.dim = dim
@@ -101,6 +109,7 @@ class BasicTransformerBlock(nn.Module):
         self.positional_embeddings = positional_embeddings
         self.num_positional_embeddings = num_positional_embeddings
         self.norm_type = norm_type
+        self.world_cross_attention = world_cross_attention
 
         if positional_embeddings and (num_positional_embeddings is None):
             raise ValueError(
@@ -130,6 +139,30 @@ class BasicTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
         )
 
+        #######
+        # 中文注释：World cross-attention（M5/M6+）。读与 attn1 相同的 block 输入 X（pre-attn），gated 残差相加。
+        if world_cross_attention:
+            self.world_norm = (
+                AdaLayerNorm(dim) if norm_type == "ada_norm"
+                else nn.LayerNorm(dim, elementwise_affine=norm_elementwise_affine, eps=norm_eps)
+            )
+            self.world_attn = Attention(
+                query_dim=dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                dropout=dropout,
+                bias=attention_bias,
+                cross_attention_dim=world_cross_attention_dim,
+                upcast_attention=upcast_attention,
+                out_bias=attention_out_bias,
+            )
+            self.world_gate = nn.Parameter(torch.full((1,), float(world_gate_init)))
+        else:
+            self.world_norm = None
+            self.world_attn = None
+            self.world_gate = None
+        #######
+
         # 3. Feed-forward
         self.norm3 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
         self.ff = FeedForward(
@@ -152,9 +185,15 @@ class BasicTransformerBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.LongTensor] = None,
+        #######
+        # 中文注释：World→Action guidance（M5/M6+）的 world memory + mask；为 None 时本 block 行为与 baseline 完全一致。
+        world_hidden_states: Optional[torch.Tensor] = None,
+        world_attention_mask: Optional[torch.Tensor] = None,
+        #######
     ) -> torch.Tensor:
 
         # 0. Self-Attention
+        x_in = hidden_states  # 中文注释：保存 block 输入 X（world cross-attn 与 attn1 读同一 X）
         if self.norm_type == "ada_norm":
             norm_hidden_states = self.norm1(hidden_states, temb)
         else:
@@ -174,6 +213,24 @@ class BasicTransformerBlock(nn.Module):
         hidden_states = attn_output + hidden_states
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
+
+        #######
+        # 中文注释：M5/M6+ gated world cross-attention——X' += tanh(gate)·CA_world(X, M_w)。
+        # 读 block 输入 X（pre-attn1），与 action cross-attn 并联；gate 初值 0 → 平滑从 baseline 起步。
+        if self.world_attn is not None and world_hidden_states is not None:
+            if self.norm_type == "ada_norm":
+                norm_world = self.world_norm(x_in, temb)
+            else:
+                norm_world = self.world_norm(x_in)
+            world_out = self.world_attn(
+                norm_world,
+                encoder_hidden_states=world_hidden_states,
+                attention_mask=world_attention_mask,
+            )
+            if world_out.ndim == 4:
+                world_out = world_out.squeeze(1)
+            hidden_states = hidden_states + torch.tanh(self.world_gate) * world_out
+        #######
 
         # 4. Feed-forward
         norm_hidden_states = self.norm3(hidden_states)
@@ -210,6 +267,17 @@ class DiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
+        #######
+        # 中文注释：World→Action guidance（M4/M5/M6/M6+）的 DiT 级开关，默认全 False → 与原 DiT 完全一致。
+        #   world_cross_attention：在每个 cross block 加 gated world cross-attn（M5/M6+）。
+        #   world_adaln：加 world_to_temb（zero-init），把 pooled world 向量加到 timestep embedding 驱动 AdaLN（M6/M6+）。
+        #   world_cross_attention_dim/world_global_dim：world memory / world 全局向量维度（默认=cross_attention_dim）。
+        world_cross_attention: bool = False,
+        world_adaln: bool = False,
+        world_cross_attention_dim: Optional[int] = None,
+        world_global_dim: Optional[int] = None,
+        world_gate_init: float = 0.0,
+        #######
         **kwargs,
     ):
         super().__init__()
@@ -231,6 +299,8 @@ class DiT(ModelMixin, ConfigMixin):
 
             use_self_attn = idx % 2 == 1 and interleave_self_attention
             curr_cross_attention_dim = cross_attention_dim if not use_self_attn else None
+            # world cross-attn 只加在 cross block（self block 不读 memory）。
+            block_world_xattn = bool(world_cross_attention) and (not use_self_attn)
 
             all_blocks += [
                 BasicTransformerBlock(
@@ -248,9 +318,24 @@ class DiT(ModelMixin, ConfigMixin):
                     num_positional_embeddings=self.config.max_num_positional_embeddings,
                     final_dropout=final_dropout,
                     cross_attention_dim=curr_cross_attention_dim,
+                    world_cross_attention=block_world_xattn,
+                    world_cross_attention_dim=(world_cross_attention_dim or cross_attention_dim),
+                    world_gate_init=world_gate_init,
                 )
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)
+
+        #######
+        # 中文注释：M6/M6+ world AdaLN——zero-init 的 Linear 把 pooled world 向量映到 inner_dim 加到 temb；
+        # zero-init → 训练起点 temb 不变（等价 baseline），让 world 调制平滑生效。
+        if world_adaln:
+            wgd = int(world_global_dim or cross_attention_dim or self.inner_dim)
+            self.world_to_temb = nn.Linear(wgd, self.inner_dim)
+            nn.init.zeros_(self.world_to_temb.weight)
+            nn.init.zeros_(self.world_to_temb.bias)
+        else:
+            self.world_to_temb = None
+        #######
 
         # Output blocks
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=1e-6)
@@ -268,9 +353,25 @@ class DiT(ModelMixin, ConfigMixin):
         timestep: Optional[torch.LongTensor] = None,
         return_all_hidden_states: bool = False,
         encoder_attention_mask=None,
+        #######
+        # 中文注释：World→Action guidance（M4/M5/M6+）。默认全 None/"none" → 与原 DiT 完全一致。
+        #   world_mode="alternate"(M4)：cross block 交替 attend action / world memory（复用 attn1，无新参数）。
+        #   world_mode="dual"(M5/M6+)：每个 cross block 并联 gated world cross-attn（用 block.world_attn）。
+        #   world_global(M6/M6+)：pooled world 向量经 world_to_temb 加到 temb 驱动 AdaLN。
+        world_hidden_states=None,
+        world_attention_mask=None,
+        world_global=None,
+        world_mode: str = "none",
+        #######
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
+
+        #######
+        # 中文注释：M6/M6+ world AdaLN 调制（zero-init → 起点等价 baseline）。
+        if getattr(self, "world_to_temb", None) is not None and world_global is not None:
+            temb = temb + self.world_to_temb(world_global.to(temb.dtype))
+        #######
 
         # Process through transformer blocks - single pass through the blocks
         hidden_states = hidden_states.contiguous()
@@ -279,6 +380,7 @@ class DiT(ModelMixin, ConfigMixin):
         all_hidden_states = [hidden_states]
 
         # Process through transformer blocks
+        cross_count = 0  # 中文注释：cross block 计数（M4 交替路由用）
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1 and self.config.interleave_self_attention:
                 hidden_states = block(
@@ -289,13 +391,25 @@ class DiT(ModelMixin, ConfigMixin):
                     temb=temb,
                 )
             else:
+                enc, enc_mask = encoder_hidden_states, encoder_attention_mask
+                w_hs, w_mask = None, None
+                if world_mode == "alternate" and world_hidden_states is not None:
+                    # M4：奇数个 cross block → 读 world memory，偶数 → action memory
+                    if cross_count % 2 == 1:
+                        enc, enc_mask = world_hidden_states, world_attention_mask
+                elif world_mode == "dual" and world_hidden_states is not None:
+                    # M5/M6+：并联 gated world cross-attn
+                    w_hs, w_mask = world_hidden_states, world_attention_mask
                 hidden_states = block(
                     hidden_states,
                     attention_mask=None,
-                    encoder_hidden_states=encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
+                    encoder_hidden_states=enc,
+                    encoder_attention_mask=enc_mask,
                     temb=temb,
+                    world_hidden_states=w_hs,
+                    world_attention_mask=w_mask,
                 )
+                cross_count += 1
             all_hidden_states.append(hidden_states)
 
         # Output processing

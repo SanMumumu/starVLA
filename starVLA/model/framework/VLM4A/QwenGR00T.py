@@ -259,6 +259,11 @@ class Qwen_GR00T(baseframework):
         # Wan-初始化动作头（Wan DiTBlock 架构 + Wan 视频 DiT 骨干截断/插值初始化，参考 FastWAM）。
         # 对外接口与 FlowmatchingActionHead 完全一致（forward/predict_action/set_action_correlation），
         # 所以 wam/native 调用处都不用改。
+        #######
+        # 中文注释：World→Action guidance 的 M5/M6/M6+ 需要 action DiT 内建 world 子模块（world_attn / world_to_temb），
+        # 必须在构造 action head 之前把开关写进 diffusion_model_cfg。M4(alternate)/concat-family 不需要新参数。
+        self._inject_guidance_dit_flags()
+        #######
         action_backbone = str(self.config.framework.action_model.get("backbone", "gr00t")).lower()
         if action_backbone == "wan":
             from starVLA.model.modules.action_model.wan_action_head import WanFlowMatchingActionHead
@@ -281,6 +286,34 @@ class Qwen_GR00T(baseframework):
         if self.wam_enabled:
             self._init_wam_modules()
         #######
+
+    #######
+    # 中文注释：在构造 action head 前，把 guidance 的 M5/M6/M6+ 开关注入 action_model.diffusion_model_cfg，
+    # 让 DiT 在 __init__ 时建好 world_attn(每 cross block) / world_to_temb(AdaLN)。默认关 → 不注入任何键。
+    def _inject_guidance_dit_flags(self) -> None:
+        from omegaconf import OmegaConf
+
+        wam = self.config.framework.get("wam", {})
+        g = wam.get("guidance", {}) if hasattr(wam, "get") else {}
+        if not bool(g.get("enabled", False)):
+            return
+        mode = str(g.get("mode", "none")).lower()
+        if mode not in ("dual_xattn", "adaln", "dual_xattn_adaln"):
+            return  # M4 alternate 复用 attn1，concat-family 走 memory 拼接，都不需要新 DiT 参数
+        dcfg = self.config.framework.action_model.diffusion_model_cfg
+        # 训练时 self.config 被 AccessTrackedConfig(config_tracker) 包了一层，嵌套节点也是包装对象，
+        # 而 OmegaConf.set_struct 的 monkey-patch 没覆盖 → 直接调会 AttributeError(_set_flag)。
+        # 先 unwrap 成原生 OmegaConf（底层同一引用，改键照样对 self.config 可见）。
+        if hasattr(dcfg, "unwrap"):
+            dcfg = dcfg.unwrap()
+        OmegaConf.set_struct(dcfg, False)
+        if mode in ("dual_xattn", "dual_xattn_adaln"):
+            dcfg.world_cross_attention = True
+            dcfg.world_gate_init = float(g.get("gate_init", 0.0))
+        if mode in ("adaln", "dual_xattn_adaln"):
+            dcfg.world_adaln = True
+        # world_cross_attention_dim / world_global_dim 默认 = cross_attention_dim（= d_model），DiT 内部兜底。
+    #######
 
     def _uses_action_state(self) -> bool:
         datasets_cfg = getattr(self.config, "datasets", None)
@@ -847,6 +880,114 @@ class Qwen_GR00T(baseframework):
         self.wam_act_ctx = ActionContextEncoder(
             action_dim=self.action_dim, hidden_size=int(self.qwen_vl_interface.model.config.hidden_size)
         )
+        #######
+        # 中文注释：World→Action guidance（M0–M6+ 大计划）的配置与子模块初始化。默认全关。
+        self._init_wam_guidance(wam_cfg)
+        #######
+
+    #######
+    # 中文注释：World→Action guidance 配置解析（plan §3）。所有键默认值在此集中，默认 enabled=False →
+    # guidance 子模块不构造、forward 不进 guided 分支，旧 WAM/原生 QwenGR00T 行为/ckpt 完全不变。
+    @staticmethod
+    def _wam_guidance_defaults() -> dict:
+        return {
+            "enabled": False,
+            # 注入结构 mode：concat-family(无需改 action head/DiT) = none|concat|sa_fusion|qformer；
+            # 需改 DiT(后续 P6-P8) = alternate_xattn|dual_xattn|adaln|dual_xattn_adaln。
+            "mode": "none",
+            # world 信号 signal：none|h_future|z_pred|delta_z_pred|z_oracle|delta_z_oracle。
+            "signal": "none",
+            # prompt：action_only(原 WAM 单 query) | dual_query(act+future 占位同一 forward)。
+            "prompt_mode": "action_only",
+            # bridge：predicted(用 world head 预测) | oracle(用 GT DINO) | scheduled(按 oracle_ratio 混)。
+            "bridge_source": "predicted",
+            "detach_world": True,       # True=action loss 不回传 world head（Stage1/2）；False=e2e(Stage3)
+            "oracle_ratio": 1.0,         # scheduled 时逐样本取 oracle 的概率（1→全 oracle, 0→全 predicted）
+            "n_world_tokens": 16,        # M3 Q-Former 压缩后的 token 数
+            "qformer_layers": 2,
+            "fusion_layers": 2,          # M2 CompactSAFusion 层数
+            "fusion_heads": 8,
+            "qformer_heads": 8,
+            "pooler_heads": 8,
+            "gate_init": 0.0,            # M5 world_gate 初值（tanh(0)=0 → 平滑从 baseline 起步），DiT 阶段用
+            "world_dropout": 0.0,
+            "include_context_in_world_memory": True,  # action memory 是否保留 Qwen 图文 context
+            # 因果消融(plan §11，eval 时生效)：correct|off|zero|shuffled|wrong_task|gt
+            "world_eval_mode": "correct",
+        }
+
+    def _init_wam_guidance(self, wam_cfg) -> None:
+        g_user = dict(wam_cfg.get("guidance", {})) if hasattr(wam_cfg, "get") else {}
+        g = self._wam_guidance_defaults()
+        g.update({k: v for k, v in g_user.items() if v is not None})
+        self.wam_guidance = g
+        self.wam_guidance_enabled = bool(g["enabled"])
+        # world_target(absolute|delta)：guidance 下优先；否则回落已有 fdm_delta_dino。delta → world head 学差分。
+        wt = str(wam_cfg.get("world_target", "")).lower() if hasattr(wam_cfg, "get") else ""
+        if wt in ("absolute", "delta"):
+            self.wam_fdm_delta = wt == "delta"
+        if not self.wam_guidance_enabled:
+            return
+        mode = str(g["mode"]).lower()
+        signal = str(g["signal"]).lower()
+        # 信号是否走 DINO 潜变量空间（d_dino）：z_pred/delta_z_pred/z_oracle/delta_z_oracle；否则 h_future 走 d_model。
+        self._wam_signal_is_latent = signal in ("z_pred", "delta_z_pred", "z_oracle", "delta_z_oracle")
+        self._wam_signal_is_delta = signal in ("delta_z_pred", "delta_z_oracle")
+        self._wam_signal_is_oracle = signal in ("z_oracle", "delta_z_oracle")
+        if self._wam_signal_is_delta:
+            self.wam_fdm_delta = True  # 信号是差分 → world head 必须训练成预测差分
+        d_model = int(self.qwen_vl_interface.model.config.hidden_size)
+        d_dino = int(self.d_dino)
+        world_in_dim = d_dino if self._wam_signal_is_latent else d_model
+        from starVLA.model.framework.VLM4A.wam_guidance import (
+            CompactSAFusion,
+            WorldQFormer,
+            WorldTokenAdapter,
+            WorldTokenPooler,
+        )
+        drop = float(g["world_dropout"])
+        # 子模块按 mode/signal 条件实例化（未用到的不建，省参数 + 避免 DDP unused-param；guided 分支另有 anchor 兜底）。
+        self.world_adapter = None
+        self.world_fusion = None
+        self.world_qformer = None
+        self.world_pooler = None
+        if signal != "none":
+            if mode == "qformer":
+                # M3：压缩空间 DINO tokens → n_world_tokens（不需要 adapter）。
+                self.world_qformer = WorldQFormer(
+                    in_dim=world_in_dim, out_dim=d_model, n_query=int(g["n_world_tokens"]),
+                    num_layers=int(g["qformer_layers"]), num_heads=int(g["qformer_heads"]), dropout=drop,
+                )
+            elif mode == "sa_fusion":
+                # M2：对 [h_act; h_future] 轻量 SA（都在 d_model，不需要 adapter）。
+                self.world_fusion = CompactSAFusion(
+                    dim=d_model, num_layers=int(g["fusion_layers"]), num_heads=int(g["fusion_heads"]), dropout=drop,
+                )
+            else:
+                # concat / adaln / dual_xattn / dual_xattn_adaln / alternate_xattn：投影 world 信号到 d_model。
+                self.world_adapter = WorldTokenAdapter(in_dim=world_in_dim, out_dim=d_model, dropout=drop)
+            if mode in ("adaln", "dual_xattn_adaln"):
+                self.world_pooler = WorldTokenPooler(dim=d_model, out_dim=d_model, num_heads=int(g["pooler_heads"]))
+        # world head 预测时的默认 token 数（无 GT 兜底，如 live eval）：DINO patch 数 = (image/patch)^2。
+        _img = int(self.config.framework.dino.get("image_size", 224))
+        _pch = int(self.config.framework.dino.get("patch_size", 16))
+        self._wam_world_n = (_img // _pch) ** 2
+        # dual_query：注册独立 future 占位 token（与 act 占位 <ACT_PH> 区分），便于一个 forward 取两组 query。
+        self.wam_future_ph = None
+        self.wam_future_ph_id = None
+        if str(g["prompt_mode"]).lower() == "dual_query":
+            tok = self.qwen_vl_interface.processor.tokenizer
+            self.wam_future_ph = "<FUTURE_PH>"
+            tok.add_special_tokens({"additional_special_tokens": [self.wam_future_ph]})
+            self.wam_future_ph_id = int(tok.convert_tokens_to_ids(self.wam_future_ph))
+            self.qwen_vl_interface.model.resize_token_embeddings(len(tok))
+        logger.info(
+            "WAM guidance ON: mode=%s signal=%s prompt=%s bridge=%s detach_world=%s (adapter=%s qformer=%s fusion=%s pooler=%s)",
+            mode, signal, g["prompt_mode"], g["bridge_source"], g["detach_world"],
+            self.world_adapter is not None, self.world_qformer is not None,
+            self.world_fusion is not None, self.world_pooler is not None,
+        )
+    #######
 
     @staticmethod
     def _wam_view_list(v):
@@ -979,6 +1120,11 @@ class Qwen_GR00T(baseframework):
     # 两组 query 依托不同范式：act-query 服务 policy/idm（预测 action）；flow-query 服务 passive/fdm（预测 DINO）。
     def _wam_forward(self, examples: List[dict], task: str = "policy", **kwargs) -> dict:
         task = str(task)
+        #######
+        # 中文注释：World→Action guidance 开启时走 guided 路径（dual-query + world 注入）。默认关→原 WAM。
+        if getattr(self, "wam_guidance_enabled", False):
+            return self._wam_guided_forward(examples, task=task, **kwargs)
+        #######
         h_query, hidden, attn, ph_mask = self._wam_backbone(examples, task=task)
         if task in ("policy", "idm"):
             actions = self._stack_jointflow_field(examples, "action", required=True)
@@ -1031,6 +1177,11 @@ class Qwen_GR00T(baseframework):
         if not isinstance(examples, list):
             examples = [examples]
         #######
+        # 中文注释：World→Action guidance 开启时走 guided 推理（dual-query + world 注入 + 可选因果消融）。
+        if getattr(self, "wam_guidance_enabled", False):
+            return self._wam_guided_predict_action(examples, **kwargs)
+        #######
+        #######
         # 中文注释：推理 action 条件与训练 policy 一致 = act-query ⊕ 图文 hidden（屏蔽 raw 占位）；走 policy prompt（仅 act 占位）。
         h_act, hidden, attn, ph_mask = self._wam_backbone(examples, task="policy")
         mem, mem_mask = self._wam_action_memory(h_act, hidden, attn, ph_mask)
@@ -1039,6 +1190,324 @@ class Qwen_GR00T(baseframework):
         #######
         return {"normalized_actions": pred.float().detach().cpu().numpy()}
     #######
+
+    #######################################################################
+    # 中文注释：World→Action guidance（M0–M6+ 大计划）的 guided 路径。仅在
+    # framework.wam.guidance.enabled=true 时由 _wam_forward/_wam_predict_action 路由进来。
+    # 与原 WAM 的差别：用 dual-query prompt（act 占位 + future 占位同一 forward），把 future-query
+    # hidden（或 world head 预测的未来 DINO 潜变量）作为 world 信号注入 action 条件，保留原始
+    # action 条件不删（plan §2.1）。当前支持 concat-family 注入：none(M0-Q)/concat(M1.x)/
+    # sa_fusion(M2)/qformer(M3)——均走 action memory 拼接，复用现有 action head 接口，不改 DiT。
+    # alternate/dual_xattn/adaln/dual_xattn_adaln(M4/M5/M6/M6+) 需 DiT 改造，留任务 #14(P6-P8)。
+    #######################################################################
+
+    def _build_wam_guided_inputs(self, examples: List[dict], task: str = "policy"):
+        """dual-query prompt：指令后接 act 占位×n_act + future 占位×n_flow（同一 forward）。
+
+        中文注释：与 _build_wam_inputs 同构，但**每个任务**都同时放两组 query 占位——这样 h_future 永远
+        在「带 act-query」的同一上下文里被算出来（M0-Q 控制组的前提：双 query 本身会改 Qwen 表征）。
+        返回 inputs + act_mask + future_mask（按各自占位 id 定位）。
+        """
+        task = str(task)
+        is_action = task in ("policy", "idm")
+        include_future = task == "idm"
+        act_str = " ".join([self.wam_ph] * self.wam_n_act)
+        fut_str = " ".join([self.wam_future_ph] * self.wam_n_flow)
+        ph_str = f"{act_str} {fut_str}"
+        drop_lang = (not is_action) and bool(getattr(self, "wam_world_model_no_language", False))
+        proc = self.qwen_vl_interface.processor
+        cot = self.config.datasets.vla_data.get("CoT_prompt", "{instruction}")
+        messages = []
+        for ex in examples:
+            views, future_main = self._wam_views(ex)
+            text = "" if drop_lang else str(cot).replace("{instruction}", str(ex.get("lang", "")))
+            imgs = list(views)
+            if include_future and future_main is not None:
+                imgs.append(future_main)
+            content = [{"type": "image", "image": im} for im in imgs]
+            content.append({"type": "text", "text": f"{text}\n{ph_str}"})
+            messages.append([{"role": "user", "content": content}])
+        old = proc.tokenizer.padding_side
+        proc.tokenizer.padding_side = "left"
+        try:
+            inputs = proc.apply_chat_template(
+                messages, tokenize=True, padding=True, add_generation_prompt=True,
+                return_dict=True, return_tensors="pt",
+            )
+        finally:
+            proc.tokenizer.padding_side = old
+        inputs = inputs.to(self.qwen_vl_interface.model.device)
+        act_mask = inputs["input_ids"] == self.wam_ph_id
+        fut_mask = inputs["input_ids"] == self.wam_future_ph_id
+        return inputs, act_mask, fut_mask
+
+    def _wam_guided_backbone(self, examples: List[dict], task: str = "policy"):
+        """跑 Qwen，取 h_act[B,n_act,D] 与 h_future[B,n_flow,D]，并返回完整 hidden/padding/占位 mask。"""
+        inputs, act_mask, fut_mask = self._build_wam_guided_inputs(examples, task=task)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = self.qwen_vl_interface.model(
+                **inputs, output_hidden_states=True, return_dict=True, use_cache=False,
+            )
+        hidden = out.hidden_states[-1]
+        bsz = len(examples)
+        d = hidden.shape[-1]
+        h_act = hidden[act_mask].view(bsz, self.wam_n_act, d)
+        h_future = hidden[fut_mask].view(bsz, self.wam_n_flow, d)
+        attn = inputs.get("attention_mask", None)
+        ph_mask = act_mask | fut_mask  # 两组占位都从 raw context 里屏蔽
+        return h_act, h_future, hidden, attn, ph_mask
+
+    def _wam_world_target(self, examples: List[dict]) -> torch.Tensor:
+        """GT 未来 world 监督 target：absolute=DINO(image_1)；delta=标准化(DINO(img1)-DINO(img0))。
+
+        中文注释：passive/fdm 的监督 target 与 oracle bridge 的 GT 必须**同一函数**产出，否则 oracle 与
+        world head 学到的空间不一致（delta 还要按 batch 标准化到≈单位方差，与 _wam_forward 老路一致）。
+        """
+        z1 = self._wam_dino_target(examples, "dino_1", ["image_1"])
+        if not self.wam_fdm_delta:
+            return z1
+        z0 = self._wam_dino_target(examples, "dino_0", ["image_0", "image"])
+        z = z1 - z0.to(z1.device, z1.dtype)
+        return z / (z.std(dim=(0, 1), keepdim=True) + 1e-6)
+
+    def _build_world_signal(self, h_future: torch.Tensor, examples: List[dict], eval_mode: str = "correct"):
+        """产出注入 action 的 world tokens [B,N_w,D_model]（或 None=不注入）。
+
+        中文注释：按 guidance.signal 取信号——h_future(直接用 future-query hidden)；z_pred/delta_z_pred
+        (world head 预测未来 DINO 潜变量)；z_oracle/delta_z_oracle(直接用 GT)。bridge_source 决定
+        predicted/oracle/scheduled 混合；detach_world 决定 action loss 是否回传 world head。最后用
+        adapter(concat/dual/adaln) 或 qformer(M3) 投到 d_model。eval_mode 实现因果消融(off/zero/shuffled)。
+        """
+        from starVLA.model.framework.VLM4A.wam_guidance import mix_world_tokens, shuffle_along_batch
+
+        g = self.wam_guidance
+        signal = str(g["signal"]).lower()
+        mode = str(g["mode"]).lower()
+        em = str(eval_mode or "correct").lower()
+        if signal == "none" or em == "off":
+            return None
+
+        if not self._wam_signal_is_latent:
+            # M1.1/M2：world 信号 = future-query hidden（d_model）。
+            base = h_future
+        else:
+            bridge = str(g["bridge_source"]).lower()
+            # oracle（GT DINO/Δ）：仅训练时 dino_1 在 batch 才有；live eval 没有未来帧 → None。
+            oracle = None
+            want_oracle = self._wam_signal_is_oracle or bridge in ("oracle", "scheduled") or em == "gt"
+            if want_oracle:
+                try:
+                    oracle = self._wam_world_target(examples)
+                except Exception:
+                    oracle = None
+            # predicted：world head 以 h_future 为条件，flow 采样未来 DINO 潜变量。
+            predicted = None
+            need_pred = (not self._wam_signal_is_oracle) and em != "gt" and (
+                bridge in ("predicted", "scheduled") or oracle is None
+            )
+            if need_pred:
+                n_v = oracle.shape[1] if oracle is not None else int(self._wam_world_n)
+                if bool(g["detach_world"]):
+                    # detach_world：action loss 不回传 world head（Stage1/2）。直接 no_grad 出预测，
+                    # 不建无用反传图（省显存）；world head 由 passive/fdm 步监督训练。
+                    with torch.no_grad():
+                        predicted = self.wam_visual_head.predict_latent(h_future, n=n_v)
+                else:
+                    # e2e（Stage3）：保留梯度，action loss 经 predict_latent 回传到 world head + h_future。
+                    predicted = self.wam_visual_head.predict_latent(h_future, n=n_v)
+            if self._wam_signal_is_oracle or em == "gt":
+                base = oracle
+            elif bridge == "oracle":
+                base = oracle if oracle is not None else predicted
+            elif bridge == "scheduled":
+                base = mix_world_tokens(predicted, oracle, float(g["oracle_ratio"]))
+            else:
+                base = predicted if predicted is not None else oracle
+            if base is None:
+                return None
+        base = base.to(h_future.dtype)
+        # 因果消融（plan §11）：zero=置零；shuffled/wrong_task=batch 内错排（拿别人的未来）。
+        if em == "zero":
+            base = torch.zeros_like(base)
+        elif em in ("shuffled", "wrong_task"):
+            base = shuffle_along_batch(base)
+        # 投影到 action cross-attn 维度。
+        if mode == "qformer" and self.world_qformer is not None:
+            qd = self._jointflow_module_dtype(self.world_qformer, fallback=base.dtype)
+            return self.world_qformer(base.to(qd)).to(h_future.dtype)
+        if self.world_adapter is not None:
+            ad = self._jointflow_module_dtype(self.world_adapter, fallback=base.dtype)
+            return self.world_adapter(base.to(ad)).to(h_future.dtype)
+        return base
+
+    def _build_guided_action_memory(self, h_act, h_future, hidden, attn, ph_mask, world_tokens):
+        """组装 action DiT 的 cross-attn memory（concat-family）。
+
+        中文注释（plan §4.2）：
+          none(M0-Q)   memory = [h_act ; qwen_context]（world 不注入，仅 dual-query 影响 Qwen 表征）。
+          concat/qformer memory = [h_act ; world_tokens ; qwen_context]。
+          sa_fusion(M2)  memory = [SA([h_act;h_future]) ; qwen_context]。
+        qwen_context = 原始图文 hidden（屏蔽两组占位）。保留原始 action 条件不删。
+        """
+        g = self.wam_guidance
+        mode = str(g["mode"]).lower()
+        dtype = h_act.dtype
+        blocks, masks = [], []
+        if mode == "sa_fusion" and self.world_fusion is not None:
+            fd = self._jointflow_module_dtype(self.world_fusion, fallback=dtype)
+            fused = self.world_fusion(torch.cat([h_act, h_future], dim=1).to(fd)).to(dtype)
+            blocks.append(fused)
+            masks.append(torch.ones(fused.shape[:2], dtype=torch.bool, device=fused.device))
+        else:
+            blocks.append(h_act)
+            masks.append(torch.ones(h_act.shape[:2], dtype=torch.bool, device=h_act.device))
+            if mode in ("concat", "qformer") and world_tokens is not None:
+                wt = world_tokens.to(dtype)
+                blocks.append(wt)
+                masks.append(torch.ones(wt.shape[:2], dtype=torch.bool, device=wt.device))
+        if bool(g["include_context_in_world_memory"]):
+            non_ph = ~ph_mask.to(torch.bool)
+            keep = (attn.to(torch.bool) & non_ph) if attn is not None else non_ph
+            blocks.append(hidden.to(dtype))
+            masks.append(keep.to(hidden.device))
+        return torch.cat(blocks, dim=1), torch.cat(masks, dim=1)
+
+    #######
+    # 中文注释：World memory（M4 alternate / M5,M6+ dual cross-attn 用）：M_w=[world_tokens ; qwen_context]
+    # （plan §4.5，include_context_in_world_memory 控制是否带 context）。供 action DiT 的 world cross-attn 读。
+    def _build_world_memory(self, world_tokens, hidden, attn, ph_mask):
+        g = self.wam_guidance
+        dtype = world_tokens.dtype
+        blocks = [world_tokens]
+        masks = [torch.ones(world_tokens.shape[:2], dtype=torch.bool, device=world_tokens.device)]
+        if bool(g["include_context_in_world_memory"]):
+            non_ph = ~ph_mask.to(torch.bool)
+            keep = (attn.to(torch.bool) & non_ph) if attn is not None else non_ph
+            blocks.append(hidden.to(dtype))
+            masks.append(keep.to(hidden.device))
+        return torch.cat(blocks, dim=1), torch.cat(masks, dim=1)
+
+    # 中文注释：统一组装 guided action head 的输入——返回 (action_mem, action_mask, world_embs, world_mask, world_global)。
+    #   concat-family(none/concat/sa_fusion/qformer)：world 进 action memory 拼接，world_embs/global=None。
+    #   DIT-family(alternate/dual/adaln/dual_adaln)：action_mem=[h_act;ctx]（baseline），world 经 cross-attn(world_embs)
+    #     和/或 AdaLN(world_global=pooler(world_tokens)) 注入。
+    _CONCAT_MODES = ("none", "concat", "sa_fusion", "qformer")
+    _DIT_XATTN_MODES = ("alternate_xattn", "dual_xattn", "dual_xattn_adaln")
+    _DIT_ADALN_MODES = ("adaln", "dual_xattn_adaln")
+
+    def _assemble_guided_inputs(self, mode, h_act, h_future, hidden, attn, ph_mask, world_tokens):
+        mem, mem_mask = self._build_guided_action_memory(h_act, h_future, hidden, attn, ph_mask, world_tokens)
+        world_embs, world_mask, world_global = None, None, None
+        if mode in self._DIT_XATTN_MODES and world_tokens is not None:
+            world_embs, world_mask = self._build_world_memory(world_tokens, hidden, attn, ph_mask)
+        if mode in self._DIT_ADALN_MODES and world_tokens is not None and self.world_pooler is not None:
+            pd = self._jointflow_module_dtype(self.world_pooler, fallback=world_tokens.dtype)
+            world_global = self.world_pooler(world_tokens.to(pd)).to(h_act.dtype)
+        return mem, mem_mask, world_embs, world_mask, world_global
+    #######
+
+    def _wam_guided_unused_anchor(self, task: str, ref: torch.Tensor) -> torch.Tensor:
+        """guided 单任务/优化步：给本步**结构上不会用到**的子模块加零梯度 anchor（DDP/DeepSpeed 全覆盖）。"""
+        g = self.wam_guidance
+        mode = str(g["mode"]).lower()
+        signal = str(g["signal"]).lower()
+        all_mods = {
+            "action": self.action_model,
+            "visual": self.wam_visual_head,
+            "act_ctx": self.wam_act_ctx,
+            "adapter": getattr(self, "world_adapter", None),
+            "fusion": getattr(self, "world_fusion", None),
+            "qformer": getattr(self, "world_qformer", None),
+            "pooler": getattr(self, "world_pooler", None),
+        }
+        used: set[str] = set()
+        if task in ("policy", "idm"):
+            used.add("action")
+            if signal != "none":
+                if mode == "qformer":
+                    used.add("qformer")
+                elif mode == "sa_fusion":
+                    used.add("fusion")
+                else:
+                    used.add("adapter")
+                if mode in ("adaln", "dual_xattn_adaln"):
+                    used.add("pooler")
+                # world head 仅在 e2e(detach_world=false) 时由 action loss 真正受梯度；detach_world=true 下
+                # predict_latent 在 no_grad 里跑、输出 detach → world head 本步无梯度 → 需 anchor 兜底
+                # （它由 passive/fdm 步监督）。oracle 信号根本不跑 world head。
+                if (
+                    self._wam_signal_is_latent
+                    and not self._wam_signal_is_oracle
+                    and not bool(g["detach_world"])
+                ):
+                    used.add("visual")
+        else:  # passive / fdm
+            used.add("visual")
+            if task == "fdm":
+                used.add("act_ctx")
+        unused = [m for k, m in all_mods.items() if k not in used]
+        return self._zero_grad_anchor_for_modules(unused, ref)
+
+    def _wam_guided_forward(self, examples: List[dict], task: str = "policy", **kwargs) -> dict:
+        task = str(task)
+        mode = str(self.wam_guidance["mode"]).lower()
+        h_act, h_future, hidden, attn, ph_mask = self._wam_guided_backbone(examples, task=task)
+        if task in ("policy", "idm"):
+            actions = self._stack_jointflow_field(examples, "action", required=True)
+            actions = actions[:, -self.action_horizon :, : self.action_dim].float()
+            state = self._stack_jointflow_field(examples, "state", required=False) if self._uses_action_state() else None
+            world_tokens = self._build_world_signal(h_future, examples)
+            mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
+                mode, h_act, h_future, hidden, attn, ph_mask, world_tokens
+            )
+            hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
+            loss = self.action_model(
+                mem.to(hd), actions.to(hd), state, encoder_attention_mask=mem_mask,
+                world_embs=(w_embs.to(hd) if w_embs is not None else None),
+                world_attention_mask=w_mask,
+                world_global=(w_global.to(hd) if w_global is not None else None),
+                guidance_mode=mode,
+            )
+            key = "action_loss" if task == "policy" else "idm_loss"
+            return {key: loss + self._wam_guided_unused_anchor(task, loss)}
+        # passive / fdm：world head 监督（dual-query 的 h_future 为条件，与 policy 一致）。
+        z_gt = self._wam_world_target(examples)
+        cond = h_future
+        if task == "fdm":
+            a = self._stack_jointflow_field(examples, "action", required=True)
+            a = a[:, -self.action_horizon :, : self.action_dim]
+            ad = self._jointflow_module_dtype(self.wam_act_ctx, fallback=h_future.dtype)
+            actx = self.wam_act_ctx(a.to(ad)).to(h_future.dtype)
+            cond = torch.cat([h_future, actx], dim=1)
+        vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=cond.dtype)
+        raw = self.wam_visual_head(cond.to(vh), z_gt)
+        loss = self.wam_dino_loss_weight * raw
+        return {
+            f"{task}_loss": loss + self._wam_guided_unused_anchor(task, loss),
+            f"{task}_loss_raw": raw.detach(),
+        }
+
+    @torch.inference_mode()
+    def _wam_guided_predict_action(self, examples: List[dict], **kwargs) -> dict:
+        if not isinstance(examples, list):
+            examples = [examples]
+        mode = str(self.wam_guidance["mode"]).lower()
+        h_act, h_future, hidden, attn, ph_mask = self._wam_guided_backbone(examples, task="policy")
+        eval_mode = str(self.wam_guidance.get("world_eval_mode", "correct")).lower()
+        world_tokens = self._build_world_signal(h_future, examples, eval_mode=eval_mode)
+        mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
+            mode, h_act, h_future, hidden, attn, ph_mask, world_tokens
+        )
+        hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
+        pred = self.action_model.predict_action(
+            mem.to(hd), state=None, encoder_attention_mask=mem_mask,
+            world_embs=(w_embs.to(hd) if w_embs is not None else None),
+            world_attention_mask=w_mask,
+            world_global=(w_global.to(hd) if w_global is not None else None),
+            guidance_mode=mode,
+        )
+        return {"normalized_actions": pred.float().detach().cpu().numpy()}
+    #######################################################################
 
     def forward(
         self,

@@ -80,6 +80,16 @@ class AgilexData50Config(AgilexDataConfig):
 
 
 # ---------------------------------------------------------------------------
+# DataConfig — Agilex 16 (action_indices=16)
+# 与 AgilexData50Config 仅 action_indices 不同（复用 keys/transforms 含 gripper binary_threshold=0.49）。
+# OFT 走 lerobot_datasets 时 horizon 由 action_indices 决定，chunk=16 用 robotwin16；
+# WAM 走 jointflow 用 config.action_horizon 覆盖，但复用同一 keys/transforms，保证 OFT/WAM 在 chunk=16 对齐。
+# ---------------------------------------------------------------------------
+class AgilexData16Config(AgilexData50Config):
+    action_indices = list(range(16))
+
+
+# ---------------------------------------------------------------------------
 # DataConfig — ARX X5
 # ---------------------------------------------------------------------------
 class ArxX5DataConfig:
@@ -123,6 +133,7 @@ class ArxX5DataConfig:
 ROBOT_TYPE_CONFIG_MAP = {
     "robotwin": AgilexDataConfig(),
     "robotwin50": AgilexData50Config(),
+    "robotwin16": AgilexData16Config(),
     "arx_x5": ArxX5DataConfig(),
 }
 
@@ -296,3 +307,23 @@ DATASET_NAMED_MIXTURES = {
     "robotwin_task2": [("place_a2b_left", 1.0, "robotwin"), ("place_a2b_right", 1.0, "robotwin")],
     "arx_x5": [("arx_x5", 1.0, "arx_x5")],
 }
+
+# ---------------------------------------------------------------------------
+# horizon-16 变体（robot_type=robotwin16）—— 从 robotwin_all_50 惰性派生，避免任务清单重复。
+# 注意：列表里每个条目 = 一个数据集目录(整目录轨迹全部纳入)，不是一条轨迹！
+#   robotwin_all_16   = 50 个任务 × {Clean/, Randomized/} = 100 个数据集条目 → "rand 设定"：
+#                       每任务 = Clean(50条) + Randomized(500条) = 550 条轨迹（50 任务共 27500 条，全用）。
+#   robotwin_clean_16 = 仅 50 个 Clean/ 条目 → "clean 设定"：每任务 Clean(50条)，共 2500 条。
+# 采样比例由 balance_dataset_weights 决定：jointflow/lerobot 两条通路都默认 False → 每个目录按权重 1.0
+#   等概率采样(clean目录:rand目录≈1:1，即每条 clean 轨迹被采到的概率是每条 rand 的 ~10 倍)；若要 50:500=1:10
+#   的自然比例，在 datasets.vla_data 里设 balance_dataset_weights: true(权重×目录轨迹数)。
+# 两者仅数据不同、robot_type/keys/transforms 一致，便于 clean vs rand 单变量对照；OFT/WAM 共用。
+# ---------------------------------------------------------------------------
+DATASET_NAMED_MIXTURES["robotwin_all_16"] = [
+    (path, weight, "robotwin16") for (path, weight, _robot_type) in DATASET_NAMED_MIXTURES["robotwin_all_50"]
+]
+DATASET_NAMED_MIXTURES["robotwin_clean_16"] = [
+    (path, weight, "robotwin16")
+    for (path, weight, _robot_type) in DATASET_NAMED_MIXTURES["robotwin_all_50"]
+    if path.startswith("Clean/")
+]

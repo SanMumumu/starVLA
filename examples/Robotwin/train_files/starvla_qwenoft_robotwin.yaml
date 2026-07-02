@@ -2,9 +2,9 @@
 # 中文注释：RoboTwin baseline = QwenOFT（Qwen3-VL-4B 原生视觉 + DiT 动作头），**纯 VLA**（关掉官方 abs 配置的 llava co-train）。
 # 与官方 starvla_cotrain_robotwin_abs.yaml 同构，只做三处对齐 WAM 对照的改动：
 #   ① 去掉 vlm_data（co-train）→ 纯 VLA，单变量只差「OFT 动作头 vs WAM-metaquery」；
-#   ② data_mix=robotwin_all_50（与 WAM 同任务集 + horizon 32；OFT 的 horizon 由 DataConfig.action_indices 定，
-#      故用新增的 robotwin32 robot_type，见 dataloader/gr00t_lerobot/{data_config,mixtures}.py）；
-#   ③ action_horizon=32（原官方 abs 是 50）。
+#   ② data_mix=robotwin_all_16（与 WAM 同任务集 + horizon 16；OFT 的 horizon 由 DataConfig.action_indices 定，
+#      故用新增的 robotwin16 robot_type，见 dataloader/gr00t_lerobot/{data_config,mixtures}.py）；
+#   ③ action_horizon=16（原官方 abs 是 50）。主要用于验证训练脚本正确性 + 对齐 WAM chunk=16。
 # 其余（lr/optimizer/action head/dino backbone/image size）保持官方 OFT 设定，方便控制变量。
 # ⚠️ 提交前确认 data_root_dir / base_vlm 路径按实际环境改。
 #######
@@ -31,7 +31,7 @@ framework:
     max_seq_len: 1024
     action_dim: 14
     state_dim: 14
-    action_horizon: 32        # 中文注释：与 WAM 实验统一 chunk=32（官方 abs 原为 50）
+    action_horizon: 16        # 中文注释：与 WAM 实验统一 chunk=16（官方 abs 原为 50）
     repeated_diffusion_steps: 8
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
@@ -55,10 +55,17 @@ datasets:
     dataset_py: lerobot_datasets
     include_state: false
     data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin   # ⚠️ 按实际 RoboTwin 根目录改
-    data_mix: robotwin_all_50     # 100 任务 @ horizon32（robot_type=robotwin32）
+    data_mix: robotwin_all_16     # 100 任务 @ horizon16（robot_type=robotwin16；lerobot 通路 horizon=action_indices=16，与 action_horizon 对齐）
     action_type: abs_qpos
     action_mode: abs
     sequential_step_sampling: False
+    #######
+    # 中文注释：RobotWin 局部帧级均匀采样（仅本 config 设，不改全局默认 False）。
+    #   balance_dataset_weights=true  → 目录按总帧数成比例（clean 50 : rand 500 = 1:10 自然比例）。
+    #   balance_trajectory_weights=true → 目录内轨迹按帧数成比例 → 帧级均匀，长时序任务被更多采样。
+    balance_dataset_weights: true
+    balance_trajectory_weights: true
+    #######
     per_device_batch_size: 4      # 中文注释：官方 4B robotwin 设定（baseline 不开大 batch）
     load_all_data_for_training: true
     obs_image_size: [224, 224]
@@ -66,7 +73,7 @@ datasets:
   #######
 
 trainer:
-  max_train_steps: 100000
+  max_train_steps: 50000
   num_warmup_steps: 5000
   save_interval: 5000
   #######

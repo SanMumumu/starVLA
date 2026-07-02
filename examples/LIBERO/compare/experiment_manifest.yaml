@@ -1,0 +1,155 @@
+#######
+# 中文注释：World→Action guidance 对比矩阵——每个实验只存「与 base_compare.yaml 的差异」（plan §8）。
+# generate_configs.py 用 OmegaConf.merge(base, override) 生成 configs/<name>.yaml（完整可复现）。
+#
+# 全部已实现可跑：concat-family（m0/m0q/m1_1/m1_2/m1_3/m2/m3 + warmup）走 action memory 拼接；
+# DiT-family（m4 alternate / m5 dual_xattn / m6 adaln / m6plus）走 action DiT 内建 world 子模块（已建好）。
+#
+# P4 已定：S* = dino_future（= 预测的绝对未来 DINO；signal=z_pred + world_target=absolute）。h_future 弃用。
+# 结构对比 = m3 qformer / m4 alternate / m5 dual_gate / m6 adaln / m6plus，signal 全=z_pred，
+# 全部从 warmup_predicted_absolute 热启（S* 是预测潜变量，避免每个结构重做冷启动 warmup）。
+# sa_fusion(m2) 写死用 h_future（QwenGR00T.py:1352）→ 已剔除，不在结构对比内。
+#######
+
+# ===== P0：基线 + 控制组 =====
+m0_baseline:
+  run_id: cmp_m0_baseline
+  framework:
+    # passive: 0.0 关掉（OmegaConf.merge 是深合并，不能删 key；trainer 过滤 weight<=0）→ 纯 policy 基线。
+    tasks: {weights: {policy: 1.0, passive: 0.0}}
+    wam:
+      guidance: {enabled: false, prompt_mode: action_only, mode: none, signal: none}
+
+m0q_dual_query_control:
+  run_id: cmp_m0q_dual_query_control
+  framework:
+    wam:
+      guidance: {enabled: true, prompt_mode: dual_query, mode: none, signal: none}
+
+# ===== P3：确定最佳 world 信号（concat 注入，单变量只差 signal）=====
+m1_1_hfuture_concat:
+  run_id: cmp_m1_1_hfuture_concat
+  framework:
+    wam:
+      guidance: {enabled: true, prompt_mode: dual_query, mode: concat, signal: h_future}
+
+m1_2_zpred_concat:
+  run_id: cmp_m1_2_zpred_concat
+  framework:
+    wam:
+      world_target: absolute
+      guidance:
+        enabled: true
+        prompt_mode: dual_query
+        mode: concat
+        signal: z_pred
+        bridge_source: predicted
+        detach_world: true
+
+m1_3_dzpred_concat:
+  run_id: cmp_m1_3_dzpred_concat
+  framework:
+    wam:
+      world_target: delta
+      guidance:
+        enabled: true
+        prompt_mode: dual_query
+        mode: concat
+        signal: delta_z_pred
+        bridge_source: predicted
+        detach_world: true
+
+# ===== P5：注入结构（S*=z_pred，全部从 warmup_predicted_absolute 热启）=====
+# 注：m2 sa_fusion 已剔除（h_future 专属，见上方说明）。
+m3_qformer_best:
+  run_id: cmp_m3_qformer_best
+  framework:
+    wam:
+      guidance:
+        enabled: true
+        prompt_mode: dual_query
+        mode: qformer
+        signal: z_pred          # S* = dino_future（绝对未来 DINO）
+        n_world_tokens: 64      # 196→64（3× 压缩，= n_flow_query）；16 太狠、信息损失大
+        qformer_layers: 2
+        detach_world: true
+
+# ===== warm-up（DIAL 风格，plan §6）。Stage2/3 用 run 脚本把上一阶段 ckpt 传入 pretrained_checkpoint =====
+warmup_oracle_absolute:    # Stage1 decoupled：bridge=oracle, detach_world，policy+passive 同训
+  run_id: cmp_warmup_oracle_absolute
+  framework:
+    wam:
+      world_target: absolute
+      guidance:
+        enabled: true
+        prompt_mode: dual_query
+        mode: concat
+        signal: z_pred
+        bridge_source: oracle
+        detach_world: true
+        oracle_ratio: 1.0
+
+warmup_oracle_delta:
+  run_id: cmp_warmup_oracle_delta
+  framework:
+    wam:
+      world_target: delta
+      guidance:
+        enabled: true
+        prompt_mode: dual_query
+        mode: concat
+        signal: delta_z_pred
+        bridge_source: oracle
+        detach_world: true
+        oracle_ratio: 1.0
+
+warmup_predicted_absolute:  # Stage2：bridge=predicted, detach_world（load Stage1 ckpt）
+  run_id: cmp_warmup_predicted_absolute
+  framework:
+    wam:
+      world_target: absolute
+      guidance:
+        enabled: true
+        prompt_mode: dual_query
+        mode: concat
+        signal: z_pred
+        bridge_source: predicted
+        detach_world: true
+
+warmup_predicted_delta:
+  run_id: cmp_warmup_predicted_delta
+  framework:
+    wam:
+      world_target: delta
+      guidance:
+        enabled: true
+        prompt_mode: dual_query
+        mode: concat
+        signal: delta_z_pred
+        bridge_source: predicted
+        detach_world: true
+
+# ===== DiT-family（M4/M5/M6/M6+，已实现）。signal=z_pred（S*=dino_future）；从 warmup_predicted_absolute 热启 =====
+m4_alternate_best:
+  run_id: cmp_m4_alternate_best
+  framework:
+    wam:
+      guidance: {enabled: true, prompt_mode: dual_query, mode: alternate_xattn, signal: z_pred}
+
+m5_dual_gate_best:
+  run_id: cmp_m5_dual_gate_best
+  framework:
+    wam:
+      guidance: {enabled: true, prompt_mode: dual_query, mode: dual_xattn, signal: z_pred, gate_init: 0.0}
+
+m6_adaln_best:
+  run_id: cmp_m6_adaln_best
+  framework:
+    wam:
+      guidance: {enabled: true, prompt_mode: dual_query, mode: adaln, signal: z_pred}
+
+m6plus_dual_adaln_best:
+  run_id: cmp_m6plus_dual_adaln_best
+  framework:
+    wam:
+      guidance: {enabled: true, prompt_mode: dual_query, mode: dual_xattn_adaln, signal: z_pred, gate_init: 0.0}

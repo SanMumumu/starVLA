@@ -592,7 +592,12 @@ def build_task_grad_groups(model):
     shared = collect(["qwen_vl_interface"])
     if shared:
         groups["shared"] = shared
-    policy_head = collect(["action_model", "action_queries"])
+    # 中文注释：World→Action guidance 的 world 注入子模块(adapter/fusion/qformer/pooler)只在 policy/idm 步
+    # 受梯度(passive/fdm 步被 anchor 置零),归入 policy_head；不存在时 _module_trainable_params 返回[]，
+    # 故对非 guidance 运行无影响。world_attn/world_to_temb 在 action_model.* 内，已被 "action_model" 覆盖。
+    policy_head = collect(
+        ["action_model", "action_queries", "world_adapter", "world_fusion", "world_qformer", "world_pooler"]
+    )
     if policy_head:
         groups["policy_head"] = policy_head
     world_model_head = collect(["wam_visual_head", "wam_act_ctx", "future_dino_queries"])

@@ -203,6 +203,19 @@ DiTConfig = {
 }
 
 
+#######
+# 中文注释：World→Action guidance 的 guidance_mode → DiT world_mode 映射（cross 路由方式）。
+#   alternate_xattn→"alternate"(M4)；dual_xattn / dual_xattn_adaln→"dual"(M5/M6+)；
+#   adaln→"none"（只走 world_to_temb AdaLN，不改 cross 路由）；其它/缺省→"none"。
+def _guidance_to_world_mode(guidance_mode) -> str:
+    return {
+        "alternate_xattn": "alternate",
+        "dual_xattn": "dual",
+        "dual_xattn_adaln": "dual",
+    }.get(str(guidance_mode), "none")
+#######
+
+
 class FlowmatchingActionHead(nn.Module):
     def __init__(
         self,
@@ -359,6 +372,15 @@ class FlowmatchingActionHead(nn.Module):
         actions: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
+        #######
+        # 中文注释：World→Action guidance（M4/M5/M6+）的可选 world 条件。全 None/"none" 时与原 forward 完全一致。
+        #   world_embs：world memory [B,N_w,cross_dim]（M4 alternate / M5,M6+ dual cross-attn）。
+        #   world_global：pooled world 向量 [B,D]（M6/M6+ AdaLN）。guidance_mode 决定 DiT 路由。
+        world_embs: torch.Tensor = None,
+        world_attention_mask=None,
+        world_global: torch.Tensor = None,
+        guidance_mode: str = "none",
+        #######
     ):
         """
         vl_embs: shape (B, seq_length, feature_dim)
@@ -377,6 +399,13 @@ class FlowmatchingActionHead(nn.Module):
                 state = state.repeat(n_fm, *([1] * (state.ndim - 1)))
             if encoder_attention_mask is not None and torch.is_tensor(encoder_attention_mask):
                 encoder_attention_mask = encoder_attention_mask.repeat(n_fm, *([1] * (encoder_attention_mask.ndim - 1)))
+            # world 条件同样复制 N 份，保持与 (vl_embs, actions) 对齐。
+            if world_embs is not None:
+                world_embs = world_embs.repeat(n_fm, 1, 1)
+            if world_attention_mask is not None and torch.is_tensor(world_attention_mask):
+                world_attention_mask = world_attention_mask.repeat(n_fm, *([1] * (world_attention_mask.ndim - 1)))
+            if world_global is not None:
+                world_global = world_global.repeat(n_fm, *([1] * (world_global.ndim - 1)))
         #######
 
         # Embed noised action trajectory.
@@ -415,6 +444,10 @@ class FlowmatchingActionHead(nn.Module):
             encoder_attention_mask=encoder_attention_mask,
             timestep=t_discretized,
             return_all_hidden_states=False,  # NOTE (YL): not using flare now
+            world_hidden_states=world_embs,
+            world_attention_mask=world_attention_mask,
+            world_global=world_global,
+            world_mode=_guidance_to_world_mode(guidance_mode),
         )
         pred = self.action_decoder(model_output)
         pred_actions = pred[:, -actions.shape[1] :]
@@ -429,10 +462,18 @@ class FlowmatchingActionHead(nn.Module):
         vl_embs: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
+        #######
+        # 中文注释：World→Action guidance 推理条件（与 forward 对称）。全 None/"none" 时与原 predict_action 一致。
+        world_embs: torch.Tensor = None,
+        world_attention_mask=None,
+        world_global: torch.Tensor = None,
+        guidance_mode: str = "none",
+        #######
     ) -> torch.Tensor:
         # Set initial actions as the sampled noise.
         batch_size = vl_embs.shape[0]
         device = vl_embs.device
+        world_mode = _guidance_to_world_mode(guidance_mode)
         #######
         # 中文注释：E1.3——推理初始噪声必须与训练同分布（correlated noise 开时用 z@L^T，否则 randn）。
         actions = self._sample_initial_noise(batch_size, device, vl_embs.dtype)
@@ -471,6 +512,10 @@ class FlowmatchingActionHead(nn.Module):
                 encoder_hidden_states=vl_embs,
                 encoder_attention_mask=encoder_attention_mask,
                 timestep=timesteps_tensor,
+                world_hidden_states=world_embs,
+                world_attention_mask=world_attention_mask,
+                world_global=world_global,
+                world_mode=world_mode,
             )
             pred = self.action_decoder(model_output)
 

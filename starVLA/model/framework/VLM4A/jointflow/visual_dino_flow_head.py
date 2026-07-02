@@ -119,6 +119,42 @@ class VisualFlowMatchingHead(nn.Module):
             return loss
     ######### // code // ##########
 
+    #######
+    # 中文注释：predict_latent —— predict() 的「可反传」版本，供 World→Action guidance 在训练时把
+    # 世界模型预测的未来 DINO 潜变量当作 action 的条件信号（M1.2 z_pred / M1.3 Δz_pred）。
+    # 与 predict() 的区别：① 不加 @torch.inference_mode（detach 与否交给调用方按 guidance.detach_world 决定，
+    # Stage3 e2e 需要 action loss 回传到 world head）；② 支持 encoder_attention_mask（双 query prompt 下
+    # h_future 条件可能带 padding）；③ 接受外部 generator 以便复现/消融。其余 Euler 采样逻辑与 predict() 完全一致。
+    def predict_latent(
+        self,
+        cond: torch.Tensor,
+        n: int,
+        encoder_attention_mask: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        batch_size = cond.shape[0]
+        compute_dtype = self._module_dtype(self, fallback=cond.dtype)
+        cond = cond.to(dtype=compute_dtype)
+        z = torch.randn(
+            batch_size, n, self.d_dino, device=cond.device, dtype=compute_dtype, generator=generator
+        )
+        dt = 1.0 / float(self.num_inference_timesteps)
+        for step in range(self.num_inference_timesteps):
+            t_cont = step / float(self.num_inference_timesteps)
+            t_discretized = int(t_cont * self.num_timestep_buckets)
+            timestep = torch.full((batch_size,), t_discretized, device=cond.device, dtype=torch.long)
+            hidden = self._embed_noisy(z)
+            out = self.model(
+                hidden_states=hidden,
+                encoder_hidden_states=cond,
+                timestep=timestep,
+                encoder_attention_mask=encoder_attention_mask,
+            )
+            pred_velocity = self.x_decode(out)
+            z = z + dt * pred_velocity
+        return z
+    #######
+
     @torch.inference_mode()
     def predict(self, cond: torch.Tensor, n: int) -> torch.Tensor:
         batch_size = cond.shape[0]

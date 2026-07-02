@@ -1,0 +1,167 @@
+#######
+# 中文注释：World→Action guidance 对比矩阵的「基座」配置（plan §8）。
+# 完整复制现有 2B WAM recipe（≈exp6：Qwen3-VL-2B + tricks + 大 batch），是 M0–M6+ 所有实验的公共底座。
+# 每个实验只在 experiment_manifest.yaml 里写「与本文件的差异」，由 generate_configs.py 用
+# OmegaConf.merge(base, override) 生成完整、独立、可复现的 yaml（避免人工复制导致配置漂移）。
+# 固定不变（公平比较，plan §9）：数据 / seed / batch / 训练步数 / 学习率 / action DiT / world DiT /
+#   query 数 / 评测次数。每个实验只改 World signal 或注入结构（framework.wam.guidance.*）。
+#######
+run_id: cmp_base                       # 由各实验覆盖
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_compare
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: starvla_wam_compare
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T
+  qwenvl:
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B-Instruct/
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: true
+    vl_hidden_dim: 2048
+    max_text_length: 256
+  wam:
+    enabled: true
+    placeholder_token: "<ACT_PH>"
+    dino_loss_weight: 0.1
+    # world_target：absolute=world head 学绝对未来 DINO；delta=学标准化(DINO(img1)-DINO(img0))。
+    # M1.3/delta 系实验覆盖为 delta；其余 absolute。
+    world_target: absolute
+    #######
+    # 中文注释：World→Action guidance 总配置（plan §3）。默认全关 → 等价原生 WAM。各实验在 manifest 覆盖。
+    #   mode：none|concat|sa_fusion|qformer（concat-family，已实现）| alternate_xattn|dual_xattn|adaln|dual_xattn_adaln（需 DiT 改造，P6-P8）。
+    #   signal：none|h_future|z_pred|delta_z_pred|z_oracle|delta_z_oracle。
+    #   prompt_mode：action_only（原 WAM）| dual_query（act+future 占位同一 forward；guidance 用此）。
+    #   bridge_source：predicted（world head 预测）| oracle（GT DINO，warm-up Stage1）| scheduled（按 oracle_ratio 混）。
+    #   detach_world：true=action loss 不回传 world head（Stage1/2）；false=e2e（Stage3）。
+    guidance:
+      enabled: false
+      mode: none
+      signal: none
+      prompt_mode: action_only
+      bridge_source: predicted
+      detach_world: true
+      oracle_ratio: 1.0
+      n_world_tokens: 16
+      qformer_layers: 2
+      fusion_layers: 2
+      gate_init: 0.0
+      world_dropout: 0.0
+      include_context_in_world_memory: true
+      world_eval_mode: correct      # 评测因果消融：correct|off|zero|shuffled|wrong_task|gt（plan §11）
+    #######
+  # 默认 policy + passive（guided 需要 passive 监督 world head）。M0 基线覆盖为仅 policy。
+  tasks:
+    weights:
+      policy: 1.0
+      passive: 1.0
+  dino:
+    name: dinov3_vits16
+    hf_model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+    repo_or_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/dinov3_repo
+    weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/dinov3-vits16-pretrain-lvd1689m/
+    loader: auto
+    image_size: 224
+    patch_size: 16
+    embed_dim: 384
+    future_view_keys: ["video.primary_image", "observation.images.image", "primary_image", "agentview"]
+    stats_path: null
+    load_live_backbone: false
+    dino_pool: 1
+  action_model:
+    action_model_type: DiT-B
+    action_dim: 7
+    state_dim: 7
+    action_horizon: 8
+    n_action_query: 32
+    # tricks（与 exp5/6 一致，整个矩阵共享 → 公平）：correlated noise(β=0.5) + multi-step FM(20)。
+    use_correlated_noise: true
+    correlation_beta: 0.5
+    flow_matching_steps: 20
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_inference_timesteps: 10
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    repeated_diffusion_steps: 1
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      num_attention_heads: 12
+      attention_head_dim: 64
+      output_dim: 1024
+      positional_embeddings: null
+  visual_model:
+    d_dino: 384
+    n_query: 196
+    n_flow_query: 64        # future-query 占位数 = h_future token 数 = world 信号容量
+    max_image_queries: 256
+    hidden_size: 1024
+    cross_attention_dim: 2048
+    num_attention_heads: 16
+    attention_head_dim: 64
+    num_layers: 12
+    dropout: 0.1
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_inference_timesteps: 6
+    patch_weighting: change
+
+datasets:
+  vla_data:
+    dataset_py: jointflow
+    data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero
+    data_mix: libero_all
+    action_type: delta_qpos
+    sequential_step_sampling: false
+    include_state: false
+    CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+    online_dino: true
+    dino_target_latents: true
+    world_model:
+      future_stride: 8
+
+trainer:
+  max_train_steps: 60000
+  num_warmup_steps: 3000
+  save_interval: 5000
+  eval_interval: 1000000
+  # warm-up 链接：Stage2/3 把上一阶段输出目录填到 pretrained_checkpoint（strict=False，新增 guidance 子模块自动 fresh init）。
+  pretrained_checkpoint: null
+  is_resume: false
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 5.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  loss_scale:
+    vla: 1.0
+  freeze_modules: ''
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 100
+  log_grad_norms: true
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    # 稳定性配方 [[wam-action-loss-divergence-fix]]：bf16 近收敛 Adam 爆炸（loss 飞到高台回不来）。
+    # eps 1e-8→1e-6（治 grad/(√v+1e-8) 爆炸）+ weight_decay 1e-8→0.01（抑后期漂移、拉回盆地）。
+    # m0q / warmup_oracle_delta 曾用旧值随机崩；action lr 已是 5e-5。
+    eps: 1.0e-06
+    weight_decay: 0.01
