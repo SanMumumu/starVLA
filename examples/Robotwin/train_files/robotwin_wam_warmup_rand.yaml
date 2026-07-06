@@ -128,26 +128,32 @@ datasets:
     per_device_batch_size: 4
     load_all_data_for_training: false
     video_backend: torchvision_av
-    num_workers: 1
-    prefetch_factor: 1
+    # 提速：jointflow 每样本=3视角×2帧视频解码+episode latent 读取，num_workers=1 藏不住 → 40-60s/it。
+    # ⚠️ 8 worker 首跑 step78 节点 OOM→ncclRemoteError（episode latent 缓存 per-dataset×worker 膨胀）。
+    # 已在 joint_dataset.py 修（逐样本清缓存 + 下面 dino_target_latent_views 只读 view0），并回到验证过的
+    # 4 worker/rank=32/节点。若仍慢再试 6/8；若再见 worker killed/OOM 先查节点内存。
+    num_workers: 4
+    prefetch_factor: 2
     pin_memory: false
-    persistent_workers: false
+    persistent_workers: true
     online_dino: true
     dino_target_latents: true
+    # 只读 cam_high 的 latent（模型 target 只取 z[:,0]，其余视角白读）：bucket I/O 与 worker 内存 3× 减。
+    dino_target_latent_views: [0]
     world_model:
       future_stride: 16
 
 trainer:
-  max_train_steps: 50000
-  num_warmup_steps: 3000
-  save_interval: 5000
-  eval_interval: 1000000
+  max_train_steps: 150000
+  num_warmup_steps: 5000
+  save_interval: 10000
+  eval_interval: 1000
   pretrained_checkpoint: null
   is_resume: false
   learning_rate:
     base: 1.0e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 5.0e-05
+    action_model: 1.0e-04
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 5.0e-07
@@ -156,7 +162,7 @@ trainer:
   freeze_modules: ''
   max_grad_norm: 1.0
   weight_decay: 0.0
-  logging_frequency: 100
+  logging_frequency: 50
   log_grad_norms: true
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
@@ -164,5 +170,5 @@ trainer:
   optimizer:
     name: AdamW
     betas: [0.9, 0.95]
-    eps: 1.0e-06
-    weight_decay: 0.01
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

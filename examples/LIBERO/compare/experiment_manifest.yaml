@@ -142,6 +142,17 @@ m5_dual_gate_best:
     wam:
       guidance: {enabled: true, prompt_mode: dual_query, mode: dual_xattn, signal: z_pred, gate_init: 0.0}
 
+m5_sample_dual_gate_best:
+  run_id: cmp_m5_sample_dual_gate_best
+  framework:
+    wam:
+      guidance: {enabled: true, prompt_mode: dual_query, mode: dual_xattn, signal: z_pred, gate_init: 0.0}
+  datasets:
+    vla_data:
+      # dataset=按目录总帧数成比例；trajectory=目录内按轨迹长度成比例 → 近似帧级均匀采样。
+      balance_dataset_weights: true
+      balance_trajectory_weights: true
+
 m6_adaln_best:
   run_id: cmp_m6_adaln_best
   framework:
@@ -153,3 +164,14 @@ m6plus_dual_adaln_best:
   framework:
     wam:
       guidance: {enabled: true, prompt_mode: dual_query, mode: dual_xattn_adaln, signal: z_pred, gate_init: 0.0}
+
+m6plus_sample_dual_adaln_best:
+  run_id: cmp_m6plus_sample_dual_adaln_best
+  framework:
+    wam:
+      guidance: {enabled: true, prompt_mode: dual_query, mode: dual_xattn_adaln, signal: z_pred, gate_init: 0.0}
+  datasets:
+    vla_data:
+      # dataset=按目录总帧数成比例；trajectory=目录内按轨迹长度成比例 → 近似帧级均匀采样。
+      balance_dataset_weights: true
+      balance_trajectory_weights: true

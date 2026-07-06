@@ -46,6 +46,8 @@ bash examples/LIBERO/compare/run_compare.sh <exp_name> [init_checkpoint]
 | m5_dual_gate_best | dual_xattn | z_pred | 🔲 待跑（gated world cross-attn，gate init 0）|
 | m6_adaln_best | adaln | z_pred | 🔲 待跑（pooled world→AdaLN，zero-init）|
 | m6plus_dual_adaln_best | dual_xattn_adaln | z_pred | 🔲 待跑（dual cross-attn + AdaLN）|
+| m5_sample_dual_gate_best | dual_xattn | z_pred | 🔲 采样消融：M5 + 帧级均匀采样 |
+| m6plus_sample_dual_adaln_best | dual_xattn_adaln | z_pred | 🔲 采样消融：M6+ + 帧级均匀采样 |
 
 **P4 已定：S\* = dino_future**（预测的绝对未来 DINO；`signal=z_pred` + `world_target=absolute`）。h_future 弃用，
 `m2_sa_hfuture`（sa_fusion 写死用 h_future）已剔除。**结构对比的 5 个结构 + concat 基线全部从 `warmup_oracle_absolute`（Stage1）热启、训同样步数**（concat-from-oracle = `warmup_predicted_absolute`；若结构改 50k 则 concat 也按 50k 重跑，保证同步数公平）。
@@ -109,6 +111,8 @@ bash $CMP m4_alternate_best         "$ORC_ABS"   # M4 cross block 交替 action/
 bash $CMP m5_dual_gate_best         "$ORC_ABS"   # M5 gated world cross-attn（gate init 0）
 bash $CMP m6_adaln_best             "$ORC_ABS"   # M6 pooled world → AdaLN（zero-init）
 bash $CMP m6plus_dual_adaln_best    "$ORC_ABS"   # M6+ dual cross-attn + AdaLN
+bash $CMP m5_sample_dual_gate_best       "$ORC_ABS"   # M5 + 帧级均匀采样（看 long/长轨迹任务是否提升）
+bash $CMP m6plus_sample_dual_adaln_best  "$ORC_ABS"   # M6+ + 帧级均匀采样（看 long/长轨迹任务是否提升）
 
 # ── P9 因果消融 + 效率（对结构 best 模型）────────────────
 # eval 时设 guidance.world_eval_mode: correct|off|zero|shuffled 比 SR（只有 shuffled 明显掉才算真用了 world）

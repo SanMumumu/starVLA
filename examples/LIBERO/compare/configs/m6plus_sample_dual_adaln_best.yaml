@@ -1,0 +1,149 @@
+run_id: cmp_m6plus_sample_dual_adaln_best
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_compare
+seed: 42
+wandb_entity: your_wandb_entity
+wandb_project: starvla_wam_compare
+is_debug: false
+version_id: '0.21'
+framework:
+  name: QwenGR00T
+  qwenvl:
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B-Instruct/
+    attn_implementation: sdpa
+    enable_gradient_checkpointing: true
+    vl_hidden_dim: 2048
+    max_text_length: 256
+  wam:
+    enabled: true
+    placeholder_token: <ACT_PH>
+    dino_loss_weight: 0.1
+    world_target: absolute
+    guidance:
+      enabled: true
+      mode: dual_xattn_adaln
+      signal: z_pred
+      prompt_mode: dual_query
+      bridge_source: predicted
+      detach_world: true
+      oracle_ratio: 1.0
+      n_world_tokens: 16
+      qformer_layers: 2
+      fusion_layers: 2
+      gate_init: 0.0
+      world_dropout: 0.0
+      include_context_in_world_memory: true
+      world_eval_mode: correct
+  tasks:
+    weights:
+      policy: 1.0
+      passive: 1.0
+  dino:
+    name: dinov3_vits16
+    hf_model_id: facebook/dinov3-vits16-pretrain-lvd1689m
+    repo_or_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/dinov3_repo
+    weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/dinov3-vits16-pretrain-lvd1689m/
+    loader: auto
+    image_size: 224
+    patch_size: 16
+    embed_dim: 384
+    future_view_keys:
+    - video.primary_image
+    - observation.images.image
+    - primary_image
+    - agentview
+    stats_path: null
+    load_live_backbone: false
+    dino_pool: 1
+  action_model:
+    action_model_type: DiT-B
+    action_dim: 7
+    state_dim: 7
+    action_horizon: 8
+    n_action_query: 32
+    use_correlated_noise: true
+    correlation_beta: 0.5
+    flow_matching_steps: 20
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_inference_timesteps: 10
+    num_timestep_buckets: 1000
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    repeated_diffusion_steps: 1
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      num_attention_heads: 12
+      attention_head_dim: 64
+      output_dim: 1024
+      positional_embeddings: null
+  visual_model:
+    d_dino: 384
+    n_query: 196
+    n_flow_query: 64
+    max_image_queries: 256
+    hidden_size: 1024
+    cross_attention_dim: 2048
+    num_attention_heads: 16
+    attention_head_dim: 64
+    num_layers: 12
+    dropout: 0.1
+    add_pos_embed: true
+    max_seq_len: 1024
+    num_inference_timesteps: 6
+    patch_weighting: change
+datasets:
+  vla_data:
+    dataset_py: jointflow
+    data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero
+    data_mix: libero_all
+    action_type: delta_qpos
+    sequential_step_sampling: false
+    include_state: false
+    CoT_prompt: Your task is {instruction}. To identify the key objects for your task.
+      Locate their bounding boxes in [x1,y1,x2,y2] format.
+    per_device_batch_size: 16
+    load_all_data_for_training: true
+    video_backend: torchvision_av
+    online_dino: true
+    dino_target_latents: true
+    world_model:
+      future_stride: 8
+    balance_dataset_weights: true
+    balance_trajectory_weights: true
+trainer:
+  max_train_steps: 60000
+  num_warmup_steps: 3000
+  save_interval: 5000
+  eval_interval: 1000000
+  pretrained_checkpoint: null
+  is_resume: false
+  learning_rate:
+    base: 2.5e-05
+    qwen_vl_interface: 1.0e-05
+    action_model: 5.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 1.0e-06
+  loss_scale:
+    vla: 1.0
+  freeze_modules: ''
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 100
+  log_grad_norms: true
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 8
+  gradient_checkpointing: true
+  optimizer:
+    name: AdamW
+    betas:
+    - 0.9
+    - 0.95
+    eps: 1.0e-06
+    weight_decay: 0.01

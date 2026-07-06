@@ -20,6 +20,7 @@ Submit:
 ```bash
 cd examples/LIBERO/eval_horizon
 aidi-inf-cli job submit -f job_server.yaml -q project-h20-robot-lab-acloud-langfang
+cd -
 ```
 
 If the job cannot find `run_aidi_server.sh`, check `RUN_SCRIPTS` in `job_server.yaml`:
@@ -59,7 +60,10 @@ Submit:
 ```bash
 cd examples/LIBERO/eval_horizon
 aidi-inf-cli job submit -f job_client.yaml -q project-h20-robot-lab-acloud-langfang
+cd -
 ```
+
+`job_client_libero.yaml` is the same client job config.
 
 ## Outputs
 

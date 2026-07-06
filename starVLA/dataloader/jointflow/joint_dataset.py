@@ -112,7 +112,9 @@ class JointLiberoDataset(LeRobotSingleDataset):
         *args,
         online_dino: bool = True,
         dino_feature_dir: str = "latents",
-        dino_episode_cache_size: int = 2,
+        # 中文注释：≥视角数才能让同一样本 dino_0→dino_1 全部命中（3 视角时 2 会把 view0 挤掉→重读）。
+        # 缓存现已在 _pack_sample 末尾逐样本清空（防 per-dataset×worker 常驻膨胀→节点 OOM），此值只是样本内瞬态上限。
+        dino_episode_cache_size: int = 4,
         dino_target_latents: bool = False,
         **kwargs,
     ):
@@ -254,14 +256,26 @@ class JointLiberoDataset(LeRobotSingleDataset):
         frame_index = int(np.clip(frame_index, 0, length - 1))
         return int(starts[traj_pos]) + frame_index
 
+    def _dino_target_view_indices(self) -> "list[int] | None":
+        """中文注释：latent target 只读部分视角（config: datasets.vla_data.dino_target_latent_views，如 [0]=cam_high）。
+        None=全读（兼容旧行为）。WAM 世界模型 target 只用 view 0（QwenGR00T._wam_dino_target 取 z[:,0]），
+        读全部视角纯属浪费 bucket I/O 与 worker 内存（每视角=整个 episode 的 fp32 latent）。"""
+        views = _cfg_get(self.data_cfg, "dino_target_latent_views", None)
+        if views is None:
+            return None
+        return [int(v) for v in views]
+
     def _read_dino(self, trajectory_id: int, frame_index: int) -> np.ndarray:
         self._load_dino_store()
         if self._dino_layout == "lingbot_episode":
             traj_pos = int(self.get_trajectory_index(trajectory_id))
             length = int(self.trajectory_lengths[traj_pos])
             frame_index = int(np.clip(frame_index, 0, length - 1))
+            view_ids = self._dino_target_view_indices()
+            if view_ids is None:
+                view_ids = list(range(len(self._original_view_keys())))
             per_view = []
-            for view_idx in range(len(self._original_view_keys())):
+            for view_idx in view_ids:
                 latent = self._load_episode_view_latent(int(trajectory_id), view_idx)
                 safe_idx = int(np.clip(frame_index, 0, latent.shape[0] - 1))
                 per_view.append(latent[safe_idx].numpy())
@@ -390,6 +404,14 @@ class JointLiberoDataset(LeRobotSingleDataset):
                     state.append(_to_numpy(data[state_key]))
             if state:
                 sample["state"] = np.concatenate(state, axis=1).astype(np.float32)
+        #######
+        # 中文注释：episode latent 缓存只为**同一样本内** dino_0→dino_1 复用（同 episode 同 view 文件不二读）。
+        # 随机采样下跨样本命中≈0，但缓存是 per-dataset 的：mixture 有 50-100 个数据集对象 × 每个 2-4 条
+        # × 整集 fp32 latent（~百 MB/条）× 每节点几十个 persistent worker → 常驻内存线性膨胀直至节点 OOM
+        # （表现为某 rank 被 SIGKILL、其余 rank 报 ncclRemoteError）。∴ 样本打包完立即清空。
+        if self._episode_latent_cache:
+            self._episode_latent_cache.clear()
+        #######
         return sample
 ######### // code // ##########
 
