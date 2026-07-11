@@ -389,6 +389,20 @@ bash examples/Robotwin/eval_files/start_eval.sh \
 
 This schedules all 50 tasks across 8 GPUs, running up to 8 tasks in parallel. When a task finishes on a GPU, the next pending task is dispatched to that slot.
 
+### Execution-horizon replanning
+
+The policy always predicts the action horizon stored in the checkpoint. To execute only the first `N` actions and then infer a fresh chunk, use the result-only replan launcher:
+
+```bash
+REPLAN_STEPS=24 \
+CKPT=/path/to/checkpoint.pt \
+HOST=policy-server-host \
+ROBOTWIN_PATH=/path/to/RoboTwin \
+bash examples/Robotwin/eval_files/eval_robotwin_8clients_replan.sh
+```
+
+The default is `24`, matching FastWAM's RoboTwin execution horizon. For a 50-action StarVLA checkpoint, `REPLAN_STEPS=50` executes the full predicted chunk and preserves the previous behavior. Values larger than the checkpoint action horizon are rejected.
+
 ### Runtime output
 
 During evaluation, per-episode success rates are streamed to stdout in real time:
@@ -434,6 +448,7 @@ These environment variables are read when the corresponding flag is not set:
 | `ROBOTWIN_SERVER_TIMEOUT` | `600` | Server startup timeout in seconds (overridden by `--server-timeout`) |
 | `ROBOTWIN_AUTO_INSTALL_DEPS` | `0` | Set to `1` to bootstrap pip deps (overridden by `--install-deps`) |
 | `ROBOTWIN_LOG_ROOT` | auto | Override the log output directory |
+| `REPLAN_STEPS` | model chunk (`24` in replan launcher) | Number of cached actions to execute before a fresh inference |
 
 The launcher does **not** use `conda activate`. Instead, it locates the Python binary directly from the conda env directory. It searches `CONDA_EXE`, `CONDA_PREFIX`, `~/miniconda3/envs/`, `~/anaconda3/envs/`, etc. If auto-detection fails, set `STARVLA_PYTHON` and `ROBOTWIN_PYTHON` explicitly.
 
@@ -443,11 +458,12 @@ The launcher does **not** use `conda activate`. Instead, it locates the Python b
 
 | Field | Description |
 |-------|-------------|
-| `normalization_mode` | Normalization mode: `min_max` or `q99` |
+| `normalization_mode` | Informational compatibility field; the server uses the checkpoint's training transform |
 | `unnorm_key` | Unnormalization key for the embodiment |
 | `action_mode` | Action mode (e.g. `abs`) |
+| `replan_steps` | Actions executed per inference; `null` uses the model's full action chunk |
 
-`host` and `port` are overridden at runtime by the launcher. If your checkpoint was trained with percentile normalization, set `normalization_mode: "q99"`.
+`host`, `port`, and `replan_steps` are overridden at runtime by the launcher. Action unnormalization is selected from the `data_mix` saved with the checkpoint, including `mean_std` for the z-score experiment.
 
 ### Low-level manual mode
 

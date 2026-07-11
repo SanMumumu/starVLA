@@ -7,9 +7,9 @@ is_debug: false
 version_id: "0.21"
 
 framework:
-  name: QwenOFT
+  name: QwenPI_v3
   qwenvl:
-    base_vlm: ./playground/Pretrained_models/Qwen3-VL-4B-Instruct
+    base_vlm: /horizon-bucket/robot_lab/users/zihan.liu-labs/LDA/weights/Qwen3-VL-4B-Instruct
     attn_implementation: flash_attention_2
     vl_hidden_dim: 2048
   dino:
@@ -57,7 +57,7 @@ datasets:
   vla_data:
     dataset_py: lerobot_datasets
     include_state: false
-    data_root_dir: playground/Datasets/RoboTwin
+    data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/RoboTwin
     data_mix: robotwin_all_50
     action_type: abs_qpos
     action_mode: abs

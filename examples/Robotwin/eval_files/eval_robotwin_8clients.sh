@@ -16,6 +16,9 @@ SERVER_MAX_WAIT="${SERVER_MAX_WAIT:-1800}"
 SERVER_CONNECT_INTERVAL="${SERVER_CONNECT_INTERVAL:-2}"
 ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-}"
 ROBOTWIN_PATH="${ROBOTWIN_PATH:-}"
+# RoboTwin eval_policy.py defaults ROBOTWIN_DISABLE_EVAL_VIDEO=1 (no MP4).
+# This script wires eval_result -> OUTPUT_ROOT; enable videos unless caller opts out.
+export ROBOTWIN_DISABLE_EVAL_VIDEO="${ROBOTWIN_DISABLE_EVAL_VIDEO:-0}"
 
 ALL_TASKS=(
     adjust_bottle
@@ -237,6 +240,7 @@ echo "[INFO] client GPUs:   ${GPU_IDS[*]}"
 echo "[INFO] modes:         ${MODE_LIST[*]}"
 echo "[INFO] tasks:         ${#SELECTED_TASKS[@]}"
 echo "[INFO] output:        ${OUTPUT_ROOT}"
+echo "[INFO] videos:        $([[ "${ROBOTWIN_DISABLE_EVAL_VIDEO}" == "0" ]] && echo enabled || echo disabled)"
 echo "[INFO] python:        ${ROBOTWIN_PYTHON}"
 
 deadline=$((SECONDS + SERVER_MAX_WAIT))

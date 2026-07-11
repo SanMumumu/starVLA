@@ -10,4 +10,5 @@ host: "127.0.0.1"
 port: 5694
 unnorm_key: "new_embodiment"
 action_mode: "abs"
-normalization_mode: "min_max"  # options: min_max, q99
+normalization_mode: "min_max"  # informational; server uses the checkpoint's training transform
+replan_steps: null  # null/full action chunk preserves old behavior; use 24 for FastWAM-like replanning

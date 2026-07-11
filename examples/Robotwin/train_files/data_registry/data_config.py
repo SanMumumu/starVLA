@@ -80,6 +80,31 @@ class AgilexData50Config(AgilexDataConfig):
 
 
 # ---------------------------------------------------------------------------
+# DataConfig — Agilex 50 with FastWAM-style z-score normalization on all 14 dims
+# ---------------------------------------------------------------------------
+class AgilexData50ZScoreConfig(AgilexData50Config):
+    def transform(self):
+        return ComposedModalityTransform(transforms=[
+            StateActionToTensor(apply_to=self.state_keys),
+            StateActionTransform(
+                apply_to=self.state_keys,
+                normalization_modes={
+                    "state.left_joints": "mean_std", "state.right_joints": "mean_std",
+                    "state.left_gripper": "mean_std", "state.right_gripper": "mean_std",
+                },
+            ),
+            StateActionToTensor(apply_to=self.action_keys),
+            StateActionTransform(
+                apply_to=self.action_keys,
+                normalization_modes={
+                    "action.left_joints": "mean_std", "action.right_joints": "mean_std",
+                    "action.left_gripper": "mean_std", "action.right_gripper": "mean_std",
+                },
+            ),
+        ])
+
+
+# ---------------------------------------------------------------------------
 # DataConfig — Agilex 16 (action_indices=16)
 # 与 AgilexData50Config 仅 action_indices 不同（复用 keys/transforms 含 gripper binary_threshold=0.49）。
 # OFT 走 lerobot_datasets 时 horizon 由 action_indices 决定，chunk=16 用 robotwin16；
@@ -133,6 +158,7 @@ class ArxX5DataConfig:
 ROBOT_TYPE_CONFIG_MAP = {
     "robotwin": AgilexDataConfig(),
     "robotwin50": AgilexData50Config(),
+    "robotwin50_z": AgilexData50ZScoreConfig(),
     "robotwin16": AgilexData16Config(),
     "arx_x5": ArxX5DataConfig(),
 }
@@ -307,6 +333,12 @@ DATASET_NAMED_MIXTURES = {
     "robotwin_task2": [("place_a2b_left", 1.0, "robotwin"), ("place_a2b_right", 1.0, "robotwin")],
     "arx_x5": [("arx_x5", 1.0, "arx_x5")],
 }
+
+# FastWAM-style normalization ablation. Dataset paths and sampling weights are
+# identical to robotwin_all_50; only the state/action normalization changes.
+DATASET_NAMED_MIXTURES["robotwin_all_50_z"] = [
+    (path, weight, "robotwin50_z") for (path, weight, _robot_type) in DATASET_NAMED_MIXTURES["robotwin_all_50"]
+]
 
 # ---------------------------------------------------------------------------
 # horizon-16 变体（robot_type=robotwin16）—— 从 robotwin_all_50 惰性派生，避免任务清单重复。

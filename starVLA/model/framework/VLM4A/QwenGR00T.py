@@ -99,7 +99,7 @@ class QwenGR00TDefaultConfig:
     # === Action head (Flow-matching / DiT diffusion) ===
     action_model: dict = field(
         default_factory=lambda: {
-            # DiT model size: "DiT-B" | "DiT-L" | "DiT-XL"
+            # DiT model size: "DiT-B" | "DiT-LAWAM" | "DiT-L"
             "action_model_type": "DiT-B",
             # Hidden dim for action model (auto-aligned at runtime)
             "action_hidden_dim": 1024,
@@ -124,6 +124,13 @@ class QwenGR00TDefaultConfig:
             "num_timestep_buckets": 1000,
             # Inference denoising steps
             "num_inference_timesteps": 4,
+            # Action output parameterization. Keep velocity for old checkpoints;
+            # set jit_x to predict clean actions and train with JiT's v-loss.
+            "prediction_type": "velocity",
+            "jit_t_eps": 5e-2,
+            # Keep legacy for old checkpoints. ``gr00t`` uses
+            # t=(1-Beta(alpha,beta))*noise_s, as in Isaac-GR00T/LaWAM.
+            "flow_time_sampling": "legacy",
             # Number of vision tokens fed to action head
             "num_target_vision_tokens": 32,
             # === DiT Transformer sub-config ===

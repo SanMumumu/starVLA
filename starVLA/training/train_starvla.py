@@ -707,7 +707,7 @@ def main(cfg) -> None:
     vla = build_framework(cfg)
     vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
     #######
-    # 中文注释：E1.3 correlated noise——若 action_model.use_correlated_noise=true，启动时从 dataloader 估计动作协方差
+    # 中文注释：E1.3 correlated noise——若 action_model.use_correlated_noise=true，启动时从 dataloader 估计动作 correlation
     # 的 Cholesky 并注入 action head（启动时算好注入，免离线脚本）。开关关时此段不执行，不影响其它实验。
     action_cfg = getattr(getattr(cfg, "framework", None), "action_model", None)
     if (
@@ -742,9 +742,16 @@ def main(cfg) -> None:
                     vla_train_dataloader.dataset,
                     num_samples=int(action_cfg.get("correlation_num_samples", 4096)),
                     beta=float(action_cfg.get("correlation_beta", 0.5)),
+                    matrix_type=str(action_cfg.get("correlation_matrix_type", "covariance")),
                 )
                 _np.save(cache_path, _np.asarray(chol))
-                logger.info(f"correlated-noise Cholesky ready: shape={chol.shape}, beta={action_cfg.get('correlation_beta', 0.5)} → {cache_path}")
+                logger.info(
+                    "correlated-noise Cholesky ready: shape=%s, beta=%s, matrix_type=%s -> %s",
+                    chol.shape,
+                    action_cfg.get("correlation_beta", 0.5),
+                    action_cfg.get("correlation_matrix_type", "covariance"),
+                    cache_path,
+                )
         if dist.is_initialized():
             dist.barrier()  # 等 rank0 算好/存好,其余 rank 再读
         vla.set_action_correlation(_np.load(cache_path))

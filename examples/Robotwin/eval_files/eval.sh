@@ -51,6 +51,12 @@ policy_port="${7:-${ROBOTWIN_POLICY_PORT:-5694}}"
 policy_host="${8:-${ROBOTWIN_POLICY_HOST:-127.0.0.1}}"
 robotwin_python="${ROBOTWIN_PYTHON:-python}"
 deploy_policy_template="${DEPLOY_POLICY_TEMPLATE_PATH:-${SCRIPT_DIR}/deploy_policy.yml}"
+replan_steps="${ROBOTWIN_REPLAN_STEPS:-${REPLAN_STEPS:-}}"
+
+if [[ -n "${replan_steps}" && ! "${replan_steps}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "REPLAN_STEPS must be a positive integer, got: ${replan_steps}" >&2
+    exit 1
+fi
 
 if [[ ! -f "${deploy_policy_template}" ]]; then
     echo "Deploy policy template does not exist: ${deploy_policy_template}" >&2
@@ -63,9 +69,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+runtime_replan_steps="${replan_steps:-null}"
 sed \
     -e "s/^host:.*/host: \"${policy_host}\"/" \
     -e "s/^port:.*/port: ${policy_port}/" \
+    -e "s/^replan_steps:.*/replan_steps: ${runtime_replan_steps}/" \
     "${deploy_policy_template}" > "${runtime_deploy_policy}"
 
 export CUDA_VISIBLE_DEVICES="${gpu_id}"
@@ -85,6 +93,7 @@ echo "task_name: ${task_name}"
 echo "task_config: ${task_config}"
 echo "ckpt_setting: ${ckpt_setting}"
 echo "policy_port: ${policy_port}"
+echo "replan_steps: ${replan_steps:-full model chunk}"
 
 PYTHONWARNINGS=ignore::UserWarning \
 "${robotwin_python}" script/eval_policy.py --config "${runtime_deploy_policy}" \

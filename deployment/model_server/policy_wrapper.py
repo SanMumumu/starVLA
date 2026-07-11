@@ -10,7 +10,8 @@ already-unnormalized actions.
 Client-side responsibilities that REMAIN on the client:
   - environment-specific adapters (image_history, gripper sticky, action
     ensembling)
-  - chunk-cache scheduling (`step % chunk_size == 0` triggers a new infer)
+  - chunk-cache scheduling (the execution horizon may be shorter than the
+    model's predicted action chunk)
 
 Exposed API:
   - ``metadata`` (dict, sent at handshake): ``action_chunk_size``,

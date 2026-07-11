@@ -22,6 +22,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset, LeRobotSingleDataset, ModalityConfig
+from starVLA.dataloader.action_correlation import compute_action_noise_matrix
 from starVLA.dataloader.gr00t_lerobot.registry import ROBOT_TYPE_CONFIG_MAP, EmbodimentTag
 from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionToTensor, StateActionTransform
@@ -582,12 +583,16 @@ def build_joint_dataloader(cfg, mode: str = "train") -> DataLoader:
 
 
 #######
-# 中文注释：E1.3 correlated noise——从数据集采样归一化动作 chunk，估计 flat(=horizon·action_dim) 的协方差 Σ，
-# 返回正则化协方差 βΣ+(1−β)I 的下三角 Cholesky（[flat,flat]）。训练启动时算一次，注入 action head。
+# 中文注释：E1.3 correlated noise——从数据集采样归一化动作 chunk，返回
+# beta*M+(1-beta)*I 的 Cholesky。M 默认沿用旧 covariance；Robotwin 新实验显式使用 scale-invariant correlation。
 def compute_action_correlation_cholesky(
-    mixture_dataset: LeRobotMixtureDataset, num_samples: int = 20000, beta: float = 0.5, seed: int = 0
+    mixture_dataset: LeRobotMixtureDataset,
+    num_samples: int = 20000,
+    beta: float = 0.5,
+    seed: int = 0,
+    matrix_type: str = "covariance",
 ) -> np.ndarray:
-    """估动作协方差的 Cholesky（correlated-noise 用）。
+    """Estimate the correlated-noise Cholesky from action chunks.
 
     中文注释：**只读 action，不解码视频**——按各子数据集步数比例随机取样，走子数据集的 `read_action_only`
     （同 __getitem__ 的 transform，但跳过 PyAV 视频解码 + latent 读取）。这样在多机 bucket I/O 下 rank0 估计
@@ -621,8 +626,8 @@ def compute_action_correlation_cholesky(
         raise RuntimeError("compute_action_correlation_cholesky: 采不到 action，检查数据集。")
     X = np.stack(rows, axis=0)  # [M, flat]
     flat = X.shape[1]
-    Sigma = np.cov(X, rowvar=False).reshape(flat, flat).astype(np.float64)
-    Sigma_reg = float(beta) * Sigma + (1.0 - float(beta)) * np.eye(flat)
+    action_matrix = compute_action_noise_matrix(X, matrix_type=matrix_type)
+    Sigma_reg = float(beta) * action_matrix + (1.0 - float(beta)) * np.eye(flat)
     # 数值稳健：对角加微小抖动后 Cholesky
     L = np.linalg.cholesky(Sigma_reg + 1e-6 * np.eye(flat))
     return L.astype(np.float32)

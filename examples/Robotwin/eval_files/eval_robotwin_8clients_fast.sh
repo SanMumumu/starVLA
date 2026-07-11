@@ -14,6 +14,7 @@ SEED="${SEED:-0}"
 RUN_NAME="${RUN_NAME:-robotwin_full_eval}"
 ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-python3}"
 SERVER_MAX_WAIT="${SERVER_MAX_WAIT:-1800}"
+REPLAN_STEPS="${REPLAN_STEPS:-${ROBOTWIN_REPLAN_STEPS:-}}"
 
 # Final benchmark defaults. Only lower TEST_NUM / disable EXPERT_CHECK for smoke tests.
 export ROBOTWIN_DISABLE_EVAL_VIDEO="${ROBOTWIN_DISABLE_EVAL_VIDEO:-1}"
@@ -37,6 +38,7 @@ ALL_TASKS=(
 )
 
 [[ -f "${CKPT}" ]] || { echo "[ERROR] Missing checkpoint: ${CKPT}" >&2; exit 1; }
+
 [[ -f "${ROBOTWIN_PATH}/script/eval_policy.py" ]] || {
     echo "[ERROR] Missing ${ROBOTWIN_PATH}/script/eval_policy.py" >&2; exit 1;
 }
@@ -46,6 +48,10 @@ ALL_TASKS=(
 [[ "${ROBOTWIN_TEST_NUM}" =~ ^[1-9][0-9]*$ ]] || {
     echo "[ERROR] ROBOTWIN_TEST_NUM must be a positive integer" >&2; exit 1;
 }
+[[ -z "${REPLAN_STEPS}" || "${REPLAN_STEPS}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "[ERROR] REPLAN_STEPS must be a positive integer" >&2; exit 1;
+}
+export ROBOTWIN_REPLAN_STEPS="${REPLAN_STEPS}"
 
 if ! grep -q 'ROBOTWIN_DISABLE_EVAL_VIDEO' "${ROBOTWIN_PATH}/script/eval_policy.py"; then
     echo "[ERROR] Fast-eval patch is not installed." >&2
@@ -130,6 +136,7 @@ echo "[INFO] clients:    ${NUM_CLIENTS}"
 echo "[INFO] episodes:   ${ROBOTWIN_TEST_NUM} per task-mode"
 echo "[INFO] videos:     disabled"
 echo "[INFO] expert seed check: ${ROBOTWIN_EXPERT_CHECK}"
+echo "[INFO] replan:     ${REPLAN_STEPS:-full model chunk}"
 echo "[INFO] output:     ${OUTPUT_ROOT}"
 
 deadline=$((SECONDS + SERVER_MAX_WAIT))
@@ -198,7 +205,9 @@ launch_job() {
 
 compact_log() {
     local raw="$1" out="$2"
-    sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw}" \
+    local cleaned
+    cleaned="$(sed -E $'s/\x1B\\[[0-9;?]*[ -\\/]*[@-~]//g' "${raw}")"
+    printf '%s\n' "${cleaned}" \
         | grep -E 'Success rate|Traceback|ERROR|Error|Exception' > "${out}" || :
 }
 

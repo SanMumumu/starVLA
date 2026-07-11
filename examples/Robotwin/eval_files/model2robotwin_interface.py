@@ -12,6 +12,30 @@ except ImportError:
     AdaptiveEnsembler = None
 
 
+def resolve_replan_steps(replan_steps: Optional[int], action_chunk_size: int) -> int:
+    """Resolve how many cached actions are executed before querying the policy again."""
+    if action_chunk_size <= 0:
+        raise ValueError(f"action_chunk_size must be positive, got {action_chunk_size}")
+    if replan_steps is None:
+        return action_chunk_size
+    if isinstance(replan_steps, bool):
+        raise ValueError("replan_steps must be an integer, not a boolean")
+
+    try:
+        resolved = int(replan_steps)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"replan_steps must be an integer, got {replan_steps!r}") from exc
+
+    if isinstance(replan_steps, float) and not replan_steps.is_integer():
+        raise ValueError(f"replan_steps must be an integer, got {replan_steps!r}")
+    if not 1 <= resolved <= action_chunk_size:
+        raise ValueError(
+            f"replan_steps must be in [1, {action_chunk_size}], got {resolved}. "
+            f"Use {action_chunk_size} to execute the full predicted chunk."
+        )
+    return resolved
+
+
 class ModelClient:
     def __init__(
         self,
@@ -29,6 +53,7 @@ class ModelClient:
         port=5694,
         action_mode: str = "abs",
         normalization_mode: str = "min_max",
+        replan_steps: Optional[int] = None,
     ) -> None:
 
         self.client = WebsocketClientPolicy(host, port)
@@ -68,9 +93,11 @@ class ModelClient:
 
         server_meta = self.client.get_server_metadata()
         self.action_chunk_size = server_meta["action_chunk_size"]
+        self.replan_steps = resolve_replan_steps(replan_steps, self.action_chunk_size)
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
             f"action_mode: {action_mode}, normalization_mode: {normalization_mode}, "
+            f"replan_steps: {self.replan_steps}/{self.action_chunk_size}, "
             f"server_meta: {server_meta} ***"
         )
 
@@ -124,12 +151,16 @@ class ModelClient:
         }
         vla_input["unnorm_key"] = self.unnorm_key
 
-        action_chunk_size = self.action_chunk_size
+        execution_horizon = self.replan_steps
 
-        if step % action_chunk_size == 0 or self.raw_actions is None:
+        if step % execution_horizon == 0 or self.raw_actions is None:
             response = self.client.predict_action(vla_input)
             # server already un-normalized via training-time transform
             raw_actions = np.array(response["data"]["actions"][0])  # (chunk, D)
+            if len(raw_actions) < execution_horizon:
+                raise ValueError(
+                    f"Policy returned {len(raw_actions)} actions, fewer than replan_steps={execution_horizon}"
+                )
 
             # Convert delta/rel to absolute actions
             if self.action_mode == "delta":
@@ -139,9 +170,11 @@ class ModelClient:
             else:
                 self.raw_actions = raw_actions
 
-        action_idx = step % action_chunk_size
+        action_idx = step % execution_horizon
         if action_idx >= len(self.raw_actions):
-            pass
+            raise IndexError(
+                f"Action index {action_idx} is outside the returned chunk of length {len(self.raw_actions)}"
+            )
 
         current_action = self.raw_actions[action_idx]
 
@@ -180,6 +213,7 @@ def get_model(usr_args):
         "action_normalization_mode",
         usr_args.get("normalization_mode", "min_max"),
     )
+    replan_steps = usr_args.get("replan_steps")
 
     if policy_ckpt_path is None:
         raise ValueError("policy_ckpt_path must be provided in config")
@@ -191,6 +225,7 @@ def get_model(usr_args):
         unnorm_key=unnorm_key,
         action_mode=action_mode,
         normalization_mode=normalization_mode,
+        replan_steps=replan_steps,
     )
 
 

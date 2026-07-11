@@ -5,7 +5,7 @@
 # 数据同 warmup_clean（robotwin_clean_16，仅 Clean，2500 条）；训练超参对齐官方 abs 配置。
 # ⚠️ 提交前把 trainer.pretrained_checkpoint 填成 robotwin_wam_warmup_clean.yaml 跑完的 ckpt 文件。
 #######
-run_id: robotwin_wam_m5_gate_clean2clean_h16
+run_id: robotwin_wam_m5_gate_clean2clean_h16_lawam_jitx_corrnoise
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin
 seed: 42
 wandb_entity: your_wandb_entity
@@ -60,18 +60,23 @@ framework:
     load_live_backbone: false
     dino_pool: 1
   action_model:
-    action_model_type: DiT-B
+    action_model_type: DiT-LAWAM
+    action_hidden_dim: 1024
+    hidden_size: 1024
     action_dim: 14
     state_dim: 14
     action_horizon: 16
+    num_target_vision_tokens: 32
     n_action_query: 32
-    # correlated noise：启动时 rank0 估动作协方差 Cholesky。已改为"只读 action 不解码视频"
+    # correlated noise：启动时 rank0 估 action correlation Cholesky。已改为"只读 action 不解码视频"
     # (joint_dataset.py: compute_action_correlation_cholesky + read_action_only,只碰 parquet + 逐样本跳坏样本)，
     # 不再逐样本 PyAV 解码 → 不再撞启动 barrier(train_starvla.py:749) 的 30min NCCL 超时。
     use_correlated_noise: true
     correlation_beta: 0.5
-    correlation_num_samples: 512
-    flow_matching_steps: 4
+    correlation_num_samples: 4096
+    correlation_matrix_type: correlation
+    # WAM 绕过 outer repeated_diffusion_steps；这里用 head 内 repeat=2 对齐 LaWAM rp2。
+    flow_matching_steps: 2
     add_pos_embed: true
     max_seq_len: 1024
     num_inference_timesteps: 10
@@ -79,6 +84,10 @@ framework:
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
     noise_s: 0.999
+    # JiT x-prediction parameterization with velocity-space MSE.
+    prediction_type: jit_x
+    jit_t_eps: 0.05
+    flow_time_sampling: gr00t
     repeated_diffusion_steps: 1
     diffusion_model_cfg:
       cross_attention_dim: 2048
@@ -87,7 +96,7 @@ framework:
       interleave_self_attention: true
       norm_type: ada_norm
       num_layers: 16
-      num_attention_heads: 12
+      num_attention_heads: 16
       attention_head_dim: 64
       output_dim: 1024
       positional_embeddings: null
@@ -123,7 +132,8 @@ datasets:
     include_state: false
     obs_image_size: [224, 224]
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
-    per_device_batch_size: 4
+    # 三视角 WAM 比纯 baseline 更重；6×8 卡用 micro-batch 8（global=384）。
+    per_device_batch_size: 8
     load_all_data_for_training: false
     video_backend: torchvision_av
     # 提速：jointflow 每样本=3视角×2帧视频解码+episode latent 读取，num_workers=1 藏不住 → 40-60s/it。
@@ -142,14 +152,14 @@ datasets:
       future_stride: 16
 
 trainer:
-  max_train_steps: 150000
-  num_warmup_steps: 5000
-  save_interval: 10000
+  max_train_steps: 20000
+  num_warmup_steps: 500
+  save_interval: 2000
   eval_interval: 1000
   # ⚠️ 填成 robotwin_wam_warmup_clean.yaml 的产出 ckpt（跑完后确认路径存在）：
-  #   .../starvla_wam_robotwin/robotwin_wam_m5_warmup_clean_h16/final_model/pytorch_model.pt
-  #   （或中间点 .../checkpoints/steps_150000_pytorch_model.pt）
-  pretrained_checkpoint: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin/robotwin_wam_m5_warmup_clean_h16/final_model/pytorch_model.pt
+  #   .../starvla_wam_robotwin/robotwin_wam_m5_warmup_clean_h16_lawam_jitx_corrnoise/final_model/pytorch_model.pt
+  #   （或中间点 .../checkpoints/steps_80000_pytorch_model.pt）
+  pretrained_checkpoint: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin/robotwin_wam_m5_warmup_clean_h16_lawam_jitx_corrnoise/final_model/pytorch_model.pt
   is_resume: false
   learning_rate:
     base: 1.0e-05
@@ -163,7 +173,7 @@ trainer:
   freeze_modules: ''
   max_grad_norm: 1.0
   weight_decay: 0.0
-  logging_frequency: 50
+  logging_frequency: 200
   log_grad_norms: true
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1

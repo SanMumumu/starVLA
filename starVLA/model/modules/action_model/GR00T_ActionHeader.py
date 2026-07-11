@@ -59,6 +59,34 @@ class MLP(nn.Module):
         return self.layer2(F.relu(self.layer1(x)))
 
 
+_ACTION_PREDICTION_TYPES = {"velocity", "jit_x"}
+_FLOW_TIME_SAMPLING_TYPES = {"legacy", "gr00t"}
+
+
+def action_prediction_to_velocity(
+    prediction: torch.Tensor,
+    noisy_trajectory: torch.Tensor,
+    t,
+    *,
+    prediction_type: str,
+    t_eps: float,
+) -> torch.Tensor:
+    """Interpret an action-head prediction as a flow velocity.
+
+    ``jit_x`` follows JiT's clean-sample parameterization: the network predicts
+    x and the ODE velocity is recovered as (x - z_t) / max(1 - t, eps).
+    """
+    if prediction_type == "velocity":
+        return prediction
+    if prediction_type != "jit_x":
+        raise ValueError(
+            f"Unsupported action prediction_type={prediction_type!r}; "
+            f"expected one of {sorted(_ACTION_PREDICTION_TYPES)}."
+        )
+    t = torch.as_tensor(t, device=noisy_trajectory.device, dtype=noisy_trajectory.dtype)
+    return (prediction - noisy_trajectory) / (1 - t).clamp_min(t_eps)
+
+
 class ActionEncoder(nn.Module):
     def __init__(self, action_dim, hidden_size):
         super().__init__()
@@ -183,13 +211,21 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
 
     #######
     # 中文注释：E1.3 trick 开关（默认关，不影响其它实验与原生）。参考 behavior-1k 冠军方案：
-    #   use_correlated_noise：flow-matching 噪声从 N(0, βΣ+(1−β)I) 采（Σ=动作协方差），而非独立噪声；
-    #   correlation_beta：上式的 β（0.5=半相关）；Σ 的 Cholesky 训练启动时从 dataloader 算好注入。
+    #   use_correlated_noise：flow-matching 噪声从 N(0, βR+(1−β)I) 采（R=动作 correlation），而非独立噪声；
+    #   correlation_beta：上式的 β（0.5=半相关）；Σ 的 Cholesky 训练启动时从 dataloader 算好注入；
+    #   correlation_matrix_type：默认 covariance 保持旧实验，Robotwin 新实验显式选 correlation。
     #   flow_matching_steps：每个 VLM step 对 action expert 跑 N 次不同 (t,noise) 预测并平均，降训练方差（1=关）。
     use_correlated_noise: bool = field(default=False)
     correlation_beta: float = field(default=0.5)
+    correlation_matrix_type: str = field(default="covariance")
     flow_matching_steps: int = field(default=1)
     #######
+
+    # Action output parameterization. ``velocity`` preserves released
+    # checkpoints; ``jit_x`` predicts the clean action and applies JiT's v-loss.
+    prediction_type: str = field(default="velocity")
+    jit_t_eps: float = field(default=5e-2)
+    flow_time_sampling: str = field(default="legacy")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -199,6 +235,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
 
 DiTConfig = {
     "DiT-B": {"input_embedding_dim": 768, "attention_head_dim": 64, "num_attention_heads": 12},
+    "DiT-LAWAM": {"input_embedding_dim": 1024, "attention_head_dim": 64, "num_attention_heads": 16},
     "DiT-L": {"input_embedding_dim": 1536, "attention_head_dim": 48, "num_attention_heads": 32},
 }
 
@@ -227,8 +264,9 @@ class FlowmatchingActionHead(nn.Module):
 
         # ------------------------------------------------------------------
         # DiT architecture selection
-        #   action_model_type: "DiT-B" | "DiT-L"
+        #   action_model_type: "DiT-B" | "DiT-LAWAM" | "DiT-L"
         #     DiT-B → input_embedding_dim=768,  heads=12, head_dim=64
+        #     DiT-LAWAM → input_embedding_dim=1024, heads=16, head_dim=64
         #     DiT-L → input_embedding_dim=1536, heads=32, head_dim=48
         #   diffusion_model_cfg overrides/extends the base DiT shape.
         #   In particular, diffusion_model_cfg.cross_attention_dim MUST be
@@ -310,6 +348,21 @@ class FlowmatchingActionHead(nn.Module):
         # 训练启动时由 trainer 算好并 set_action_correlation 注入；未注入时即便开关打开也回退独立噪声。
         self.use_correlated_noise = bool(getattr(config, "use_correlated_noise", False))
         self.flow_matching_steps = int(getattr(config, "flow_matching_steps", 1))
+        self.prediction_type = str(getattr(config, "prediction_type", "velocity")).lower()
+        if self.prediction_type not in _ACTION_PREDICTION_TYPES:
+            raise ValueError(
+                f"Unsupported action prediction_type={self.prediction_type!r}; "
+                f"expected one of {sorted(_ACTION_PREDICTION_TYPES)}."
+            )
+        self.jit_t_eps = float(getattr(config, "jit_t_eps", 5e-2))
+        if self.jit_t_eps <= 0:
+            raise ValueError(f"jit_t_eps must be positive, got {self.jit_t_eps}.")
+        self.flow_time_sampling = str(getattr(config, "flow_time_sampling", "legacy")).lower()
+        if self.flow_time_sampling not in _FLOW_TIME_SAMPLING_TYPES:
+            raise ValueError(
+                f"Unsupported flow_time_sampling={self.flow_time_sampling!r}; "
+                f"expected one of {sorted(_FLOW_TIME_SAMPLING_TYPES)}."
+            )
         self.register_buffer(
             "_action_corr_chol",
             torch.zeros(self.action_horizon * self.action_dim, self.action_horizon * self.action_dim),
@@ -339,6 +392,9 @@ class FlowmatchingActionHead(nn.Module):
         self.config = config
 
     def sample_time(self, batch_size, device, dtype):
+        if self.flow_time_sampling == "gr00t":
+            sample = self.beta_dist.sample([batch_size]).to(device=device, dtype=torch.float32)
+            return ((1.0 - sample) * float(self.config.noise_s)).to(dtype=dtype)
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype).clamp(max=self.config.noise_s)
         return (self.config.noise_s - sample) / self.config.noise_s
 
@@ -453,7 +509,22 @@ class FlowmatchingActionHead(nn.Module):
         pred_actions = pred[:, -actions.shape[1] :]
 
         # Slice out only the action portion of pred and target.
-        loss = ((pred_actions - velocity) ** 2).mean()
+        if self.prediction_type == "jit_x":
+            velocity = action_prediction_to_velocity(
+                actions,
+                noisy_trajectory,
+                t,
+                prediction_type="jit_x",
+                t_eps=self.jit_t_eps,
+            )
+        pred_velocity = action_prediction_to_velocity(
+            pred_actions,
+            noisy_trajectory,
+            t,
+            prediction_type=self.prediction_type,
+            t_eps=self.jit_t_eps,
+        )
+        loss = ((pred_velocity - velocity) ** 2).mean()
         return loss
 
     @torch.no_grad()
@@ -519,7 +590,14 @@ class FlowmatchingActionHead(nn.Module):
             )
             pred = self.action_decoder(model_output)
 
-            pred_velocity = pred[:, -self.action_horizon :]
+            action_prediction = pred[:, -self.action_horizon :]
+            pred_velocity = action_prediction_to_velocity(
+                action_prediction,
+                actions,
+                t_cont,
+                prediction_type=self.prediction_type,
+                t_eps=self.jit_t_eps,
+            )
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity

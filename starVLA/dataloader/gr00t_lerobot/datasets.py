@@ -1376,6 +1376,23 @@ class LeRobotSingleDataset(Dataset):
         data = self.transforms(raw_data)
         return self._pack_sample(data)
 
+    def read_action_only(self, trajectory_id: int, base_index: int) -> np.ndarray:
+        """Return one transformed action chunk without decoding video."""
+        self.curr_traj_data = self.get_trajectory_data(trajectory_id)
+        raw_data = {}
+        # Delta/relative action modes may require state, so retain both numeric
+        # modalities while skipping video and language I/O.
+        for modality in ("state", "action"):
+            for key in self.modality_keys.get(modality, []):
+                raw_data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
+        data = self.transforms(self._apply_action_mode(raw_data))
+        action = []
+        for key in self.modality_keys["action"]:
+            value = data[key]
+            value = value.detach().cpu().numpy() if torch.is_tensor(value) else np.asarray(value)
+            action.append(value)
+        return np.concatenate(action, axis=1).astype(np.float32)
+
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
         step_images = []

@@ -8,6 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+ANSI_RE = re.compile(r"\x1B\[[0-9;?]*[ -/]*[@-~]")
 RATE_RE = re.compile(
     r"Success rate:\s*(\d+)\s*/\s*(\d+)\s*=>\s*([0-9]+(?:\.[0-9]+)?)%"
 )
@@ -31,7 +32,8 @@ def parse_log(path: Path) -> tuple[int | None, int | None, float | None]:
     if not path.is_file():
         return None, None, None
 
-    matches = RATE_RE.findall(path.read_text(encoding="utf-8", errors="replace"))
+    text = ANSI_RE.sub("", path.read_text(encoding="utf-8", errors="replace"))
+    matches = RATE_RE.findall(text)
     if not matches:
         return None, None, None
 
