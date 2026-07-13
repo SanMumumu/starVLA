@@ -403,6 +403,28 @@ bash examples/Robotwin/eval_files/eval_robotwin_8clients_replan.sh
 
 The default is `24`, matching FastWAM's RoboTwin execution horizon. For a 50-action StarVLA checkpoint, `REPLAN_STEPS=50` executes the full predicted chunk and preserves the previous behavior. Values larger than the checkpoint action horizon are rejected.
 
+### FastWAM 50 Hz data-only baseline
+
+Use this config for the controlled FastWAM data experiment:
+
+```text
+examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam_corrnoise.yaml
+```
+
+It reads the full global 50 Hz LeRobot v2.1 release, applies its global z-score (`std + 1e-8`, clamp to
+`[-5, 5]`), and predicts 32-step absolute-action chunks. All remaining behavior follows the completed
+`starvla_qwengroot_robotwin_corrnoise.yaml` baseline: correlated noise, standard StarVLA sampling, no proprioceptive
+input, three independent 224x224 camera views, the standard action order, and the standard RoboTwin inference
+interface. No FastWAM composite-image or special inference preprocessing is used.
+
+Run evaluation for these checkpoints through:
+
+```bash
+bash examples/Robotwin/eval_files/eval_robotwin_8clients_fastwam.sh
+```
+
+This launcher uses `replan_steps=24`, so each 32-action prediction executes 24 actions before the next policy call.
+
 ### Runtime output
 
 During evaluation, per-episode success rates are streamed to stdout in real time:
@@ -463,7 +485,8 @@ The launcher does **not** use `conda activate`. Instead, it locates the Python b
 | `action_mode` | Action mode (e.g. `abs`) |
 | `replan_steps` | Actions executed per inference; `null` uses the model's full action chunk |
 
-`host`, `port`, and `replan_steps` are overridden at runtime by the launcher. Action unnormalization is selected from the `data_mix` saved with the checkpoint, including `mean_std` for the z-score experiment.
+`host`, `port`, and `replan_steps` are overridden at runtime by the launcher. Action unnormalization is selected from
+the `data_mix` saved with the checkpoint, including exact `fastwam_zscore` inversion for the FastWAM data baseline.
 
 ### Low-level manual mode
 

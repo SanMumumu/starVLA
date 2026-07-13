@@ -73,13 +73,20 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
         }
         if num_workers > 0:
             loader_kwargs["prefetch_factor"] = int(vla_dataset_cfg.get("prefetch_factor", 4))
+        if bool(vla_dataset_cfg.get("fastwam_direct_frame_sampling", False)):
+            from starVLA.dataloader.fastwam_robotwin_dataset import FastWAMEpochSampler
+
+            loader_kwargs["sampler"] = FastWAMEpochSampler(
+                vla_dataset,
+                seed=int(vla_dataset_cfg.get("fastwam_split_seed", getattr(cfg, "seed", 42))),
+            )
         vla_train_dataloader = DataLoader(
             vla_dataset,
             batch_size=vla_dataset_cfg.per_device_batch_size,
             collate_fn=collate_fn,
             **loader_kwargs,
         )
-        if dist.get_rank() == 0: 
+        if (not dist.is_initialized()) or dist.get_rank() == 0:
             
             output_dir = Path(cfg.output_dir)
             vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")

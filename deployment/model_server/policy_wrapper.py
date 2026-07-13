@@ -29,17 +29,20 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 
-from starVLA.dataloader.gr00t_lerobot.registry import ROBOT_TYPE_CONFIG_MAP
-from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
-from starVLA.model.framework.base_framework import baseframework
-from starVLA.model.framework.share_tools import read_mode_config
-
+from deployment.model_server.checkpoint_contract import (
+    load_checkpoint_contract_config,
+    resolve_config_expects_state,
+)
 from deployment.model_server.policy_norm_processor import (
     PolicyNormProcessor,
     _build_dataset_metadata,
     _infer_key_dims,
     _resolve_robot_type,
 )
+from starVLA.dataloader.gr00t_lerobot.registry import ROBOT_TYPE_CONFIG_MAP
+from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
+from starVLA.model.framework.base_framework import baseframework
+from starVLA.model.framework.share_tools import read_mode_config
 
 
 class PolicyServerWrapper:
@@ -80,11 +83,22 @@ class PolicyServerWrapper:
         # Co-located metadata.
         model_cfg, _ = read_mode_config(self._ckpt_path)
         self._model_cfg = model_cfg
+        contract_cfg, contract_cfg_path = load_checkpoint_contract_config(
+            self._ckpt_path,
+            accessed_config=model_cfg,
+        )
+        self._contract_cfg_path = str(contract_cfg_path)
         self._state_normalizer: Optional[ComposedModalityTransform] = None
         self._state_keys: List[str] = []
         self._state_key_dims: Dict[str, int] = {}
         self._state_total_dim = 0
-        self._expects_state = self._config_expects_state(model_cfg)
+        self._expects_state, self._state_contract_source = resolve_config_expects_state(contract_cfg)
+        logging.info(
+            "PolicyServerWrapper: expects_state=%s (%s; config=%s)",
+            self._expects_state,
+            self._state_contract_source,
+            self._contract_cfg_path,
+        )
 
         # action_chunk_size = future_action_window_size + 1 (matches old client).
         action_model_cfg = model_cfg["framework"]["action_model"]
@@ -95,7 +109,8 @@ class PolicyServerWrapper:
             self._action_chunk_size = int(action_model_cfg["future_action_window_size"]) + 1
         else:
             raise ValueError(
-                f"PolicyServerWrapper: no action_horizon or future_action_window_size found in model config for {self._ckpt_path}"
+                "PolicyServerWrapper: no action_horizon or future_action_window_size found "
+                f"in model config for {self._ckpt_path}"
             )
         # Cache of PolicyNormProcessor instances per unnorm_key.
         # For single-dataset ckpts unnorm_key is auto-selected; for multi-dataset
@@ -129,22 +144,13 @@ class PolicyServerWrapper:
             )
 
         if self._expects_state:
-            self._build_state_normalizer(model_cfg, _ns)
-
-    @staticmethod
-    def _truthy(value: Any) -> bool:
-        if isinstance(value, str):
-            return value.strip().lower() not in {"", "0", "false", "none", "no"}
-        return bool(value)
+            self._build_state_normalizer(contract_cfg, _ns)
 
     @classmethod
     def _config_expects_state(cls, model_cfg: dict) -> bool:
-        vla_cfg = ((model_cfg.get("datasets") or {}).get("vla_data") or {})
-        if cls._truthy(vla_cfg.get("include_state", False)):
-            return True
+        """Compatibility shim for callers/tests that only have a config dict."""
 
-        state_cfg = ((model_cfg.get("framework") or {}).get("state") or {})
-        return str(state_cfg.get("inject_mode", "none")) == "token"
+        return resolve_config_expects_state(model_cfg)[0]
 
     def _build_state_normalizer(self, model_cfg: dict, norm_stats: dict) -> None:
         unnorm_key = self._default_unnorm_key
@@ -204,11 +210,11 @@ class PolicyServerWrapper:
         total = self._state_total_dim
         if total <= 0:
             return arr
-        if arr.shape[-1] < total:
-            pad = np.zeros((*arr.shape[:-1], total - arr.shape[-1]), dtype=np.float32)
-            arr = np.concatenate([arr, pad], axis=-1)
-        elif arr.shape[-1] > total:
-            arr = arr[..., :total]
+        if arr.shape[-1] != total:
+            raise ValueError(
+                f"PolicyServerWrapper: checkpoint expects a {total}-D state, got shape {arr.shape}. "
+                "Refusing to pad or truncate state because that would break train/inference consistency."
+            )
 
         data: Dict[str, np.ndarray] = {}
         cursor = 0
@@ -235,7 +241,17 @@ class PolicyServerWrapper:
             prepared = dict(example)
             if not self._expects_state:
                 prepared.pop("state", None)
-            elif self._state_normalizer is not None and prepared.get("state") is not None:
+            else:
+                if prepared.get("state") is None:
+                    raise ValueError(
+                        "PolicyServerWrapper: this checkpoint was trained with include_state=true, "
+                        "but the inference request did not provide state."
+                    )
+                if self._state_normalizer is None:
+                    raise RuntimeError(
+                        "PolicyServerWrapper: this checkpoint requires state, but its training-time "
+                        "state normalizer could not be constructed."
+                    )
                 prepared["state"] = self._normalize_state(prepared["state"])
             prepared_examples.append(prepared)
         return prepared_examples
@@ -243,9 +259,7 @@ class PolicyServerWrapper:
     def _get_processor(self, unnorm_key: Optional[str]) -> PolicyNormProcessor:
         cache_key = unnorm_key if unnorm_key is not None else "__default__"
         if cache_key not in self._norm_processors:
-            self._norm_processors[cache_key] = PolicyNormProcessor(
-                self._ckpt_path, unnorm_key=unnorm_key
-            )
+            self._norm_processors[cache_key] = PolicyNormProcessor(self._ckpt_path, unnorm_key=unnorm_key)
         return self._norm_processors[cache_key]
 
     @property
@@ -258,6 +272,8 @@ class PolicyServerWrapper:
             "available_unnorm_keys": self._available_unnorm_keys,
             "default_unnorm_key": self._default_unnorm_key,
             "expects_state": self._expects_state,
+            "state_contract_source": self._state_contract_source,
+            "contract_config": self._contract_cfg_path,
         }
         # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:

@@ -1,0 +1,15 @@
+policy_name: model2robotwin_fastwam_interface
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+# Checkpoint-compatible FastWAM client: one 384x320 composite image, current
+# 14-D proprio, release-order action vectors, and a 24/32 execution horizon.
+host: "127.0.0.1"
+port: 5694
+unnorm_key: "new_embodiment"
+action_mode: "abs"
+normalization_mode: "fastwam_zscore"
+replan_steps: 24

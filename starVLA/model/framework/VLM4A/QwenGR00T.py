@@ -10,10 +10,12 @@ Flow-matching header is copyright from GR00T N1.5,
 
 import sys
 from pathlib import Path
+
 #######
 # 中文注释：JointFlow 分支需要在局部禁用 autocast，并为 unused-parameter anchor 遍历模块参数。
 from contextlib import nullcontext
 import json
+
 #######
 
 # Add workspace root to Python path if not already there
@@ -26,9 +28,11 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
+
 #######
 # 中文注释：JointFlow 迁移到 QwenGR00T 后会新增若干可训练子模块，统一使用 nn.Module 类型标注。
 from torch import nn
+
 #######
 from PIL import Image
 
@@ -46,11 +50,17 @@ from starVLA.model.modules.action_model.GR00T_ActionHeader import FlowmatchingAc
 from starVLA.model.modules.vlm import get_vlm_model
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
+
 #######
 # 中文注释：复用 JointFlow 已验证的 DINO token、query token、visual flow head 模块；
 # 这些模块只在 framework.jointflow.enabled=true 时实例化，默认不影响原生 QwenGR00T。
 from starVLA.model.framework.VLM4A.jointflow.attention_mask import build_block_causal_mask
-from starVLA.model.framework.VLM4A.jointflow.dino_v3 import DINOv3Backbone, resolve_dino_spec
+from starVLA.model.framework.VLM4A.jointflow.dino_v3 import (
+    DINOv3Backbone,
+    dino_num_patches,
+    dino_patch_grid,
+    resolve_dino_spec,
+)
 from starVLA.model.framework.VLM4A.jointflow.joint_modules import (
     ActionContextEncoder,
     ActionQueryTokenBank,
@@ -58,6 +68,7 @@ from starVLA.model.framework.VLM4A.jointflow.joint_modules import (
     FutureDinoQueryTokenBank,
 )
 from starVLA.model.framework.VLM4A.jointflow.visual_dino_flow_head import VisualFlowMatchingHead
+
 #######
 
 
@@ -259,6 +270,11 @@ class Qwen_GR00T(baseframework):
         self.wam_enabled = bool(self.config.framework.get("wam", {}).get("enabled", False))
         if self.wam_enabled:
             self.config.framework.visual_model.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
+        # Multi-task branches normally attach every unused parameter to the loss with a zero-valued
+        # autograd edge.  The trainer may disable those anchors after DeepSpeed ZeRO-2 is initialized:
+        # ZeRO-2 fills missing partition gradients with zeros before AdamW, preserving optimizer semantics
+        # without reducing a dense zero gradient for every inactive head.
+        self._unused_param_anchors_enabled = True
         #######
 
         #######
@@ -274,6 +290,7 @@ class Qwen_GR00T(baseframework):
         action_backbone = str(self.config.framework.action_model.get("backbone", "gr00t")).lower()
         if action_backbone == "wan":
             from starVLA.model.modules.action_model.wan_action_head import WanFlowMatchingActionHead
+
             self.action_model = WanFlowMatchingActionHead(self.config)
         else:
             self.action_model: FlowmatchingActionHead = get_action_model(config=self.config)
@@ -320,6 +337,7 @@ class Qwen_GR00T(baseframework):
         if mode in ("adaln", "dual_xattn_adaln"):
             dcfg.world_adaln = True
         # world_cross_attention_dim / world_global_dim 默认 = cross_attention_dim（= d_model），DiT 内部兜底。
+
     #######
 
     def _uses_action_state(self) -> bool:
@@ -358,13 +376,16 @@ class Qwen_GR00T(baseframework):
         )
         self.visual_head = VisualFlowMatchingHead(self.config)
 
-
-        self.dino = None
+        # Frozen DINO is a target encoder, not a trainable/checkpointed model
+        # component.  Keep it outside nn.Module registration so checkpoints do
+        # not silently grow by the full DINO-L state dict.
+        object.__setattr__(self, "_dino_teacher", None)
         if bool(dino_cfg.get("load_live_backbone", False)):
-            self.dino = DINOv3Backbone(**self._jointflow_dino_spec)
+            self._set_dino_teacher(DINOv3Backbone(**self._jointflow_dino_spec))
         self.register_buffer("_dino_mean", torch.zeros(self.d_dino), persistent=False)
         self.register_buffer("_dino_std", torch.ones(self.d_dino), persistent=False)
         self._load_jointflow_dino_stats(dino_cfg.get("stats_path", None))
+
     #######
 
     #######
@@ -385,9 +406,14 @@ class Qwen_GR00T(baseframework):
         return self.qwen_vl_interface.model.get_input_embeddings()
         #######
 
-    @staticmethod
-    def _zero_grad_anchor_for_modules(modules: list[nn.Module | None], ref: torch.Tensor) -> torch.Tensor:
+    def set_unused_param_anchors_enabled(self, enabled: bool) -> None:
+        """Enable conservative unused-parameter anchors for non-ZeRO distributed backends."""
+        self._unused_param_anchors_enabled = bool(enabled)
+
+    def _zero_grad_anchor_for_modules(self, modules: list[nn.Module | None], ref: torch.Tensor) -> torch.Tensor:
         anchor = ref.new_zeros(())
+        if not self._unused_param_anchors_enabled:
+            return anchor
         seen: set[int] = set()
         for module in modules:
             if module is None:
@@ -447,9 +473,7 @@ class Qwen_GR00T(baseframework):
         mean = torch.tensor(stats["mean"], dtype=torch.float32)
         std = torch.tensor(stats["std"], dtype=torch.float32).clamp_min(1e-6)
         if mean.numel() != self.d_dino or std.numel() != self.d_dino:
-            logger.warning(
-                f"JointFlow DINO stats dim {mean.numel()} != embed_dim {self.d_dino}; using identity stats."
-            )
+            logger.warning(f"JointFlow DINO stats dim {mean.numel()} != embed_dim {self.d_dino}; using identity stats.")
             return
         self._dino_mean.copy_(mean)
         self._dino_std.copy_(std)
@@ -543,17 +567,31 @@ class Qwen_GR00T(baseframework):
         pool = int(self.config.framework.dino.get("dino_pool", 1))
         if pool > 1:
             n_tokens = dino.shape[1]
-            side = int(n_tokens**0.5)
-            if side * side == n_tokens and side % pool == 0:
-                dino = dino.view(dino.shape[0], side, side, dino.shape[-1])
-                dino = dino.view(dino.shape[0], side // pool, pool, side // pool, pool, dino.shape[-1]).mean(dim=(2, 4))
+            rows, columns = dino_patch_grid(
+                self._jointflow_dino_spec["image_size"], self._jointflow_dino_spec["patch_size"]
+            )
+            if n_tokens == rows * columns and rows % pool == 0 and columns % pool == 0:
+                dino = dino.view(dino.shape[0], rows, columns, dino.shape[-1])
+                dino = dino.view(dino.shape[0], rows // pool, pool, columns // pool, pool, dino.shape[-1]).mean(
+                    dim=(2, 4)
+                )
                 dino = dino.reshape(dino.shape[0], -1, dino.shape[-1])
         return dino
 
+    def _set_dino_teacher(self, teacher: DINOv3Backbone | None) -> None:
+        if teacher is not None:
+            teacher.requires_grad_(False)
+            teacher.eval()
+        object.__setattr__(self, "_dino_teacher", teacher)
+
     def _ensure_jointflow_dino(self) -> DINOv3Backbone:
-        if self.dino is None:
-            self.dino = DINOv3Backbone(**self._jointflow_dino_spec).to(self.device)
-        return self.dino
+        teacher = getattr(self, "_dino_teacher", None)
+        if teacher is None:
+            teacher = DINOv3Backbone(**self._jointflow_dino_spec)
+            self._set_dino_teacher(teacher)
+        teacher = teacher.to(self.device).eval()
+        self._set_dino_teacher(teacher)
+        return teacher
 
     def _collect_jointflow_images(self, examples: List[dict], keys: list[str]):
         batch_views = []
@@ -598,11 +636,9 @@ class Qwen_GR00T(baseframework):
         flat = [img for views in batch_views for img in views]
         device_type = self.device.type
         autocast_ctx = (
-            torch.autocast(device_type=device_type, enabled=False)
-            if device_type in {"cuda", "cpu"}
-            else nullcontext()
+            torch.autocast(device_type=device_type, enabled=False) if device_type in {"cuda", "cpu"} else nullcontext()
         )
-        with autocast_ctx:
+        with torch.no_grad(), autocast_ctx:
             tensor = dino.preprocess_batch(flat)
             feats = dino(tensor)
         feats = feats.view(len(batch_views), n_views, feats.shape[1], feats.shape[2]).float()
@@ -639,6 +675,7 @@ class Qwen_GR00T(baseframework):
     # 中文注释：E1.3 correlated noise——把 trainer 算好的 Σ-Cholesky 透传给 action head。
     def set_action_correlation(self, chol) -> None:
         self.action_model.set_action_correlation(chol)
+
     #######
 
     #######
@@ -647,6 +684,7 @@ class Qwen_GR00T(baseframework):
     # 原始尺度特征→视觉条件失效→SR≈0。每个 suite 的 stats 不同，评测前按 suite 注入对应文件。
     def set_dino_stats(self, stats_path: str) -> None:
         self._load_jointflow_dino_stats(stats_path)
+
     #######
 
     @staticmethod
@@ -843,6 +881,7 @@ class Qwen_GR00T(baseframework):
         )
         #######
         return {"normalized_actions": pred_actions.float().detach().cpu().numpy()}
+
     #######
 
     #######
@@ -881,8 +920,18 @@ class Qwen_GR00T(baseframework):
         self.register_buffer("_dino_mean", torch.zeros(self.d_dino), persistent=False)
         self.register_buffer("_dino_std", torch.ones(self.d_dino), persistent=False)
         self._load_jointflow_dino_stats(dino_cfg.get("stats_path", None))
-        self.dino = None  # 中文注释：DINO backbone 懒加载（仅训练算 target 时用），与 jointflow 一致
+        object.__setattr__(self, "_dino_teacher", None)  # 仅训练算 target；不注册、不保存进 checkpoint
+        if bool(dino_cfg.get("load_live_backbone", False)):
+            self._set_dino_teacher(DINOv3Backbone(**self._jointflow_dino_spec))
         self.wam_visual_head = VisualFlowMatchingHead(self.config)
+        # WAM keeps the baseline batch/repeat objective. Checkpoint only the
+        # action-DiT blocks to avoid materializing activations for the effective
+        # batch (micro-batch x repeated_diffusion_steps); parameters, precision,
+        # noise samples and loss are unchanged.
+        if bool(wam_cfg.get("action_gradient_checkpointing", True)):
+            action_dit = getattr(self.action_model, "model", None)
+            if action_dit is not None and hasattr(action_dit, "gradient_checkpointing"):
+                action_dit.gradient_checkpointing = True
         # 中文注释：fdm（前向动力学）范式需要动作上下文——把 act_ctx(动作) 拼到 flow-query 作为 DINO 头的 cross-attn 条件。
         self.wam_act_ctx = ActionContextEncoder(
             action_dim=self.action_dim, hidden_size=int(self.qwen_vl_interface.model.config.hidden_size)
@@ -908,15 +957,15 @@ class Qwen_GR00T(baseframework):
             "prompt_mode": "action_only",
             # bridge：predicted(用 world head 预测) | oracle(用 GT DINO) | scheduled(按 oracle_ratio 混)。
             "bridge_source": "predicted",
-            "detach_world": True,       # True=action loss 不回传 world head（Stage1/2）；False=e2e(Stage3)
-            "oracle_ratio": 1.0,         # scheduled 时逐样本取 oracle 的概率（1→全 oracle, 0→全 predicted）
-            "n_world_tokens": 16,        # M3 Q-Former 压缩后的 token 数
+            "detach_world": True,  # True=action loss 不回传 world head（Stage1/2）；False=e2e(Stage3)
+            "oracle_ratio": 1.0,  # scheduled 时逐样本取 oracle 的概率（1→全 oracle, 0→全 predicted）
+            "n_world_tokens": 16,  # M3 Q-Former 压缩后的 token 数
             "qformer_layers": 2,
-            "fusion_layers": 2,          # M2 CompactSAFusion 层数
+            "fusion_layers": 2,  # M2 CompactSAFusion 层数
             "fusion_heads": 8,
             "qformer_heads": 8,
             "pooler_heads": 8,
-            "gate_init": 0.0,            # M5 world_gate 初值（tanh(0)=0 → 平滑从 baseline 起步），DiT 阶段用
+            "gate_init": 0.0,  # M5 world_gate 初值（tanh(0)=0 → 平滑从 baseline 起步），DiT 阶段用
             "world_dropout": 0.0,
             "include_context_in_world_memory": True,  # action memory 是否保留 Qwen 图文 context
             # 因果消融(plan §11，eval 时生效)：correct|off|zero|shuffled|wrong_task|gt
@@ -952,6 +1001,7 @@ class Qwen_GR00T(baseframework):
             WorldTokenAdapter,
             WorldTokenPooler,
         )
+
         drop = float(g["world_dropout"])
         # 子模块按 mode/signal 条件实例化（未用到的不建，省参数 + 避免 DDP unused-param；guided 分支另有 anchor 兜底）。
         self.world_adapter = None
@@ -962,23 +1012,30 @@ class Qwen_GR00T(baseframework):
             if mode == "qformer":
                 # M3：压缩空间 DINO tokens → n_world_tokens（不需要 adapter）。
                 self.world_qformer = WorldQFormer(
-                    in_dim=world_in_dim, out_dim=d_model, n_query=int(g["n_world_tokens"]),
-                    num_layers=int(g["qformer_layers"]), num_heads=int(g["qformer_heads"]), dropout=drop,
+                    in_dim=world_in_dim,
+                    out_dim=d_model,
+                    n_query=int(g["n_world_tokens"]),
+                    num_layers=int(g["qformer_layers"]),
+                    num_heads=int(g["qformer_heads"]),
+                    dropout=drop,
                 )
             elif mode == "sa_fusion":
                 # M2：对 [h_act; h_future] 轻量 SA（都在 d_model，不需要 adapter）。
                 self.world_fusion = CompactSAFusion(
-                    dim=d_model, num_layers=int(g["fusion_layers"]), num_heads=int(g["fusion_heads"]), dropout=drop,
+                    dim=d_model,
+                    num_layers=int(g["fusion_layers"]),
+                    num_heads=int(g["fusion_heads"]),
+                    dropout=drop,
                 )
             else:
                 # concat / adaln / dual_xattn / dual_xattn_adaln / alternate_xattn：投影 world 信号到 d_model。
                 self.world_adapter = WorldTokenAdapter(in_dim=world_in_dim, out_dim=d_model, dropout=drop)
             if mode in ("adaln", "dual_xattn_adaln"):
                 self.world_pooler = WorldTokenPooler(dim=d_model, out_dim=d_model, num_heads=int(g["pooler_heads"]))
-        # world head 预测时的默认 token 数（无 GT 兜底，如 live eval）：DINO patch 数 = (image/patch)^2。
-        _img = int(self.config.framework.dino.get("image_size", 224))
-        _pch = int(self.config.framework.dino.get("patch_size", 16))
-        self._wam_world_n = (_img // _pch) ** 2
+        # world head 预测时的默认 token 数（无 GT 兜底，如 live eval）：H/P * W/P。
+        self._wam_world_n = dino_num_patches(
+            self._jointflow_dino_spec["image_size"], self._jointflow_dino_spec["patch_size"]
+        )
         # dual_query：注册独立 future 占位 token（与 act 占位 <ACT_PH> 区分），便于一个 forward 取两组 query。
         self.wam_future_ph = None
         self.wam_future_ph_id = None
@@ -990,10 +1047,17 @@ class Qwen_GR00T(baseframework):
             self.qwen_vl_interface.model.resize_token_embeddings(len(tok))
         logger.info(
             "WAM guidance ON: mode=%s signal=%s prompt=%s bridge=%s detach_world=%s (adapter=%s qformer=%s fusion=%s pooler=%s)",
-            mode, signal, g["prompt_mode"], g["bridge_source"], g["detach_world"],
-            self.world_adapter is not None, self.world_qformer is not None,
-            self.world_fusion is not None, self.world_pooler is not None,
+            mode,
+            signal,
+            g["prompt_mode"],
+            g["bridge_source"],
+            g["detach_world"],
+            self.world_adapter is not None,
+            self.world_qformer is not None,
+            self.world_fusion is not None,
+            self.world_pooler is not None,
         )
+
     #######
 
     @staticmethod
@@ -1012,6 +1076,15 @@ class Qwen_GR00T(baseframework):
         views = [to_pil_preserve(v) for v in cur]
         fut = self._wam_view_list(ex.get("image_1"))
         future_main = to_pil_preserve(fut[0]) if fut else None
+        # Native LeRobot samples are resized to 224x224 in _pack_sample, but the JointFlow/WAM
+        # loader returns raw RoboTwin frames (480x640). Honor the same obs_image_size here so
+        # training and deployment use identical resolution and Qwen does not tokenize raw frames.
+        target_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
+        if target_size:
+            target_size = tuple(int(v) for v in target_size)
+            views = [view if view.size == target_size else view.resize(target_size) for view in views]
+            if future_main is not None and future_main.size != target_size:
+                future_main = future_main.resize(target_size)
         return views, future_main
 
     # 中文注释：task-aware Qwen 原生视觉 prompt（每个任务只放它自己需要的 query 占位）：
@@ -1049,8 +1122,12 @@ class Qwen_GR00T(baseframework):
         proc.tokenizer.padding_side = "left"
         try:
             inputs = proc.apply_chat_template(
-                messages, tokenize=True, padding=True, add_generation_prompt=True,
-                return_dict=True, return_tensors="pt",
+                messages,
+                tokenize=True,
+                padding=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
             )
         finally:
             proc.tokenizer.padding_side = old
@@ -1058,13 +1135,37 @@ class Qwen_GR00T(baseframework):
         ph_mask = inputs["input_ids"] == self.wam_ph_id  # 本任务唯一占位组 = query 位置
         return inputs, ph_mask
 
+    def _wam_qwen_hidden(self, inputs) -> torch.Tensor:
+        """Run the multimodal backbone without the unused language-model head."""
+        full_model = self.qwen_vl_interface.model
+        backbone = getattr(full_model, "model", None)
+        if backbone is not None and backbone is not full_model:
+            outputs = backbone(
+                **inputs,
+                output_hidden_states=False,
+                return_dict=True,
+                use_cache=False,
+            )
+            hidden = getattr(outputs, "last_hidden_state", None)
+            return hidden if hidden is not None else outputs[0]
+
+        # Compatibility fallback for VLM wrappers that do not expose their
+        # backbone. This preserves the previous behavior.
+        outputs = full_model(
+            **inputs,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
+        hidden_states = getattr(outputs, "hidden_states", None)
+        if hidden_states is None:
+            raise RuntimeError("WAM requires backbone hidden states, but the configured VLM did not return them")
+        return hidden_states[-1]
+
     def _wam_backbone(self, examples: List[dict], task: str = "policy"):
         inputs, ph_mask = self._build_wam_inputs(examples, task=task)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = self.qwen_vl_interface.model(
-                **inputs, output_hidden_states=True, return_dict=True, use_cache=False,
-            )
-        hidden = out.hidden_states[-1]
+            hidden = self._wam_qwen_hidden(inputs)
         bsz = len(examples)
         d = hidden.shape[-1]
         n_q = self.wam_n_act if str(task) in ("policy", "idm") else self.wam_n_flow
@@ -1087,7 +1188,68 @@ class Qwen_GR00T(baseframework):
         act_ones = torch.ones(h_act.shape[0], h_act.shape[1], device=mem.device, dtype=torch.bool)
         mem_mask = torch.cat([act_ones, keep.to(mem.device)], dim=1)
         return mem, mem_mask
+
     #######
+
+    def _wam_action_state_and_mask(self, examples: List[dict]):
+        state = self._stack_jointflow_field(examples, "state", required=False) if self._uses_action_state() else None
+        action_is_pad = self._stack_jointflow_field(examples, "action_is_pad", required=False)
+        if action_is_pad is not None:
+            action_is_pad = action_is_pad[:, -self.action_horizon :].to(dtype=torch.bool)
+        return state, action_is_pad
+
+    @staticmethod
+    def _repeat_wam_batch(value: torch.Tensor | None, repeats: int):
+        if value is None:
+            return None
+        return value.repeat(repeats, *([1] * (value.ndim - 1)))
+
+    def _wam_action_loss(
+        self,
+        mem: torch.Tensor,
+        actions: torch.Tensor,
+        state: torch.Tensor | None,
+        mem_mask: torch.Tensor | None,
+        action_is_pad: torch.Tensor | None,
+        *,
+        world_embs: torch.Tensor | None = None,
+        world_attention_mask: torch.Tensor | None = None,
+        world_global: torch.Tensor | None = None,
+        guidance_mode: str | None = None,
+    ) -> torch.Tensor:
+        """Call the WAM action head with native QwenGR00T loss semantics."""
+
+        repeats = int(self.config.framework.action_model.get("repeated_diffusion_steps", 4))
+        if repeats <= 0:
+            raise ValueError(f"repeated_diffusion_steps must be positive, got {repeats}")
+        kwargs = {
+            "encoder_attention_mask": self._repeat_wam_batch(mem_mask, repeats),
+            "action_is_pad": self._repeat_wam_batch(action_is_pad, repeats),
+        }
+        if world_embs is not None:
+            kwargs["world_embs"] = self._repeat_wam_batch(world_embs, repeats)
+            kwargs["world_attention_mask"] = self._repeat_wam_batch(world_attention_mask, repeats)
+        if world_global is not None:
+            kwargs["world_global"] = self._repeat_wam_batch(world_global, repeats)
+        if guidance_mode is not None:
+            kwargs["guidance_mode"] = guidance_mode
+        return self.action_model(
+            self._repeat_wam_batch(mem, repeats),
+            self._repeat_wam_batch(actions, repeats),
+            self._repeat_wam_batch(state, repeats),
+            **kwargs,
+        )
+
+    def _wam_visual_loss(self, cond: torch.Tensor, target: torch.Tensor, examples: List[dict]) -> torch.Tensor:
+        """Ignore episode-tail future targets while preserving loss scale."""
+
+        valid = self._stack_jointflow_field(examples, "future_valid", required=False)
+        weights = None
+        if valid is not None:
+            valid = valid.reshape(valid.shape[0], -1)[:, 0].clamp_(0.0, 1.0)
+            normalizer = valid.new_tensor(float(valid.shape[0])) / valid.sum().clamp_min(1.0)
+            weights = (valid * normalizer)[:, None].expand(-1, target.shape[1])
+        return self.wam_visual_head(cond, target, weights=weights)
 
     #######
     # 中文注释：wam 多任务每步只跑一个 task，未用到的子模块（DINO 头/act_ctx 或 action head）拿不到梯度 →
@@ -1104,19 +1266,77 @@ class Qwen_GR00T(baseframework):
         else:
             modules = []
         return self._zero_grad_anchor_for_modules(modules, ref)
+
     #######
 
     #######
     # 中文注释：WAM 世界模型 target 取法——优先用数据集预存的 DINO latent（dino_target_latents 开时数据集会
-    # 在线出 raw 图的同时附带 dino_0/dino_1），没有再在线抽（兜底）。这样存了 latent 就省掉每步在线 DINO；
-    # LIBERO/RobotWin/以后任何数据集统一这套，存没存 latent 都能跑。取第 0 个 view（cam_high）与在线一致。
+    # 在线出 raw 图的同时附带 dino_0/dino_1）。普通配置缺失时仍可在线抽取；严格预计算配置则立即报错，
+    # 防止集群 latent 路径/字段配置错后悄悄加载 DINO backbone，改变速度、显存和监督来源。
     def _wam_dino_target(self, examples: List[dict], precomp_key: str, online_keys: list[str]) -> torch.Tensor:
+        datasets_cfg = getattr(self.config, "datasets", None)
+        vla_cfg = getattr(datasets_cfg, "vla_data", None) if datasets_cfg is not None else None
+        strict_precomputed = (
+            bool(vla_cfg.get("require_precomputed_dino_targets", False)) if vla_cfg is not None else False
+        )
+        configured_views_raw = vla_cfg.get("dino_target_view_keys", []) if vla_cfg is not None else []
+        configured_views = (
+            [str(configured_views_raw)]
+            if isinstance(configured_views_raw, str)
+            else [str(key) for key in configured_views_raw]
+        )
         z = self._stack_jointflow_field(examples, precomp_key, required=False)
         if z is None:
+            if strict_precomputed:
+                raise RuntimeError(
+                    f"Missing required precomputed `{precomp_key}` DINO target. "
+                    "Online DINO fallback is disabled by require_precomputed_dino_targets=true."
+                )
             z = self._run_jointflow_dino_on_images(examples, online_keys, required=True)
         if z.ndim == 4:
-            z = z[:, 0]
+            sample_views = examples[0].get("dino_target_view_keys") or examples[0].get("dino_view_keys")
+            sample_views = [str(key) for key in sample_views] if sample_views else []
+            if sample_views and len(sample_views) != z.shape[1]:
+                raise ValueError(
+                    f"DINO target view metadata {sample_views} does not match tensor shape {tuple(z.shape)}."
+                )
+            if strict_precomputed and configured_views:
+                if sample_views != configured_views:
+                    raise ValueError(
+                        f"Precomputed DINO target views {sample_views} != configured views {configured_views}."
+                    )
+                if z.shape[1] != len(configured_views):
+                    raise ValueError(
+                        f"Precomputed DINO target has {z.shape[1]} views; expected {len(configured_views)}."
+                    )
+            preferred = list(self.config.framework.dino.get("future_view_keys", []))
+            chosen = 0
+            if sample_views:
+                matched = next((key for key in preferred if key in sample_views), None)
+                if matched is not None:
+                    chosen = sample_views.index(matched)
+                elif strict_precomputed and preferred:
+                    raise ValueError(
+                        f"None of framework.dino.future_view_keys={preferred} is present in target views {sample_views}."
+                    )
+            z = z[:, chosen]
+        elif z.ndim != 3:
+            raise ValueError(f"Expected DINO target [B,V,N,D] or [B,N,D], got {tuple(z.shape)}")
+        expected_tokens = dino_num_patches(
+            self._jointflow_dino_spec["image_size"], self._jointflow_dino_spec["patch_size"]
+        )
+        if strict_precomputed and z.shape[1] != expected_tokens:
+            raise ValueError(
+                f"Precomputed DINO target has {z.shape[1]} tokens; expected one image/composite grid "
+                f"with {expected_tokens} tokens."
+            )
+        if z.shape[-1] != self.d_dino:
+            raise ValueError(
+                f"DINO target dim {z.shape[-1]} != configured encoder dim {self.d_dino} "
+                f"({self._jointflow_dino_spec['name']})."
+            )
         return z
+
     #######
 
     # 中文注释：WAM 四范式前向（每步一种，由 trainer 按 tasks.weights 广播采样）：
@@ -1136,12 +1356,18 @@ class Qwen_GR00T(baseframework):
         if task in ("policy", "idm"):
             actions = self._stack_jointflow_field(examples, "action", required=True)
             actions = actions[:, -self.action_horizon :, : self.action_dim].float()
-            state = self._stack_jointflow_field(examples, "state", required=False) if self._uses_action_state() else None
+            state, action_is_pad = self._wam_action_state_and_mask(examples)
             #######
             # 中文注释：action 条件 = act-query ⊕ 图文 hidden（屏蔽 raw 占位，见 _wam_action_memory）。
             mem, mem_mask = self._wam_action_memory(h_query, hidden, attn, ph_mask)
             hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
-            loss = self.action_model(mem.to(hd), actions.to(hd), state, encoder_attention_mask=mem_mask)
+            loss = self._wam_action_loss(
+                mem.to(hd),
+                actions.to(hd),
+                state.to(hd) if state is not None else None,
+                mem_mask,
+                action_is_pad,
+            )
             #######
             return {("action_loss" if task == "policy" else "idm_loss"): loss + self._wam_unused_anchor(task, loss)}
         # passive / fdm：flow-query → 预测未来帧 DINO；fdm 额外把 act_ctx(动作) 拼进 cross-attn 条件。
@@ -1170,7 +1396,7 @@ class Qwen_GR00T(baseframework):
         # 中文注释：拆出 raw（视觉头原始 MSE）与 weighted（× dino_loss_weight，= 实际反传的）两份，
         # 供 trainer 分别记录 loss_<task>_raw / loss_<task>_weighted。raw 仅作日志（detach，不进反传）；
         # backward 只用 weighted（key 以 _loss 结尾才会被 total_loss = sum(*_loss) 计入，raw 以 _loss_raw 结尾不计入）。
-        raw_dino = self.wam_visual_head(cond.to(vh), z_gt)
+        raw_dino = self._wam_visual_loss(cond.to(vh), z_gt, examples)
         loss = self.wam_dino_loss_weight * raw_dino
         return {
             f"{task}_loss": loss + self._wam_unused_anchor(task, loss),
@@ -1193,9 +1419,15 @@ class Qwen_GR00T(baseframework):
         h_act, hidden, attn, ph_mask = self._wam_backbone(examples, task="policy")
         mem, mem_mask = self._wam_action_memory(h_act, hidden, attn, ph_mask)
         head_dtype = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
-        pred = self.action_model.predict_action(mem.to(head_dtype), state=None, encoder_attention_mask=mem_mask)
+        state, _ = self._wam_action_state_and_mask(examples)
+        pred = self.action_model.predict_action(
+            mem.to(head_dtype),
+            state=state.to(head_dtype) if state is not None else None,
+            encoder_attention_mask=mem_mask,
+        )
         #######
         return {"normalized_actions": pred.float().detach().cpu().numpy()}
+
     #######
 
     #######################################################################
@@ -1238,8 +1470,12 @@ class Qwen_GR00T(baseframework):
         proc.tokenizer.padding_side = "left"
         try:
             inputs = proc.apply_chat_template(
-                messages, tokenize=True, padding=True, add_generation_prompt=True,
-                return_dict=True, return_tensors="pt",
+                messages,
+                tokenize=True,
+                padding=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
             )
         finally:
             proc.tokenizer.padding_side = old
@@ -1252,10 +1488,7 @@ class Qwen_GR00T(baseframework):
         """跑 Qwen，取 h_act[B,n_act,D] 与 h_future[B,n_flow,D]，并返回完整 hidden/padding/占位 mask。"""
         inputs, act_mask, fut_mask = self._build_wam_guided_inputs(examples, task=task)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out = self.qwen_vl_interface.model(
-                **inputs, output_hidden_states=True, return_dict=True, use_cache=False,
-            )
-        hidden = out.hidden_states[-1]
+            hidden = self._wam_qwen_hidden(inputs)
         bsz = len(examples)
         d = hidden.shape[-1]
         h_act = hidden[act_mask].view(bsz, self.wam_n_act, d)
@@ -1306,11 +1539,23 @@ class Qwen_GR00T(baseframework):
                 try:
                     oracle = self._wam_world_target(examples)
                 except Exception:
+                    datasets_cfg = getattr(self.config, "datasets", None)
+                    vla_cfg = getattr(datasets_cfg, "vla_data", None) if datasets_cfg is not None else None
+                    strict_precomputed = (
+                        bool(vla_cfg.get("require_precomputed_dino_targets", False)) if vla_cfg is not None else False
+                    )
+                    # Missing future GT is expected during live evaluation, where the
+                    # causal predicted world signal is used. During training, strict
+                    # precomputed mode must expose every latent/view/shape error.
+                    if self.training and strict_precomputed:
+                        raise
                     oracle = None
             # predicted：world head 以 h_future 为条件，flow 采样未来 DINO 潜变量。
             predicted = None
-            need_pred = (not self._wam_signal_is_oracle) and em != "gt" and (
-                bridge in ("predicted", "scheduled") or oracle is None
+            need_pred = (
+                (not self._wam_signal_is_oracle)
+                and em != "gt"
+                and (bridge in ("predicted", "scheduled") or oracle is None)
             )
             if need_pred:
                 n_v = oracle.shape[1] if oracle is not None else int(self._wam_world_n)
@@ -1411,6 +1656,7 @@ class Qwen_GR00T(baseframework):
             pd = self._jointflow_module_dtype(self.world_pooler, fallback=world_tokens.dtype)
             world_global = self.world_pooler(world_tokens.to(pd)).to(h_act.dtype)
         return mem, mem_mask, world_embs, world_mask, world_global
+
     #######
 
     def _wam_guided_unused_anchor(self, task: str, ref: torch.Tensor) -> torch.Tensor:
@@ -1442,11 +1688,7 @@ class Qwen_GR00T(baseframework):
                 # world head 仅在 e2e(detach_world=false) 时由 action loss 真正受梯度；detach_world=true 下
                 # predict_latent 在 no_grad 里跑、输出 detach → world head 本步无梯度 → 需 anchor 兜底
                 # （它由 passive/fdm 步监督）。oracle 信号根本不跑 world head。
-                if (
-                    self._wam_signal_is_latent
-                    and not self._wam_signal_is_oracle
-                    and not bool(g["detach_world"])
-                ):
+                if self._wam_signal_is_latent and not self._wam_signal_is_oracle and not bool(g["detach_world"]):
                     used.add("visual")
         else:  # passive / fdm
             used.add("visual")
@@ -1462,14 +1704,18 @@ class Qwen_GR00T(baseframework):
         if task in ("policy", "idm"):
             actions = self._stack_jointflow_field(examples, "action", required=True)
             actions = actions[:, -self.action_horizon :, : self.action_dim].float()
-            state = self._stack_jointflow_field(examples, "state", required=False) if self._uses_action_state() else None
+            state, action_is_pad = self._wam_action_state_and_mask(examples)
             world_tokens = self._build_world_signal(h_future, examples)
             mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
                 mode, h_act, h_future, hidden, attn, ph_mask, world_tokens
             )
             hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
-            loss = self.action_model(
-                mem.to(hd), actions.to(hd), state, encoder_attention_mask=mem_mask,
+            loss = self._wam_action_loss(
+                mem.to(hd),
+                actions.to(hd),
+                state.to(hd) if state is not None else None,
+                mem_mask,
+                action_is_pad,
                 world_embs=(w_embs.to(hd) if w_embs is not None else None),
                 world_attention_mask=w_mask,
                 world_global=(w_global.to(hd) if w_global is not None else None),
@@ -1487,7 +1733,7 @@ class Qwen_GR00T(baseframework):
             actx = self.wam_act_ctx(a.to(ad)).to(h_future.dtype)
             cond = torch.cat([h_future, actx], dim=1)
         vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=cond.dtype)
-        raw = self.wam_visual_head(cond.to(vh), z_gt)
+        raw = self._wam_visual_loss(cond.to(vh), z_gt, examples)
         loss = self.wam_dino_loss_weight * raw
         return {
             f"{task}_loss": loss + self._wam_guided_unused_anchor(task, loss),
@@ -1506,14 +1752,18 @@ class Qwen_GR00T(baseframework):
             mode, h_act, h_future, hidden, attn, ph_mask, world_tokens
         )
         hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
+        state, _ = self._wam_action_state_and_mask(examples)
         pred = self.action_model.predict_action(
-            mem.to(hd), state=None, encoder_attention_mask=mem_mask,
+            mem.to(hd),
+            state=state.to(hd) if state is not None else None,
+            encoder_attention_mask=mem_mask,
             world_embs=(w_embs.to(hd) if w_embs is not None else None),
             world_attention_mask=w_mask,
             world_global=(w_global.to(hd) if w_global is not None else None),
             guidance_mode=mode,
         )
         return {"normalized_actions": pred.float().detach().cpu().numpy()}
+
     #######################################################################
 
     def forward(
@@ -1535,6 +1785,11 @@ class Qwen_GR00T(baseframework):
         actions = [example["action"] for example in examples]  # label [B， len, 7]
 
         state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+        action_is_pad = (
+            [example["action_is_pad"] for example in examples]
+            if all("action_is_pad" in example for example in examples)
+            else None
+        )
 
         # Step 1: QWenVL input format
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
@@ -1555,6 +1810,11 @@ class Qwen_GR00T(baseframework):
                 np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
             )  # [B, T_full, action_dim]
             actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
+            action_is_pad_target = None
+            if action_is_pad is not None:
+                action_is_pad_target = torch.as_tensor(
+                    np.asarray(action_is_pad), device=last_hidden.device, dtype=torch.bool
+                )[:, -self.action_horizon :]
 
             repeated_diffusion_steps = (
                 self.config.framework.action_model.get("repeated_diffusion_steps", 4)
@@ -1562,6 +1822,9 @@ class Qwen_GR00T(baseframework):
                 else 4
             )
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
+            action_is_pad_repeated = (
+                action_is_pad_target.repeat(repeated_diffusion_steps, 1) if action_is_pad_target is not None else None
+            )
             last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
             if backbone_attention_mask is not None:
                 backbone_attention_mask = backbone_attention_mask.repeat(repeated_diffusion_steps, 1).to(
@@ -1574,8 +1837,11 @@ class Qwen_GR00T(baseframework):
                 state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
 
             action_loss = self.action_model(
-                last_hidden_repeated, actions_target_repeated, state_repeated,
+                last_hidden_repeated,
+                actions_target_repeated,
+                state_repeated,
                 encoder_attention_mask=backbone_attention_mask,
+                action_is_pad=action_is_pad_repeated,
             )  # (B, chunk_len, action_dim)
 
         return {"action_loss": action_loss}

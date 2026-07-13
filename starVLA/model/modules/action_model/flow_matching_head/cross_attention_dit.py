@@ -26,6 +26,7 @@ from diffusers.models.embeddings import (
     Timesteps,
 )
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 class TimestepEncoder(nn.Module):
@@ -383,8 +384,7 @@ class DiT(ModelMixin, ConfigMixin):
         cross_count = 0  # 中文注释：cross block 计数（M4 交替路由用）
         for idx, block in enumerate(self.transformer_blocks):
             if idx % 2 == 1 and self.config.interleave_self_attention:
-                hidden_states = block(
-                    hidden_states,
+                block_kwargs = dict(
                     attention_mask=None,
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
@@ -400,8 +400,7 @@ class DiT(ModelMixin, ConfigMixin):
                 elif world_mode == "dual" and world_hidden_states is not None:
                     # M5/M6+：并联 gated world cross-attn
                     w_hs, w_mask = world_hidden_states, world_attention_mask
-                hidden_states = block(
-                    hidden_states,
+                block_kwargs = dict(
                     attention_mask=None,
                     encoder_hidden_states=enc,
                     encoder_attention_mask=enc_mask,
@@ -410,6 +409,10 @@ class DiT(ModelMixin, ConfigMixin):
                     world_attention_mask=w_mask,
                 )
                 cross_count += 1
+            if self.training and self.gradient_checkpointing and not return_all_hidden_states:
+                hidden_states = checkpoint(block, hidden_states, use_reentrant=False, **block_kwargs)
+            else:
+                hidden_states = block(hidden_states, **block_kwargs)
             all_hidden_states.append(hidden_states)
 
         # Output processing

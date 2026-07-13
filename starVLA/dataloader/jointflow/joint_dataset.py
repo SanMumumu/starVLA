@@ -19,15 +19,16 @@ from typing import Any
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from PIL import Image
 from torch.utils.data import DataLoader
 
-from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset, LeRobotSingleDataset, ModalityConfig
 from starVLA.dataloader.action_correlation import compute_action_noise_matrix
-from starVLA.dataloader.gr00t_lerobot.registry import ROBOT_TYPE_CONFIG_MAP, EmbodimentTag
+from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset, LeRobotSingleDataset, ModalityConfig
+from starVLA.dataloader.gr00t_lerobot.registry import EmbodimentTag, ROBOT_TYPE_CONFIG_MAP
 from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionToTensor, StateActionTransform
-from starVLA.dataloader.lerobot_datasets import collate_fn
 from starVLA.dataloader.jointflow.mix_registry import resolve_data_mix
+from starVLA.dataloader.lerobot_datasets import collate_fn
 
 
 ######### // code // ##########
@@ -48,6 +49,21 @@ def _cfg_get(cfg, key: str, default=None):
 
 def _safe_view_name(key: str) -> str:
     return str(key).replace("/", "__").replace(".", "_")
+
+
+def _configured_dino_target_view_keys(data_cfg) -> list[str] | None:
+    """Return the explicitly configured latent-target views, preserving order."""
+    raw = _cfg_get(data_cfg, "dino_target_view_keys", None)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    keys = [str(key) for key in raw]
+    if not keys:
+        raise ValueError("dino_target_view_keys must contain at least one view when configured.")
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"dino_target_view_keys contains duplicate views: {keys}")
+    return keys
 
 
 def _view_original_key(dataset: LeRobotSingleDataset, video_key: str) -> str:
@@ -98,13 +114,16 @@ def _drop_video_transforms(base_transforms):
 
     base_transforms.transforms = kept
     return base_transforms
+
+
 ######### // code // ##########
 
 
 ######### // code // ##########
 # 中文注释：JointFlow 数据集子类。
-# 在线模式（online_dino=True，默认）：返回原始图像 image_0=s_t / image_1=s_{t+stride}（[V,H,W,C] uint8），
-#   DINO 在模型 forward 内部在线提特征（见 framework）。视频解码在 worker 里完成，不在 worker 跑 DINO。
+# RGB 模式（历史字段 online_dino=True，默认）：返回原始图像 image_0=s_t，并按需返回 image_1=s_{t+stride}
+#   （[V,H,W,C] uint8）。dino_target_latents=True 时，DINO target 仍从磁盘预计算 latent 读取，模型不在线编码 target；
+#   只有样本没有预计算 latent 且未启用 strict 时，framework 才会在线提取 DINO。视频解码在 worker 里完成。
 # 离线模式（online_dino=False）：保留旧逻辑，读取离线 DINOv3 特征 dino_0/dino_1 [V,N_v,D]（已按 stats 标准化）。
 # 两种模式都返回 action [H_a,7]，state [1,state_dim]，lang str。
 class JointLiberoDataset(LeRobotSingleDataset):
@@ -136,6 +155,10 @@ class JointLiberoDataset(LeRobotSingleDataset):
         self._last_trajectory_id = None
         self._last_base_index = None
         self._last_video_frames = None
+        data_cfg = kwargs.get("data_cfg")
+        self._action_pack_dtype = np.dtype(str(_cfg_get(data_cfg, "action_pack_dtype", "float32")))
+        if self._action_pack_dtype not in {np.dtype("float16"), np.dtype("float32")}:
+            raise ValueError(f"action_pack_dtype must be float16 or float32, got {self._action_pack_dtype}")
         super().__init__(*args, **kwargs)
 
     @property
@@ -216,11 +239,19 @@ class JointLiberoDataset(LeRobotSingleDataset):
                 raise FileNotFoundError(f"Missing DINOv3 latent episode file: {path}")
             path = matches[0]
 
-        obj = torch.load(path, map_location="cpu")
+        # Episode files contain hundreds of bf16 frames while each sample consumes one.
+        # mmap avoids eagerly reading the whole tensor from shared storage; fall back for
+        # older PyTorch/filesystems that do not support mmap or weights_only.
+        try:
+            obj = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        except (TypeError, RuntimeError, ValueError):
+            try:
+                obj = torch.load(path, map_location="cpu", weights_only=True)
+            except TypeError:
+                obj = torch.load(path, map_location="cpu")
         latent = obj["latent"] if isinstance(obj, dict) else obj
         if not torch.is_tensor(latent):
             latent = torch.as_tensor(latent)
-        latent = latent.float()
 
         if latent.ndim == 2:
             if isinstance(obj, dict):
@@ -237,9 +268,7 @@ class JointLiberoDataset(LeRobotSingleDataset):
                 raise ValueError(f"Cannot infer latent shape for {path}; got {tuple(latent.shape)}")
             latent = latent.reshape(num_frames, num_tokens, latent.shape[-1])
         elif latent.ndim != 3:
-            raise ValueError(
-                f"Expected latent [T,N,D] or flattened [T*N,D] in {path}, got {tuple(latent.shape)}"
-            )
+            raise ValueError(f"Expected latent [T,N,D] or flattened [T*N,D] in {path}, got {tuple(latent.shape)}")
 
         if self._dino_episode_cache_size > 0:
             self._episode_latent_cache[cache_key] = latent
@@ -258,13 +287,71 @@ class JointLiberoDataset(LeRobotSingleDataset):
         return int(starts[traj_pos]) + frame_index
 
     def _dino_target_view_indices(self) -> "list[int] | None":
-        """中文注释：latent target 只读部分视角（config: datasets.vla_data.dino_target_latent_views，如 [0]=cam_high）。
-        None=全读（兼容旧行为）。WAM 世界模型 target 只用 view 0（QwenGR00T._wam_dino_target 取 z[:,0]），
-        读全部视角纯属浪费 bucket I/O 与 worker 内存（每视角=整个 episode 的 fp32 latent）。"""
-        views = _cfg_get(self.data_cfg, "dino_target_latent_views", None)
-        if views is None:
+        """Resolve target views against the latent store, preferring stable camera names.
+
+        ``dino_target_view_keys`` is the canonical interface (for example
+        ``["video.cam_high"]``). ``dino_target_latent_views`` remains as a legacy
+        index-based alias. Reading only selected views avoids loading an entire wrist-camera
+        episode latent that the WAM target never consumes.
+        """
+        canonical_keys = list(self.modality_keys.get("video", []))
+        original_keys = self._original_view_keys()
+        requested_keys = _configured_dino_target_view_keys(self.data_cfg)
+        legacy_views = _cfg_get(self.data_cfg, "dino_target_latent_views", None)
+
+        if requested_keys is not None:
+            view_ids = []
+            for requested in requested_keys:
+                if requested in canonical_keys:
+                    canonical_idx = canonical_keys.index(requested)
+                    original_key = _view_original_key(self, requested)
+                    if original_key in original_keys:
+                        view_idx = original_keys.index(original_key)
+                    elif len(original_keys) == len(canonical_keys):
+                        # Older stores do not always record canonical-to-original names,
+                        # but preserve the dataset camera order.
+                        view_idx = canonical_idx
+                    else:
+                        raise ValueError(
+                            f"Cannot map DINO target view {requested!r} to latent store views {original_keys}."
+                        )
+                elif requested in original_keys:
+                    view_idx = original_keys.index(requested)
+                else:
+                    raise ValueError(
+                        f"Unknown DINO target view {requested!r}; dataset views={canonical_keys}, "
+                        f"latent store views={original_keys}."
+                    )
+                view_ids.append(int(view_idx))
+
+            if legacy_views is not None:
+                legacy_ids = [int(view) for view in legacy_views]
+                if legacy_ids != view_ids:
+                    raise ValueError(
+                        "dino_target_view_keys and legacy dino_target_latent_views disagree: "
+                        f"resolved names={view_ids}, indices={legacy_ids}."
+                    )
+            return view_ids
+
+        if legacy_views is None:
             return None
-        return [int(v) for v in views]
+        view_ids = [int(view) for view in legacy_views]
+        invalid = [view for view in view_ids if view < 0 or view >= len(original_keys)]
+        if invalid:
+            raise ValueError(f"Invalid DINO target view indices {invalid}; latent store has {len(original_keys)} views.")
+        return view_ids
+
+    def _dino_target_view_keys(self) -> list[str]:
+        requested = _configured_dino_target_view_keys(self.data_cfg)
+        if requested is not None:
+            return requested
+        canonical_keys = list(self.modality_keys.get("video", []))
+        view_ids = self._dino_target_view_indices()
+        if view_ids is None:
+            return canonical_keys
+        return [
+            canonical_keys[idx] if idx < len(canonical_keys) else self._original_view_keys()[idx] for idx in view_ids
+        ]
 
     def _read_dino(self, trajectory_id: int, frame_index: int) -> np.ndarray:
         self._load_dino_store()
@@ -279,18 +366,24 @@ class JointLiberoDataset(LeRobotSingleDataset):
             for view_idx in view_ids:
                 latent = self._load_episode_view_latent(int(trajectory_id), view_idx)
                 safe_idx = int(np.clip(frame_index, 0, latent.shape[0] - 1))
-                per_view.append(latent[safe_idx].numpy())
+                # Convert only the selected frame, not the entire bf16 episode tensor.
+                per_view.append(latent[safe_idx].float().numpy())
             z = np.stack(per_view, axis=0).astype(np.float32)
         else:
             abs_idx = self._absolute_frame_index(trajectory_id, frame_index)
             z = np.asarray(self._dino_memmap[abs_idx], dtype=np.float32)
+            view_ids = self._dino_target_view_indices()
+            if view_ids is not None:
+                z = z[view_ids]
         mean = np.asarray(self._dino_stats["mean"], dtype=np.float32)
         std = np.asarray(self._dino_stats["std"], dtype=np.float32)
         std = np.maximum(std, 1e-6)
         return ((z - mean) / std).astype(np.float32)
 
     def _future_dino_stride(self) -> int:
-        action_horizon = int(_cfg_get(self.data_cfg, "action_horizon", _cfg_get(self.data_cfg, "future_action_window_size", 8)))
+        action_horizon = int(
+            _cfg_get(self.data_cfg, "action_horizon", _cfg_get(self.data_cfg, "future_action_window_size", 8))
+        )
         world_model_cfg = _cfg_get(self.data_cfg, "world_model", None)
         stride = _cfg_get(world_model_cfg, "future_stride", None)
         if stride is None:
@@ -350,7 +443,10 @@ class JointLiberoDataset(LeRobotSingleDataset):
         action = []
         for action_key in self.modality_keys["action"]:
             action.append(_to_numpy(data[action_key]))
-        action = np.concatenate(action, axis=1).astype(np.float32)
+        # Standard LeRobotSingleDataset packs normalized action labels as
+        # float16. WAM ablations can opt into the same label quantization while
+        # other JointFlow experiments retain their historical float32 default.
+        action = np.concatenate(action, axis=1).astype(self._action_pack_dtype, copy=False)
 
         future_index, future_steps, future_stride = self._future_dino_index(trajectory_id, base_index)
         sample = {
@@ -367,36 +463,51 @@ class JointLiberoDataset(LeRobotSingleDataset):
         }
 
         if self.online_dino:
-            # 中文注释：在线模式返回原始图像。image_0=当前帧（每个 view 第 0 帧），
-            # image_1=未来帧（每个 view 第 1 帧，即 s_{t+stride}；边界处 get_video 已 clip 到末帧）。
+            # 中文注释：在线模式返回原始图像。image_0=当前帧（每个 view 第 0 帧）。
+            # decode_future_video=true 时再返回 image_1=未来帧；纯 policy/passive WAM 使用预计算
+            # dino_1 监督，不消费未来 RGB，可关闭该项以省掉三路未来视频解码且不改变模型输入。
             # 形状 [V,H,W,C] uint8；view 顺序 = self.modality_keys["video"]（LIBERO: primary 在前）。
             view_keys = list(self.modality_keys.get("video", []))
             if self._last_video_frames is None:
                 raise RuntimeError("JointLiberoDataset(online) requires get_step_data to decode video first.")
             img0, img1 = [], []
+            target_size = _cfg_get(self.data_cfg, "obs_image_size", None)
+            target_size = tuple(int(v) for v in target_size) if target_size else None
             for key in view_keys:
-                frames = np.asarray(self._last_video_frames[key])  # [T,H,W,C], T>=2
-                img0.append(frames[0])
-                img1.append(frames[min(1, frames.shape[0] - 1)])
+                frames = np.asarray(self._last_video_frames[key])  # [T,H,W,C]
+                current = Image.fromarray(frames[0])
+                if target_size and current.size != target_size:
+                    current = current.resize(target_size)
+                img0.append(np.asarray(current))
+                if bool(_cfg_get(self.data_cfg, "decode_future_video", True)):
+                    future = Image.fromarray(frames[min(1, frames.shape[0] - 1)])
+                    if target_size and future.size != target_size:
+                        future = future.resize(target_size)
+                    img1.append(np.asarray(future))
             sample["image_0"] = np.stack(img0, axis=0)
-            sample["image_1"] = np.stack(img1, axis=0)
+            if img1:
+                sample["image_1"] = np.stack(img1, axis=0)
+            sample["image_view_keys"] = view_keys
             sample["dino_view_keys"] = view_keys
             #######
             # 中文注释：hybrid——在线出 raw 图的同时,再读预存的 DINO latent（已按 store stats 标准化）当 target。
             # dino_0=当前帧(delta 用)、dino_1=未来帧。wam 优先用它当世界模型 target,省掉在线 DINO 抽取。
             if self._dino_target_latents:
-                sample["dino_0"] = self._read_dino(trajectory_id, base_index)
+                target_view_keys = self._dino_target_view_keys()
+                if bool(_cfg_get(self.data_cfg, "load_current_dino_target", True)):
+                    sample["dino_0"] = self._read_dino(trajectory_id, base_index)
                 sample["dino_1"] = self._read_dino(trajectory_id, future_index)
+                # Keep image and latent metadata separate: current policy RGB may have
+                # three cameras while the future DINO target intentionally has only one.
+                sample["dino_target_view_keys"] = target_view_keys
+                sample["dino_view_keys"] = target_view_keys
             #######
         else:
             # 中文注释：离线模式读取预计算 + 标准化后的 DINO 特征。
             sample["dino_0"] = self._read_dino(trajectory_id, base_index)
             sample["dino_1"] = self._read_dino(trajectory_id, future_index)
-            sample["dino_view_keys"] = (
-                list(self._dino_index.get("view_keys", self.modality_keys["video"]))
-                if self._dino_index
-                else list(self.modality_keys["video"])
-            )
+            sample["dino_target_view_keys"] = self._dino_target_view_keys()
+            sample["dino_view_keys"] = sample["dino_target_view_keys"]
 
         if self.data_cfg is not None and _cfg_get(self.data_cfg, "include_state", True) not in ["False", False]:
             state = []
@@ -414,6 +525,8 @@ class JointLiberoDataset(LeRobotSingleDataset):
             self._episode_latent_cache.clear()
         #######
         return sample
+
+
 ######### // code // ##########
 
 
@@ -440,13 +553,22 @@ def _make_joint_single_dataset(
         future_stride = _cfg_get(data_cfg, "future_dino_stride", action_horizon)
     future_stride = max(int(future_stride), 1)
     if "video" in modality_config:
-        # 中文注释：在线取未来帧用 stride；离线不解码视频，delta 取 [0,1] 仅占位无影响。
-        video_delta = [0, future_stride] if online_dino else [0, 1]
-        modality_config["video"] = ModalityConfig(delta_indices=video_delta, modality_keys=modality_config["video"].modality_keys)
+        # 中文注释：在线且任务需要未来 RGB 时取 [0,stride]；纯 policy/passive + 预计算 dino_1
+        # 可只取 [0]。离线模式不解码视频，delta 取 [0,1] 仅作兼容占位。
+        decode_future_video = bool(_cfg_get(data_cfg, "decode_future_video", True))
+        video_delta = ([0, future_stride] if decode_future_video else [0]) if online_dino else [0, 1]
+        modality_config["video"] = ModalityConfig(
+            delta_indices=video_delta,
+            modality_keys=modality_config["video"].modality_keys,
+        )
     if "language" in modality_config:
-        modality_config["language"] = ModalityConfig(delta_indices=[0], modality_keys=modality_config["language"].modality_keys)
+        modality_config["language"] = ModalityConfig(
+            delta_indices=[0], modality_keys=modality_config["language"].modality_keys
+        )
     if "state" in modality_config:
-        modality_config["state"] = ModalityConfig(delta_indices=[0], modality_keys=modality_config["state"].modality_keys)
+        modality_config["state"] = ModalityConfig(
+            delta_indices=[0], modality_keys=modality_config["state"].modality_keys
+        )
     if "action" in modality_config:
         modality_config["action"] = ModalityConfig(
             delta_indices=list(range(action_horizon)),
@@ -455,7 +577,8 @@ def _make_joint_single_dataset(
 
     transforms = _drop_video_transforms(data_config.transform())
     state_norm_modes = _cfg_get(data_cfg, "state_norm_modes", None)
-    transforms = _append_state_norm_if_needed(transforms, modality_config.get("state", ModalityConfig(delta_indices=[], modality_keys=[])).modality_keys, state_norm_modes)
+    state_config = modality_config.get("state", ModalityConfig(delta_indices=[], modality_keys=[]))
+    transforms = _append_state_norm_if_needed(transforms, state_config.modality_keys, state_norm_modes)
 
     embodiment_tag = getattr(data_config, "embodiment_tag", None) or EmbodimentTag.NEW_EMBODIMENT
     return JointLiberoDataset(
@@ -491,9 +614,174 @@ def _dataset_offline_latents_dim(dataset_path: Path, feature_dir: str) -> int | 
     try:
         with open(stats_path, "r", encoding="utf-8") as f:
             stats = json.load(f)
-        return int(len(stats.get("mean", [])))
+        mean = stats.get("mean", [])
+        std = stats.get("std", [])
+        if not mean or len(mean) != len(std):
+            return None
+        return int(len(mean))
     except Exception:
         return None
+
+
+def _inspect_precomputed_dino_store(
+    dataset_path: Path,
+    feature_dir: str,
+    target_view_keys: list[str],
+    expected_dim: int,
+    expected_tokens: int,
+) -> list[str]:
+    """Check store metadata and lightweight first/last-file sentinels without loading latent tensors."""
+    root = Path(dataset_path) / str(feature_dir)
+    dim = _dataset_offline_latents_dim(dataset_path, feature_dir)
+    if dim is None:
+        return [f"missing/invalid {feature_dir} DINO store"]
+
+    problems = []
+    if dim != expected_dim:
+        problems.append(f"stats dim {dim} != configured DINO dim {expected_dim}")
+
+    # Legacy memmap stores have no per-view episode files. Their shape and stats
+    # are validated above and their selected view axis is checked when sampled.
+    index_path = root / "dino_v3_index.json"
+    if not index_path.exists():
+        return problems
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            index = json.load(f)
+    except Exception as exc:
+        return problems + [f"cannot read dino_v3_index.json: {exc}"]
+
+    layout = index.get("layout", None)
+    if layout is not None and str(layout) != "lingbot_episode":
+        problems.append(f"unsupported index layout {layout!r}")
+    declared_root = index.get("root", None)
+    if declared_root is not None and Path(str(declared_root)).name != Path(feature_dir).name:
+        problems.append(f"index root {declared_root!r} != configured feature dir {feature_dir!r}")
+    feature_type = index.get("feature_type", None)
+    if feature_type is not None and str(feature_type) != "dinov3_patch_tokens":
+        problems.append(f"feature_type {feature_type!r} is not dinov3_patch_tokens")
+    if index.get("feature_dim", None) is not None and int(index["feature_dim"]) != expected_dim:
+        problems.append(f"index feature_dim {index['feature_dim']} != {expected_dim}")
+    if index.get("num_tokens", None) is not None and int(index["num_tokens"]) != expected_tokens:
+        problems.append(f"index num_tokens {index['num_tokens']} != {expected_tokens}")
+
+    view_keys = [str(key) for key in index.get("view_keys", [])]
+    original_view_keys = [str(key) for key in index.get("original_view_keys", [])]
+    if not view_keys or len(view_keys) != len(original_view_keys):
+        problems.append(
+            "index must contain aligned non-empty view_keys and original_view_keys "
+            f"(got {len(view_keys)} and {len(original_view_keys)})"
+        )
+        return problems
+
+    trajectory_ids = [int(value) for value in index.get("trajectory_ids", [])]
+    sentinel_ids = list(dict.fromkeys(trajectory_ids[:1] + trajectory_ids[-1:]))
+    for target_view in target_view_keys:
+        if target_view not in view_keys:
+            problems.append(f"target view {target_view!r} missing from index view_keys={view_keys}")
+            continue
+        original_view = original_view_keys[view_keys.index(target_view)]
+        if sentinel_ids:
+            for trajectory_id in sentinel_ids:
+                pattern = f"chunk-*/{original_view}/episode_{trajectory_id:06d}_0_*.pth"
+                if next(root.glob(pattern), None) is None:
+                    problems.append(f"missing target-view sentinel {pattern}")
+        elif next(root.glob(f"chunk-*/{original_view}/episode_*.pth"), None) is None:
+            problems.append(f"no episode files for target view {target_view!r} ({original_view})")
+    return problems
+
+
+def _validate_precomputed_dino_targets(cfg, mixture_spec) -> None:
+    """Fail before training unless every configured dataset has the requested latent store.
+
+    Validation work is sharded across distributed ranks so a 100-dataset RoboTwin mix
+    performs roughly two metadata reads per rank rather than 100 reads on every rank.
+    Individual episode files remain checked by ``_load_episode_view_latent`` when sampled.
+    """
+    vla_cfg = cfg.datasets.vla_data
+    if not bool(_cfg_get(vla_cfg, "require_precomputed_dino_targets", False)):
+        return
+    if not bool(_cfg_get(vla_cfg, "dino_target_latents", False)):
+        raise ValueError("require_precomputed_dino_targets=true requires dino_target_latents=true.")
+
+    target_view_keys = _configured_dino_target_view_keys(vla_cfg)
+    if target_view_keys is None:
+        raise ValueError(
+            "require_precomputed_dino_targets=true requires explicit dino_target_view_keys; "
+            "index-only target selection is not strict enough."
+        )
+
+    framework_cfg = getattr(cfg, "framework", None)
+    dino_cfg = getattr(framework_cfg, "dino", None) if framework_cfg is not None else None
+    if dino_cfg is None:
+        raise ValueError("Strict precomputed DINO targets require framework.dino configuration.")
+    from starVLA.model.framework.VLM4A.jointflow.dino_v3 import dino_num_patches, resolve_dino_spec
+
+    dino_spec = resolve_dino_spec(dino_cfg)
+    expected_dim = int(dino_spec["embed_dim"])
+    expected_tokens = dino_num_patches(dino_spec["image_size"], dino_spec["patch_size"])
+    feature_dir = str(_cfg_get(vla_cfg, "dino_feature_dir", "latents"))
+    root = Path(vla_cfg.data_root_dir)
+
+    # Check the requested canonical camera name against every embodiment in the mix.
+    view_problems = []
+    for robot_type in sorted({str(entry[2]) for entry in mixture_spec}):
+        data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
+        video_cfg = data_config.modality_config().get("video")
+        available = list(video_cfg.modality_keys) if video_cfg is not None else []
+        missing = [key for key in target_view_keys if key not in available]
+        if missing:
+            view_problems.append(f"robot_type={robot_type}: missing target views {missing}; available={available}")
+    if view_problems:
+        raise ValueError("Invalid precomputed DINO target view configuration: " + "; ".join(view_problems))
+
+    entries = []
+    seen = set()
+    for data_name, _weight, _robot_type in mixture_spec:
+        data_name = str(data_name)
+        if data_name not in seen:
+            seen.add(data_name)
+            entries.append(data_name)
+
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    rank = torch.distributed.get_rank() if distributed else 0
+    world_size = torch.distributed.get_world_size() if distributed else 1
+    local_problems = []
+    for index, data_name in enumerate(entries):
+        if index % world_size != rank:
+            continue
+        try:
+            store_problems = _inspect_precomputed_dino_store(
+                root / data_name,
+                feature_dir,
+                target_view_keys,
+                expected_dim,
+                expected_tokens,
+            )
+        except Exception as exc:
+            # Every rank must still reach all_gather_object; turn malformed metadata
+            # or filesystem errors into validation results instead of deadlocking peers.
+            store_problems = [f"inspection error ({type(exc).__name__}): {exc}"]
+        local_problems.extend(f"{data_name}: {problem}" for problem in store_problems)
+
+    if distributed:
+        gathered: list[list[str] | None] = [None] * world_size
+        torch.distributed.all_gather_object(gathered, local_problems)
+        problems = sorted(problem for rank_problems in gathered for problem in (rank_problems or []))
+    else:
+        problems = local_problems
+    if problems:
+        shown = "; ".join(problems[:8]) + (" ..." if len(problems) > 8 else "")
+        raise RuntimeError(
+            "Strict precomputed DINO target validation failed; online fallback is disabled. "
+            f"Expected tokens={expected_tokens}, dim={expected_dim}, views={target_view_keys}. {shown}"
+        )
+    if rank == 0:
+        print(
+            f"[jointflow] strict precomputed DINO targets verified: {len(entries)} stores, "
+            f"dir={feature_dir}, tokens={expected_tokens}, dim={expected_dim}, views={target_view_keys}",
+            flush=True,
+        )
 
 
 def _resolve_online_dino(cfg, mixture_spec) -> bool:
@@ -535,12 +823,42 @@ def _resolve_online_dino(cfg, mixture_spec) -> bool:
             flush=True,
         )
     return online
+
+
 ######### // code // ##########
 
 
+def _validate_io_shortcuts(cfg) -> None:
+    """Reject I/O shortcuts unless the configured WAM graph makes omitted fields unreachable."""
+    vla_cfg = cfg.datasets.vla_data
+    decode_future_video = bool(_cfg_get(vla_cfg, "decode_future_video", True))
+    load_current_dino = bool(_cfg_get(vla_cfg, "load_current_dino_target", True))
+    if decode_future_video and load_current_dino:
+        return
+
+    framework_cfg = getattr(cfg, "framework", None)
+    wam_cfg = getattr(framework_cfg, "wam", None) if framework_cfg is not None else None
+    wam_enabled = wam_cfg is not None and bool(wam_cfg.get("enabled", False))
+    tasks_cfg = getattr(framework_cfg, "tasks", None) if framework_cfg is not None else None
+    weights = tasks_cfg.get("weights", {}) if tasks_cfg is not None else {}
+
+    if not decode_future_video:
+        if not wam_enabled or float(weights.get("idm", 0.0)) > 0.0:
+            raise ValueError("decode_future_video=false is only valid for WAM training without the IDM task.")
+        if not bool(_cfg_get(vla_cfg, "dino_target_latents", False)):
+            raise ValueError("decode_future_video=false requires dino_target_latents=true for future supervision.")
+
+    if not load_current_dino:
+        world_target = str(wam_cfg.get("world_target", "absolute")).lower() if wam_enabled else ""
+        if not wam_enabled or world_target != "absolute":
+            raise ValueError("load_current_dino_target=false requires WAM world_target=absolute.")
+
+
 def build_joint_dataset(cfg, mode: str = "train") -> LeRobotMixtureDataset:
+    _validate_io_shortcuts(cfg)
     vla_cfg = cfg.datasets.vla_data
     mixture_spec = resolve_data_mix(vla_cfg.data_mix)
+    _validate_precomputed_dino_targets(cfg, mixture_spec)
     online_dino = _resolve_online_dino(cfg, mixture_spec)
     dataset_mixture = []
     seen = set()
@@ -579,6 +897,8 @@ def build_joint_dataloader(cfg, mode: str = "train") -> DataLoader:
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
     )
+
+
 ######### // code // ##########
 
 
@@ -594,26 +914,49 @@ def compute_action_correlation_cholesky(
 ) -> np.ndarray:
     """Estimate the correlated-noise Cholesky from action chunks.
 
-    中文注释：**只读 action，不解码视频**——按各子数据集步数比例随机取样，走子数据集的 `read_action_only`
-    （同 __getitem__ 的 transform，但跳过 PyAV 视频解码 + latent 读取）。这样在多机 bucket I/O 下 rank0 估计
-    只碰 parquet，避免逐样本视频解码挂起/超时（见 train_starvla 启动 barrier）。子数据集若无 `read_action_only`
-    （非 jointflow）则回退到全量 __getitem__。逐样本 try/except 跳过坏样本，单个坏轨迹不再拖垮启动。
+    中文注释：**只读 action，不解码视频**——严格复用 mixture 的 dataset_sampling_weights 与
+    trajectory_sampling_weights，再在选中轨迹内均匀取 step；因此 corrnoise 估计分布与实际训练采样一致。
+    JointFlow 子数据集走 `read_action_only`（同 __getitem__ transform，但跳过 PyAV + latent）；无该接口的
+    原生数据集回退到 mixture __getitem__。逐样本 try/except 跳过坏样本，单个坏轨迹不拖垮启动。
     """
     rng = np.random.default_rng(seed)
     datasets = list(getattr(mixture_dataset, "datasets", None) or [mixture_dataset])
-    lengths = np.array([max(int(len(d)), 1) for d in datasets], dtype=np.float64)
-    probs = lengths / lengths.sum()
+    dataset_probs = getattr(mixture_dataset, "dataset_sampling_weights", None)
+    if dataset_probs is None or len(dataset_probs) != len(datasets):
+        dataset_probs = np.ones(len(datasets), dtype=np.float64)
+    dataset_probs = np.asarray(dataset_probs, dtype=np.float64)
+    dataset_probs = dataset_probs / dataset_probs.sum()
+    mixture_trajectory_probs = getattr(mixture_dataset, "trajectory_sampling_weights", None)
     target = int(num_samples)
     rows: list[np.ndarray] = []
     tries = 0
     max_tries = max(target * 4, 16)
     while len(rows) < target and tries < max_tries:
         tries += 1
-        d = datasets[int(rng.choice(len(datasets), p=probs))]
+        dataset_index = int(rng.choice(len(datasets), p=dataset_probs))
+        d = datasets[dataset_index]
         try:
             if hasattr(d, "read_action_only"):
-                traj_id, base_index = d.all_steps[int(rng.integers(0, len(d)))]
-                a = d.read_action_only(int(traj_id), int(base_index))
+                data_cfg = getattr(d, "data_cfg", None)
+                direct_frames = (
+                    bool(data_cfg.get("fastwam_direct_frame_sampling", False)) if data_cfg is not None else False
+                )
+                if direct_frames:
+                    # Match FastWAM training's global-frame distribution: draw
+                    # uniformly from selected frames, then resolve episode/step.
+                    traj_id, base_index = d.all_steps[int(rng.integers(0, len(d)))]
+                    a = d.read_action_only(int(traj_id), int(base_index))
+                else:
+                    num_trajectories = len(d.trajectory_ids)
+                    if mixture_trajectory_probs is not None and dataset_index < len(mixture_trajectory_probs):
+                        trajectory_probs = np.asarray(mixture_trajectory_probs[dataset_index], dtype=np.float64)
+                    else:
+                        trajectory_probs = np.ones(num_trajectories, dtype=np.float64)
+                    trajectory_probs = trajectory_probs / trajectory_probs.sum()
+                    trajectory_index = int(rng.choice(num_trajectories, p=trajectory_probs))
+                    traj_id = int(d.trajectory_ids[trajectory_index])
+                    base_index = int(rng.integers(0, int(d.trajectory_lengths[trajectory_index])))
+                    a = d.read_action_only(int(traj_id), int(base_index))
             else:  # 回退：非 jointflow 数据集，走全量 __getitem__
                 a = mixture_dataset[int(rng.integers(0, len(mixture_dataset)))].get("action")
         except Exception:
@@ -631,6 +974,8 @@ def compute_action_correlation_cholesky(
     # 数值稳健：对角加微小抖动后 Cholesky
     L = np.linalg.cholesky(Sigma_reg + 1e-6 * np.eye(flat))
     return L.astype(np.float32)
+
+
 #######
 
 

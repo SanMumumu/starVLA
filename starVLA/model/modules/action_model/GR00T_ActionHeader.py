@@ -87,6 +87,21 @@ def action_prediction_to_velocity(
     return (prediction - noisy_trajectory) / (1 - t).clamp_min(t_eps)
 
 
+def _masked_action_mse(squared_error: torch.Tensor, action_is_pad: torch.Tensor | None) -> torch.Tensor:
+    """Match FastWAM's per-sample valid-timestep reduction."""
+    if action_is_pad is None:
+        return squared_error.mean()
+    if tuple(action_is_pad.shape) != tuple(squared_error.shape[:2]):
+        raise ValueError(
+            "action_is_pad must match squared_error's batch and horizon dimensions, "
+            f"got mask={tuple(action_is_pad.shape)} and error={tuple(squared_error.shape)}"
+        )
+    error_per_step = squared_error.mean(dim=-1)
+    valid = (~action_is_pad).to(device=squared_error.device, dtype=squared_error.dtype)
+    valid_per_sample = valid.sum(dim=1).clamp_min(1.0)
+    return ((error_per_step * valid).sum(dim=1) / valid_per_sample).mean()
+
+
 class ActionEncoder(nn.Module):
     def __init__(self, action_dim, hidden_size):
         super().__init__()
@@ -428,6 +443,7 @@ class FlowmatchingActionHead(nn.Module):
         actions: torch.Tensor,
         state: torch.Tensor = None,
         encoder_attention_mask=None,
+        action_is_pad: torch.Tensor = None,
         #######
         # 中文注释：World→Action guidance（M4/M5/M6+）的可选 world 条件。全 None/"none" 时与原 forward 完全一致。
         #   world_embs：world memory [B,N_w,cross_dim]（M4 alternate / M5,M6+ dual cross-attn）。
@@ -443,6 +459,13 @@ class FlowmatchingActionHead(nn.Module):
         actions: shape (B, action_horizon, action_dim)
         """
         device = vl_embs.device
+        if action_is_pad is not None:
+            action_is_pad = torch.as_tensor(action_is_pad, device=actions.device, dtype=torch.bool)
+            if tuple(action_is_pad.shape) != tuple(actions.shape[:2]):
+                raise ValueError(
+                    "action_is_pad must match actions' batch and horizon dimensions, "
+                    f"got mask={tuple(action_is_pad.shape)} and actions={tuple(actions.shape)}"
+                )
 
         #######
         # 中文注释：E1.3 multi-step Flow Matching——把 (vl_embs, actions, state) 沿 batch 复制 N 份，
@@ -455,6 +478,8 @@ class FlowmatchingActionHead(nn.Module):
                 state = state.repeat(n_fm, *([1] * (state.ndim - 1)))
             if encoder_attention_mask is not None and torch.is_tensor(encoder_attention_mask):
                 encoder_attention_mask = encoder_attention_mask.repeat(n_fm, *([1] * (encoder_attention_mask.ndim - 1)))
+            if action_is_pad is not None:
+                action_is_pad = action_is_pad.repeat(n_fm, 1)
             # world 条件同样复制 N 份，保持与 (vl_embs, actions) 对齐。
             if world_embs is not None:
                 world_embs = world_embs.repeat(n_fm, 1, 1)
@@ -524,8 +549,8 @@ class FlowmatchingActionHead(nn.Module):
             prediction_type=self.prediction_type,
             t_eps=self.jit_t_eps,
         )
-        loss = ((pred_velocity - velocity) ** 2).mean()
-        return loss
+        squared_error = (pred_velocity - velocity) ** 2
+        return _masked_action_mse(squared_error, action_is_pad)
 
     @torch.no_grad()
     def predict_action(

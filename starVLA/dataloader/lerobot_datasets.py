@@ -100,6 +100,26 @@ def get_vla_dataset(
         included_datasets.add(dataset_key)
         filtered_mixture_spec.append((d_name, d_weight, robot_type))
 
+    # FastWAM's published training recipe samples a seeded permutation of all
+    # selected global frames exactly once per epoch.  LeRobotMixtureDataset's
+    # index-hashed trajectory sampler samples with replacement and therefore
+    # changes that distribution even for a one-entry mixture.  Keep this path
+    # explicit and fail if somebody accidentally enables it for a real mix.
+    if bool(data_cfg.get("fastwam_direct_frame_sampling", False)):
+        if len(filtered_mixture_spec) != 1:
+            raise ValueError(
+                "fastwam_direct_frame_sampling requires exactly one dataset entry, "
+                f"got {len(filtered_mixture_spec)} in data_mix={data_mix!r}"
+            )
+        d_name, _d_weight, robot_type = filtered_mixture_spec[0]
+        return make_LeRobotSingleDataset(
+            Path(data_root_dir),
+            d_name,
+            robot_type,
+            delete_pause_frame=delete_pause_frame,
+            data_cfg=data_cfg,
+        )
+
     dataset_mixture = []
     for d_name, d_weight, robot_type in filtered_mixture_spec:
         dataset_mixture.append((make_LeRobotSingleDataset(Path(data_root_dir), d_name, robot_type, delete_pause_frame=delete_pause_frame, data_cfg=data_cfg), d_weight))

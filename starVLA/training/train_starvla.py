@@ -232,6 +232,8 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
         )
 
+        self._configure_unused_param_anchors()
+
         #######
         # 中文注释：在 accelerator 包装后，从**未包装**模型构建梯度分组（shared/policy_head/world_model_head）。
         if self._log_grad_norms:
@@ -251,6 +253,38 @@ class VLATrainer(TrainerUtils):
         #######
 
         self._init_wandb()
+
+    def _configure_unused_param_anchors(self) -> None:
+        """Skip dense zero-gradient communication when ZeRO-2 can preserve the same optimizer update."""
+        requested = bool(self.config.trainer.get("deepspeed_skip_unused_param_anchors", False))
+        base_model = self.accelerator.unwrap_model(self.model)
+        setter = getattr(base_model, "set_unused_param_anchors_enabled", None)
+        if not requested or setter is None:
+            return
+
+        engine = self.model
+        stage_fn = getattr(engine, "zero_optimization_stage", None)
+        ignore_fn = getattr(engine, "zero_ignore_unused_parameters", None)
+        try:
+            zero_stage = int(stage_fn()) if callable(stage_fn) else -1
+            ignore_unused = bool(ignore_fn()) if callable(ignore_fn) else False
+        except (TypeError, ValueError):
+            zero_stage = -1
+            ignore_unused = False
+
+        safe_to_skip = self._using_deepspeed and zero_stage == 2 and ignore_unused
+        setter(not safe_to_skip)
+        if self.accelerator.is_main_process:
+            if safe_to_skip:
+                logger.info(
+                    "DeepSpeed ZeRO-2 unused-parameter optimization enabled: zero anchors and inactive-head "
+                    "gradient communication are skipped; ZeRO supplies zero optimizer gradients."
+                )
+            else:
+                logger.warning(
+                    "trainer.deepspeed_skip_unused_param_anchors=true requires DeepSpeed ZeRO-2 with "
+                    "ignore_unused_parameters=true; retaining conservative zero anchors."
+                )
 
     def _calculate_total_batch_size(self):
         """Calculate global batch size."""
@@ -514,6 +548,9 @@ class VLATrainer(TrainerUtils):
             t_start_model = time.perf_counter()
             step_metrics = self._train_step(batch_vla)
             t_end_model = time.perf_counter()
+            data_elapsed = t_end_data - t_start_data
+            model_elapsed = t_end_model - t_start_model
+            task_name = str(self._jointflow_cur_task or "action")
 
             if self.accelerator.sync_gradients:
                 progress_bar.update(1)
@@ -522,16 +559,19 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.is_local_main_process:
                 progress_bar.set_postfix(
                     {
-                        "data_times": f"{t_end_data - t_start_data:.3f}",
-                        "model_times": f"{t_end_model - t_start_model:.3f}",
+                        "rank": self.accelerator.process_index,
+                        "task": task_name,
+                        "data_times": f"{data_elapsed:.3f}",
+                        "model_times": f"{model_elapsed:.3f}",
                     }
                 )
 
             if self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
 
-            step_metrics["timing/data"] = t_end_data - t_start_data
-            step_metrics["timing/model"] = t_end_model - t_start_model
+            step_metrics["timing/data"] = data_elapsed
+            step_metrics["timing/model"] = model_elapsed
+            step_metrics[f"timing/model_{task_name}"] = model_elapsed
             self._log_metrics(step_metrics)
 
             if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
@@ -724,37 +764,74 @@ def main(cfg) -> None:
         # → 落盘 → barrier → 所有 rank 从盘读。已有缓存直接加载，免重算（resume/重跑秒过）。
         # 落盘文件供评测 server 读，保证推理初始噪声分布与训练一致（buffer persistent=False 不进 ckpt）。
         cache_path = os.path.join(output_dir, "action_correlation_cholesky.npy")
+        _exp = int(action_cfg.get("action_horizon", 0)) * int(action_cfg.get("action_dim", 0))
+        if _exp <= 0:
+            raise ValueError(
+                "correlated-noise requires positive action_horizon and action_dim, "
+                f"got horizon={action_cfg.get('action_horizon')}, dim={action_cfg.get('action_dim')}"
+            )
+        _source_path = action_cfg.get("correlation_cholesky_path")
+        _source_chol = None
+        if _source_path:
+            # Validate on every rank before the barrier. If the shared source is
+            # missing/corrupt, all ranks fail promptly instead of leaving peers
+            # blocked while only rank 0 raises.
+            _source_path = os.path.expandvars(os.path.expanduser(str(_source_path)))
+            if not os.path.isfile(_source_path):
+                raise FileNotFoundError(
+                    "Configured correlation_cholesky_path does not exist; refusing to recompute a different "
+                    f"ablation matrix: {_source_path}"
+                )
+            _source_chol = _np.load(_source_path, allow_pickle=False)
+            if tuple(_source_chol.shape) != (_exp, _exp):
+                raise ValueError(
+                    f"correlation_cholesky_path has shape {_source_chol.shape}, expected ({_exp}, {_exp}): "
+                    f"{_source_path}"
+                )
+            if not _np.isfinite(_source_chol).all():
+                raise ValueError(f"correlation_cholesky_path contains non-finite values: {_source_path}")
         if accelerator.is_main_process:
             #######
-            # 中文注释：缓存复用——文件存在且维度=action_horizon×action_dim 就直接用,免重扫(秒过)；
-            # 维度不符(改了 horizon/action_dim/数据)则重算,防止用到过期 Cholesky。
-            _exp = int(action_cfg.get("action_horizon", 0)) * int(action_cfg.get("action_dim", 0))
-            _reuse = (
-                os.path.exists(cache_path)
-                and _exp > 0
-                and tuple(_np.load(cache_path).shape) == (_exp, _exp)
-            )
-            #######
-            if _reuse:
-                logger.info(f"correlated-noise: 复用已缓存 Cholesky({_exp}x{_exp}) → {cache_path}")
-            else:
-                chol = compute_action_correlation_cholesky(
-                    vla_train_dataloader.dataset,
-                    num_samples=int(action_cfg.get("correlation_num_samples", 4096)),
-                    beta=float(action_cfg.get("correlation_beta", 0.5)),
-                    matrix_type=str(action_cfg.get("correlation_matrix_type", "covariance")),
-                )
-                _np.save(cache_path, _np.asarray(chol))
+            # 中文注释：严格消融可通过 correlation_cholesky_path 固定使用已完成 baseline 的矩阵。
+            # 指定后必须存在、维度正确且数值有限；失败时直接退出，禁止静默重算引入额外变量。
+            if _source_path:
+                _np.save(cache_path, _np.asarray(_source_chol))
                 logger.info(
-                    "correlated-noise Cholesky ready: shape=%s, beta=%s, matrix_type=%s -> %s",
-                    chol.shape,
-                    action_cfg.get("correlation_beta", 0.5),
-                    action_cfg.get("correlation_matrix_type", "covariance"),
+                    "correlated-noise: copied fixed baseline Cholesky(%sx%s) from %s -> %s",
+                    _exp,
+                    _exp,
+                    _source_path,
                     cache_path,
                 )
+            else:
+                # 中文注释：未固定外部矩阵时，缓存复用——文件存在且维度正确就直接使用；
+                # 维度不符(改了 horizon/action_dim)则重算，防止用到过期 Cholesky。
+                _reuse = os.path.exists(cache_path) and tuple(
+                    _np.load(cache_path, allow_pickle=False).shape
+                ) == (_exp, _exp)
+                if _reuse:
+                    logger.info(f"correlated-noise: 复用已缓存 Cholesky({_exp}x{_exp}) → {cache_path}")
+                else:
+                    chol = compute_action_correlation_cholesky(
+                        vla_train_dataloader.dataset,
+                        num_samples=int(action_cfg.get("correlation_num_samples", 4096)),
+                        beta=float(action_cfg.get("correlation_beta", 0.5)),
+                        matrix_type=str(action_cfg.get("correlation_matrix_type", "covariance")),
+                    )
+                    _np.save(cache_path, _np.asarray(chol))
+                    logger.info(
+                        "correlated-noise Cholesky ready: shape=%s, beta=%s, matrix_type=%s -> %s",
+                        chol.shape,
+                        action_cfg.get("correlation_beta", 0.5),
+                        action_cfg.get("correlation_matrix_type", "covariance"),
+                        cache_path,
+                    )
         if dist.is_initialized():
             dist.barrier()  # 等 rank0 算好/存好,其余 rank 再读
-        vla.set_action_correlation(_np.load(cache_path))
+        _loaded_chol = _np.load(cache_path, allow_pickle=False)
+        if tuple(_loaded_chol.shape) != (_exp, _exp) or not _np.isfinite(_loaded_chol).all():
+            raise ValueError(f"Invalid correlated-noise Cholesky after synchronization: {cache_path}")
+        vla.set_action_correlation(_loaded_chol)
         #######
     #######
     optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)

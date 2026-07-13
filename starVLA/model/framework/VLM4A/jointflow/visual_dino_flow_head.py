@@ -17,8 +17,8 @@ from starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit i
 
 ######### // code // ##########
 # 中文注释：DINO feature 的 continuous flow-matching 头。
-# forward 输入 cond [B,N_q,D_qwen] 和 z_gt [B,N_v,384]，输出 velocity MSE。
-# predict 从高斯噪声 Euler 积分，输出 z_hat [B,N_v,384]，仍在 norm 后的 DINO feature 空间。
+# forward 输入 cond [B,N_q,D_qwen] 和 z_gt [B,N_v,d_dino]，输出 velocity MSE。
+# predict 从高斯噪声 Euler 积分，输出 z_hat [B,N_v,d_dino]，仍在 norm 后的 DINO feature 空间。
 class VisualFlowMatchingHead(nn.Module):
     def __init__(self, full_config):
         super().__init__()
@@ -29,16 +29,24 @@ class VisualFlowMatchingHead(nn.Module):
         self.noise_s = float(cfg.get("noise_s", 0.999))
         self.num_inference_timesteps = int(cfg.get("num_inference_timesteps", 4))
         self.add_pos_embed = bool(cfg.get("add_pos_embed", True))
+        # WAM predicts one composite-image patch grid, not three separately encoded camera grids.
+        # Keeping this bound explicit avoids allocating optimizer/gradient state for unused positional rows.
+        self.max_target_tokens = int(cfg.get("max_target_tokens", cfg.get("max_seq_len", 1024)))
+        if self.max_target_tokens <= 0:
+            raise ValueError(f"max_target_tokens must be positive, got {self.max_target_tokens}")
 
         self.x_embed = nn.Linear(self.d_dino, self.hidden_size)
         self.x_decode = nn.Linear(self.hidden_size, self.d_dino)
         if self.add_pos_embed:
-            self.position_embedding = nn.Embedding(int(cfg.get("max_seq_len", 1024)), self.hidden_size)
+            self.position_embedding = nn.Embedding(self.max_target_tokens, self.hidden_size)
             nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
 
         dit_cfg = dict(cfg.get("diffusion_model_cfg", {}))
         dit_cfg.setdefault("num_attention_heads", int(cfg.get("num_attention_heads", 12)))
-        dit_cfg.setdefault("attention_head_dim", int(cfg.get("attention_head_dim", self.hidden_size // dit_cfg["num_attention_heads"])))
+        dit_cfg.setdefault(
+            "attention_head_dim",
+            int(cfg.get("attention_head_dim", self.hidden_size // dit_cfg["num_attention_heads"])),
+        )
         dit_cfg.setdefault("num_layers", int(cfg.get("num_layers", 8)))
         dit_cfg.setdefault("output_dim", self.hidden_size)
         dit_cfg.setdefault("dropout", float(cfg.get("dropout", 0.1)))
@@ -46,7 +54,9 @@ class VisualFlowMatchingHead(nn.Module):
         dit_cfg.setdefault("interleave_self_attention", True)
         dit_cfg.setdefault("norm_type", "ada_norm")
         dit_cfg.setdefault("positional_embeddings", None)
-        dit_cfg["cross_attention_dim"] = int(cfg.get("cross_attention_dim", full_config.framework.qwenvl.get("vl_hidden_dim", 896)))
+        dit_cfg["cross_attention_dim"] = int(
+            cfg.get("cross_attention_dim", full_config.framework.qwenvl.get("vl_hidden_dim", 896))
+        )
         self.model = DiT(**dit_cfg)
 
         self.beta_dist = Beta(float(cfg.get("noise_beta_alpha", 1.5)), float(cfg.get("noise_beta_beta", 1.0)))
@@ -59,6 +69,7 @@ class VisualFlowMatchingHead(nn.Module):
         for param in module.parameters(recurse=True):
             return param.dtype
         return fallback
+
     #######
 
     def sample_time(self, batch_size: int, device, dtype) -> torch.Tensor:
@@ -66,6 +77,13 @@ class VisualFlowMatchingHead(nn.Module):
         return (self.noise_s - sample) / self.noise_s
 
     def _embed_noisy(self, z: torch.Tensor) -> torch.Tensor:
+        if z.ndim != 3 or z.shape[-1] != self.d_dino:
+            raise ValueError(f"Expected visual target [B,N,{self.d_dino}], got {tuple(z.shape)}")
+        if z.shape[1] > self.max_target_tokens:
+            raise ValueError(
+                f"Visual target has {z.shape[1]} tokens, exceeding max_target_tokens={self.max_target_tokens}. "
+                "Configure the bound to the single target image/composite patch grid."
+            )
         x = self.x_embed(z)
         if self.add_pos_embed:
             pos = torch.arange(z.shape[1], device=z.device)
@@ -87,7 +105,9 @@ class VisualFlowMatchingHead(nn.Module):
         return_pred: bool = False,
     ):
         device_type = z_gt.device.type
-        autocast_ctx = torch.autocast(device_type=device_type, enabled=False) if device_type in {"cuda", "cpu"} else nullcontext()
+        autocast_ctx = (
+            torch.autocast(device_type=device_type, enabled=False) if device_type in {"cuda", "cpu"} else nullcontext()
+        )
         with autocast_ctx:
             #######
             # 中文注释：原生 trainer 的 bf16/DeepSpeed 会改变参数 dtype；这里让 z、cond、noise
@@ -117,6 +137,7 @@ class VisualFlowMatchingHead(nn.Module):
             if return_pred:
                 return loss, pred_velocity, per_patch
             return loss
+
     ######### // code // ##########
 
     #######
@@ -135,9 +156,7 @@ class VisualFlowMatchingHead(nn.Module):
         batch_size = cond.shape[0]
         compute_dtype = self._module_dtype(self, fallback=cond.dtype)
         cond = cond.to(dtype=compute_dtype)
-        z = torch.randn(
-            batch_size, n, self.d_dino, device=cond.device, dtype=compute_dtype, generator=generator
-        )
+        z = torch.randn(batch_size, n, self.d_dino, device=cond.device, dtype=compute_dtype, generator=generator)
         dt = 1.0 / float(self.num_inference_timesteps)
         for step in range(self.num_inference_timesteps):
             t_cont = step / float(self.num_inference_timesteps)
@@ -153,6 +172,7 @@ class VisualFlowMatchingHead(nn.Module):
             pred_velocity = self.x_decode(out)
             z = z + dt * pred_velocity
         return z
+
     #######
 
     @torch.inference_mode()
@@ -175,4 +195,6 @@ class VisualFlowMatchingHead(nn.Module):
             pred_velocity = self.x_decode(out)
             z = z + dt * pred_velocity
         return z
+
+
 ######### // code // ##########

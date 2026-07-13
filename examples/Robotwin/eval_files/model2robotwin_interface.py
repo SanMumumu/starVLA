@@ -1,5 +1,5 @@
 from collections import deque
-from typing import Dict, Optional
+from typing import Optional
 
 import cv2 as cv
 import numpy as np
@@ -45,7 +45,7 @@ class ModelClient:
         horizon: int = 0,
         action_ensemble=False,
         action_ensemble_horizon: Optional[int] = 3,
-        image_size: list[int] = [224, 224],
+        image_size: list[int] = [224, 224],  # noqa: B006 - preserved public eval API
         use_ddim: bool = True,
         num_ddim_steps: int = 10,
         adaptive_ensemble_alpha=0.1,
@@ -91,14 +91,14 @@ class ModelClient:
         self.state_norm_stats = None
         self.raw_actions = None
 
-        server_meta = self.client.get_server_metadata()
-        self.action_chunk_size = server_meta["action_chunk_size"]
+        self.server_meta = self.client.get_server_metadata()
+        self.action_chunk_size = self.server_meta["action_chunk_size"]
         self.replan_steps = resolve_replan_steps(replan_steps, self.action_chunk_size)
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
             f"action_mode: {action_mode}, normalization_mode: {normalization_mode}, "
             f"replan_steps: {self.replan_steps}/{self.action_chunk_size}, "
-            f"server_meta: {server_meta} ***"
+            f"server_meta: {self.server_meta} ***"
         )
 
     def reset(self, task_description: str) -> None:
@@ -139,10 +139,14 @@ class ModelClient:
                 if self.action_mode in ["delta", "rel"] and state is not None:
                     self.initial_state = np.array(state).copy()
 
-        images = [self._resize_image(image) for image in images]
+        images = self._prepare_images(images)
         example["image"] = images
         example_copy = example.copy()
-        example_copy.pop("state")
+        prepared_state = self._prepare_state_for_server(state)
+        if prepared_state is None:
+            example_copy.pop("state", None)
+        else:
+            example_copy["state"] = prepared_state
         vla_input = {
             "examples": [example_copy],
             "do_sample": False,
@@ -182,8 +186,7 @@ class ModelClient:
         if self.action_mode == "delta":
             self.prev_action = current_action.copy()
 
-        current_action = current_action[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]
-        return current_action
+        return self._prepare_action_for_env(current_action)
 
     def _delta_to_absolute(self, delta_actions: np.ndarray, current_state: np.ndarray) -> np.ndarray:
         """Convert delta actions to absolute actions."""
@@ -197,6 +200,15 @@ class ModelClient:
     def _rel_to_absolute(self, rel_actions: np.ndarray) -> np.ndarray:
         """Convert relative actions to absolute actions."""
         return rel_actions + self.initial_state
+
+    def _prepare_images(self, images: list[np.ndarray]) -> list[np.ndarray]:
+        return [self._resize_image(image) for image in images]
+
+    def _prepare_state_for_server(self, _state: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        return None
+
+    def _prepare_action_for_env(self, action: np.ndarray) -> np.ndarray:
+        return action[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]
 
     def _resize_image(self, image: np.ndarray) -> np.ndarray:
         image = cv.resize(image, tuple(self.image_size), interpolation=cv.INTER_AREA)
@@ -233,7 +245,7 @@ def reset_model(model):
     model.reset(task_description="")
 
 
-def eval(TASK_ENV, model, observation):
+def eval(TASK_ENV, model, observation):  # noqa: A001 - RoboTwin plugin API name
     # Get instruction
     instruction = TASK_ENV.get_instruction()
 

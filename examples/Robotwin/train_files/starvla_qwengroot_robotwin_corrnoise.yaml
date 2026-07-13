@@ -1,9 +1,7 @@
 #######
-# RoboTwin QwenGR00T correlated-noise ablation.
+# RoboTwin QwenGR00T correlated-noise training config.
 #
-# 与 starvla_qwengroot_robotwin.yaml 严格单变量：
-#   iid baseline: z ~ N(0, I)
-#   本配置:       z ~ N(0, beta*R + (1-beta)*I), beta=0.5
+# 噪声分布: z ~ N(0, beta*R + (1-beta)*I), beta=0.5
 # R 从 4096 个归一化 action chunks 估计，训练启动时 rank0 自动生成
 # action_correlation_cholesky.npy；评测必须保留该文件和原 run 目录。
 #######
@@ -74,6 +72,9 @@ datasets:
     action_type: abs_qpos
     action_mode: abs
     sequential_step_sampling: false
+    # 显式记录已完成 baseline 的实际默认采样语义，供 WAM 严格消融对齐。
+    balance_dataset_weights: false
+    balance_trajectory_weights: false
     per_device_batch_size: 16
 
     load_all_data_for_training: true

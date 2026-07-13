@@ -96,7 +96,7 @@ class RotationTransform:
 
 
 class Normalizer:
-    valid_modes = ["q99", "mean_std", "min_max", "binary"]
+    valid_modes = ["q99", "mean_std", "fastwam_zscore", "min_max", "binary"]
 
     def __init__(self, mode: str, statistics: dict, binary_threshold: float = 0.5):
         self.mode = mode
@@ -151,6 +151,12 @@ class Normalizer:
             # Set the normalized values to the original values where std == 0
             normalized[..., ~mask] = x[..., ~mask].to(x.dtype)
 
+        elif self.mode == "fastwam_zscore":
+            mean = self.statistics["mean"].to(x.dtype)
+            std = self.statistics["std"].to(x.dtype)
+            normalized = (x - mean) / (std + 1e-8)
+            normalized = torch.clamp(normalized, -5.0, 5.0)
+
         elif self.mode == "min_max":
             # Range of min_max is [-1, 1]
             min = self.statistics["min"].to(x.dtype)
@@ -203,6 +209,10 @@ class Normalizer:
             mean = self.statistics["mean"].to(x.dtype)
             std = self.statistics["std"].to(x.dtype)
             return x * std + mean
+        elif self.mode == "fastwam_zscore":
+            mean = self.statistics["mean"].to(x.dtype)
+            std = self.statistics["std"].to(x.dtype)
+            return x * (std + 1e-8) + mean
         elif self.mode == "min_max":
             min = self.statistics["min"].to(x.dtype)
             max = self.statistics["max"].to(x.dtype)
@@ -361,7 +371,7 @@ class StateActionTransform(InvertibleModalityTransform):
                     assert len(normalization_statistics["min"]) == len(
                         normalization_statistics["max"]
                     ), f"Min and max statistics must have the same length, but got {normalization_statistics['min']} and {normalization_statistics['max']}"
-                elif normalization_mode == "mean_std":
+                elif normalization_mode in {"mean_std", "fastwam_zscore"}:
                     assert (
                         "mean" in normalization_statistics and "std" in normalization_statistics
                     ), f"Mean and std statistics are required for mean_std normalization, but got {normalization_statistics}"

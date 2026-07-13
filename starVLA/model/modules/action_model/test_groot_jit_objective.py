@@ -5,6 +5,7 @@ from omegaconf import OmegaConf
 
 from starVLA.model.modules.action_model.GR00T_ActionHeader import (
     FlowmatchingActionHead,
+    _masked_action_mse,
     action_prediction_to_velocity,
 )
 
@@ -151,9 +152,34 @@ def test_prediction_type_does_not_change_checkpoint_structure():
     assert torch.isfinite(predicted_actions).all()
 
 
+def test_all_padded_actions_contribute_zero_loss():
+    head = FlowmatchingActionHead(_minimal_head_config("jit_x"))
+    vl_embs = torch.randn(1, 3, 8)
+    actions = torch.randn(1, 2, 2)
+
+    loss = head(vl_embs, actions, action_is_pad=torch.ones(1, 2, dtype=torch.bool))
+
+    assert loss.item() == 0.0
+    loss.backward()
+    assert head.action_decoder.layer2.weight.grad is not None
+
+
+def test_padding_reduction_matches_fastwam_per_sample_mean():
+    squared_error = torch.tensor([[[1.0], [3.0], [100.0]], [[10.0], [100.0], [100.0]]])
+    action_is_pad = torch.tensor([[False, False, True], [False, True, True]])
+
+    loss = _masked_action_mse(squared_error, action_is_pad)
+
+    # FastWAM: mean([mean([1, 3]), mean([10])]) == 6. A global valid-step
+    # reduction would incorrectly return 14/3.
+    torch.testing.assert_close(loss, torch.tensor(6.0))
+
+
 if __name__ == "__main__":
     test_lawam_dit_shape_is_consistent()
     test_velocity_parameterization_is_identity()
     test_jit_x_parameterization_matches_reference()
     test_jit_t_eps_caps_late_time_weight()
     test_prediction_type_does_not_change_checkpoint_structure()
+    test_all_padded_actions_contribute_zero_loss()
+    test_padding_reduction_matches_fastwam_per_sample_mean()

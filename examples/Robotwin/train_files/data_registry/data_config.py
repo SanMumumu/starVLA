@@ -80,28 +80,75 @@ class AgilexData50Config(AgilexDataConfig):
 
 
 # ---------------------------------------------------------------------------
-# DataConfig — Agilex 50 with FastWAM-style z-score normalization on all 14 dims
+# DataConfig — FastWAM 50 Hz recipe (32-step actions)
 # ---------------------------------------------------------------------------
-class AgilexData50ZScoreConfig(AgilexData50Config):
+class FastWAMRobotWinDataConfig(AgilexDataConfig):
+    # The released vectors and RoboTwin environment both use this exact order.
+    # Do not reorder to AgilexDataConfig's standard StarVLA order: old FastWAM
+    # checkpoints, their saved z-score statistics, and the custom eval adapter
+    # all rely on [left_joints, left_gripper, right_joints, right_gripper].
+    state_keys = ["state.left_joints", "state.left_gripper", "state.right_joints", "state.right_gripper"]
+    action_keys = ["action.left_joints", "action.left_gripper", "action.right_joints", "action.right_gripper"]
+    state_key_dims = {
+        "state.left_joints": 6,
+        "state.left_gripper": 1,
+        "state.right_joints": 6,
+        "state.right_gripper": 1,
+    }
+    action_key_dims = {
+        "action.left_joints": 6,
+        "action.left_gripper": 1,
+        "action.right_joints": 6,
+        "action.right_gripper": 1,
+    }
+    action_indices = list(range(32))
+
     def transform(self):
         return ComposedModalityTransform(transforms=[
             StateActionToTensor(apply_to=self.state_keys),
             StateActionTransform(
                 apply_to=self.state_keys,
                 normalization_modes={
-                    "state.left_joints": "mean_std", "state.right_joints": "mean_std",
-                    "state.left_gripper": "mean_std", "state.right_gripper": "mean_std",
+                    "state.left_joints": "fastwam_zscore",
+                    "state.left_gripper": "fastwam_zscore",
+                    "state.right_joints": "fastwam_zscore",
+                    "state.right_gripper": "fastwam_zscore",
                 },
             ),
             StateActionToTensor(apply_to=self.action_keys),
             StateActionTransform(
                 apply_to=self.action_keys,
                 normalization_modes={
-                    "action.left_joints": "mean_std", "action.right_joints": "mean_std",
-                    "action.left_gripper": "mean_std", "action.right_gripper": "mean_std",
+                    "action.left_joints": "fastwam_zscore",
+                    "action.left_gripper": "fastwam_zscore",
+                    "action.right_joints": "fastwam_zscore",
+                    "action.right_gripper": "fastwam_zscore",
                 },
             ),
         ])
+
+    def make_dataset(
+        self,
+        dataset_path,
+        modality_configs,
+        transforms,
+        embodiment_tag,
+        video_backend,
+        delete_pause_frame,
+        data_cfg,
+        **_kwargs,
+    ):
+        from starVLA.dataloader.fastwam_robotwin_dataset import FastWAMRobotWinDataset
+
+        return FastWAMRobotWinDataset(
+            dataset_path=dataset_path,
+            modality_configs=modality_configs,
+            transforms=transforms,
+            embodiment_tag=embodiment_tag,
+            video_backend=video_backend,
+            delete_pause_frame=delete_pause_frame,
+            data_cfg=data_cfg,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +205,7 @@ class ArxX5DataConfig:
 ROBOT_TYPE_CONFIG_MAP = {
     "robotwin": AgilexDataConfig(),
     "robotwin50": AgilexData50Config(),
-    "robotwin50_z": AgilexData50ZScoreConfig(),
+    "robotwin_fastwam": FastWAMRobotWinDataConfig(),
     "robotwin16": AgilexData16Config(),
     "arx_x5": ArxX5DataConfig(),
 }
@@ -331,14 +378,20 @@ DATASET_NAMED_MIXTURES = {
     ],
     "robotwin_task1": [("adjust_bottle", 1.0, "robotwin")],
     "robotwin_task2": [("place_a2b_left", 1.0, "robotwin"), ("place_a2b_right", 1.0, "robotwin")],
+    "robotwin_fastwam": [(".", 1.0, "robotwin_fastwam")],
     "arx_x5": [("arx_x5", 1.0, "arx_x5")],
 }
 
-# FastWAM-style normalization ablation. Dataset paths and sampling weights are
-# identical to robotwin_all_50; only the state/action normalization changes.
-DATASET_NAMED_MIXTURES["robotwin_all_50_z"] = [
-    (path, weight, "robotwin50_z") for (path, weight, _robot_type) in DATASET_NAMED_MIXTURES["robotwin_all_50"]
+# ---------------------------------------------------------------------------
+# clean-only horizon-50 对照——严格复用 corrnoise baseline 的 robotwin50 embodiment，
+# 只把 robotwin_all_50 的 Randomized/ 目录排除，供 clean 数据消融使用。
+# ---------------------------------------------------------------------------
+DATASET_NAMED_MIXTURES["robotwin_clean_50"] = [
+    (path, weight, robot_type)
+    for (path, weight, robot_type) in DATASET_NAMED_MIXTURES["robotwin_all_50"]
+    if path.startswith("Clean/")
 ]
+
 
 # ---------------------------------------------------------------------------
 # horizon-16 变体（robot_type=robotwin16）—— 从 robotwin_all_50 惰性派生，避免任务清单重复。

@@ -78,6 +78,59 @@ worker_main() {
     exit 1
   fi
 
+  # DINOv3 must be loaded from the shared bucket on offline AIDI workers.  An
+  # explicit job-level value is propagated by controller_main below.  Refuse a
+  # bad path here instead of letting transformers fall back to Hugging Face.
+  if [ -n "${DINOV3_WEIGHTS:-}" ]; then
+    if [ ! -d "${DINOV3_WEIGHTS}" ]; then
+      echo "ERROR: local DINOv3 HF snapshot directory not found: ${DINOV3_WEIGHTS}"
+      exit 1
+    fi
+    if [ ! -f "${DINOV3_WEIGHTS%/}/config.json" ]; then
+      echo "ERROR: local DINOv3 HF snapshot is incomplete (missing config.json): ${DINOV3_WEIGHTS}"
+      exit 1
+    fi
+    DINO_WEIGHT_FILE=$(find "${DINOV3_WEIGHTS%/}" -maxdepth 1 -type f \
+      \( -name '*.safetensors' -o -name 'pytorch_model*.bin' \) -size +100M -print -quit)
+    if [ -z "${DINO_WEIGHT_FILE}" ]; then
+      echo "ERROR: local DINOv3 HF snapshot has no weight file larger than 100 MiB."
+      echo "       model.safetensors may be missing or only a Git-LFS pointer: ${DINOV3_WEIGHTS}"
+      exit 1
+    fi
+    python - "${DINOV3_WEIGHTS%/}/config.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    config = json.load(handle)
+hidden_size = config.get("hidden_size")
+if hidden_size != 1024:
+    raise SystemExit(f"ERROR: expected DINOv3 ViT-L hidden_size=1024, got {hidden_size!r} in {sys.argv[1]}")
+print(f"DINO config PASS: model_type={config.get('model_type')}, hidden_size={hidden_size}")
+PY
+    export DINOV3_WEIGHTS
+    echo "DINO weights PASS: ${DINO_WEIGHT_FILE}"
+    echo "DINOV3_WEIGHTS=${DINOV3_WEIGHTS} (local HF snapshot; network fallback disabled by loader)"
+  fi
+
+  # Controlled RoboTwin WAM ablations must stay aligned with the completed
+  # QwenGR00T corrnoise baseline. Fail before allocating the training graph if
+  # a config drifts in sampling, horizon, optimizer, loader, or prompt fields.
+  case "${CONFIG_YAML##*/}" in
+    robotwin_wam_*.yaml)
+      python examples/Robotwin/train_files/verify_wam_corrnoise_alignment.py \
+        --check-files \
+        --target "${CONFIG_YAML##*/}"
+      python examples/Robotwin/train_files/verify_fastwam_robotwin_data.py \
+        --config-yaml "${CONFIG_YAML}"
+      ;;
+    starvla_qwengroot_robotwin_fastwam_corrnoise.yaml)
+      python examples/Robotwin/train_files/verify_fastwam_starvla_alignment.py
+      python examples/Robotwin/train_files/verify_fastwam_robotwin_data.py \
+        --config-yaml "${CONFIG_YAML}"
+      ;;
+  esac
+
   python - <<'PY'
 import torch
 print("Torch:", torch.__version__)
@@ -140,6 +193,10 @@ PY
 
   # Avoid slow online version-check warning in offline cluster.
   export ALBUMENTATIONS_DISABLE_VERSION_CHECK=${ALBUMENTATIONS_DISABLE_VERSION_CHECK:-1}
+  # Long-lived WAM runs allocate different Qwen/action/world tensors by task;
+  # expandable segments prevent small tail allocations from failing after the
+  # allocator becomes segmented. This changes allocation only, not numerics.
+  export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 
   echo "========== NCCL SETTINGS =========="
   echo "NCCL_IB_DISABLE=${NCCL_IB_DISABLE}"
@@ -151,6 +208,7 @@ PY
   echo "TORCH_NCCL_BLOCKING_WAIT=${TORCH_NCCL_BLOCKING_WAIT}"
   echo "TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING}"
   echo "TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC}"
+  echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
   echo "==================================="
 
   # ============================================================
@@ -256,6 +314,7 @@ controller_main() {
   Q_ROOT=$(printf "%q" "${ROOT}")
   Q_CONFIG=$(printf "%q" "${CONFIG_ARG}")
   Q_MASTER_IP=$(printf "%q" "${MASTER_IP}")
+  Q_DINOV3_WEIGHTS=$(printf "%q" "${DINOV3_WEIGHTS:-}")
 
   echo "========== SSH fan-out =========="
 
@@ -265,7 +324,7 @@ controller_main() {
     HOST="$(resolve_task "${PREFIX}" "${NS}" "${i}")"
     echo "Launching worker on task-${i}: ${HOST}"
 
-    CMD="cd ${Q_ROOT} && export NUM_MACHINES=${NUM_MACHINES} MACHINE_RANK=${i} MASTER_ADDR=${Q_MASTER_IP} MASTER_PORT=${MASTER_PORT} GPUS_PER_NODE=8 && bash ${Q_ROOT}/run_aidi_rbtw.sh --worker ${Q_CONFIG}"
+    CMD="cd ${Q_ROOT} && export NUM_MACHINES=${NUM_MACHINES} MACHINE_RANK=${i} MASTER_ADDR=${Q_MASTER_IP} MASTER_PORT=${MASTER_PORT} GPUS_PER_NODE=8 DINOV3_WEIGHTS=${Q_DINOV3_WEIGHTS} && bash ${Q_ROOT}/run_aidi_rbtw.sh --worker ${Q_CONFIG}"
 
     if [ "${HOST}" = "${HOSTNAME_NOW}" ] || [ "${HOST}" = "$(hostname)" ]; then
       bash -lc "${CMD}" &
