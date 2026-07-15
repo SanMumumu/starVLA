@@ -222,6 +222,47 @@ def mix_world_tokens(
     return torch.where(sel, oracle.to(predicted.dtype), predicted)
 
 
+def linear_gradient_ramp(
+    global_step: int,
+    start_step: int,
+    end_step: int,
+    start_scale: float = 0.0,
+    end_scale: float = 1.0,
+) -> float:
+    """Return a deterministic linear scale for action-to-world gradients.
+
+    The forward signal is never scheduled: the action branch always consumes
+    the predicted future.  Only its backward gradient into the world predictor
+    is scaled, which avoids an oracle/predicted distribution switch.
+    """
+
+    step = max(int(global_step), 0)
+    start = max(int(start_step), 0)
+    end = max(int(end_step), start)
+    lo = float(start_scale)
+    hi = float(end_scale)
+    if lo < 0.0 or hi < 0.0:
+        raise ValueError(f"Gradient-ramp scales must be non-negative, got {lo} -> {hi}")
+    if step <= start:
+        return lo
+    if end == start or step >= end:
+        return hi
+    alpha = float(step - start) / float(end - start)
+    return lo + alpha * (hi - lo)
+
+
+def scale_gradient(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Keep ``x`` unchanged in forward while multiplying its backward by scale."""
+
+    value = float(scale)
+    if value < 0.0:
+        raise ValueError(f"Gradient scale must be non-negative, got {value}")
+    if value == 1.0:
+        return x
+    detached = x.detach()
+    return detached + value * (x - detached)
+
+
 def shuffle_along_batch(x: torch.Tensor, generator: Optional[torch.Generator] = None) -> torch.Tensor:
     """batch 内打乱（plan §11 因果消融 Shuffled World）。
 

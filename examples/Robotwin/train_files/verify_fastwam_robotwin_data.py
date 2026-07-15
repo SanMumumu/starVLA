@@ -263,7 +263,6 @@ def main() -> None:
         "fastwam_split": "train",
         "fastwam_split_seed": 42,
         "fastwam_direct_frame_sampling": True,
-        "include_state": True,
         "action_mode": "abs",
         "obs_image_size": [320, 384],
         "video_backend": "pyav",
@@ -274,6 +273,11 @@ def main() -> None:
     for key, expected in expected_config.items():
         if data_config.get(key) != expected:
             raise ValueError(f"Expected datasets.vla_data.{key}={expected!r}, got {data_config.get(key)!r}")
+    if "include_state" not in data_config or not isinstance(data_config["include_state"], bool):
+        raise ValueError(
+            "datasets.vla_data.include_state must be an explicit YAML boolean so the checkpoint records its "
+            "inference ABI"
+        )
     if int(config["framework"]["action_model"]["action_horizon"]) != 32:
         raise ValueError("FastWAM experiment requires framework.action_model.action_horizon=32")
 
@@ -283,8 +287,8 @@ def main() -> None:
         data_root,
         stats_path,
         expected_fps=float(data_config.get("fastwam_expected_fps", 50)),
-        expected_episodes=args.expected_episodes,
-        expected_frames=args.expected_frames,
+        expected_episodes=int(data_config.get("fastwam_expected_episodes", args.expected_episodes)),
+        expected_frames=int(data_config.get("fastwam_expected_frames", args.expected_frames)),
         expected_tasks=int(data_config.get("fastwam_expected_tasks", args.expected_tasks)),
     )
     domain = str(data_config.get("fastwam_domain", "all")).lower()
@@ -298,6 +302,7 @@ def main() -> None:
         expected_domain = data_config.get("fastwam_expected_domain_episodes")
         if expected_domain is not None and counts[wanted] != int(expected_domain):
             raise ValueError(f"fastwam_domain={wanted} has {counts[wanted]} episodes, expected {int(expected_domain)}")
+    summary["include_state"] = data_config["include_state"]
     print(json.dumps(summary, indent=2, ensure_ascii=True))
 
 

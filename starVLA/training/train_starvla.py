@@ -38,7 +38,7 @@ except ImportError:
 import wandb
 from accelerate import Accelerator, DeepSpeedPlugin
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import GradientAccumulationPlugin, set_seed
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -59,9 +59,10 @@ from starVLA.training.trainer_utils.trainer_tools import (
     group_grad_local_sqnorm,
 )
 
-deepspeed_plugin = DeepSpeedPlugin()
-accelerator = Accelerator(deepspeed_plugin=deepspeed_plugin)
-accelerator.print(accelerator.state)
+# Constructed only after the experiment YAML is loaded.  DeepSpeed's AIDI
+# config leaves gradient_accumulation_steps="auto"; initializing here would
+# resolve it to Accelerator's default (1) before the YAML value is known.
+accelerator: Accelerator | None = None
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -80,6 +81,61 @@ def configure_torch_runtime() -> None:
         precision = os.getenv("STARVLA_FLOAT32_MATMUL_PRECISION", "high")
         torch.set_float32_matmul_precision(precision)
         logger.info("STARVLA torch runtime: TF32 enabled, float32_matmul_precision=%s", precision)
+
+
+def build_training_accelerator(cfg) -> Accelerator:
+    """Build Accelerate/DeepSpeed with the accumulation value from this run."""
+
+    accumulation_steps = int(cfg.trainer.get("gradient_accumulation_steps", 1))
+    if accumulation_steps <= 0:
+        raise ValueError(
+            "trainer.gradient_accumulation_steps must be positive, "
+            f"got {accumulation_steps}."
+        )
+    clipping = cfg.trainer.get("gradient_clipping", None)
+    plugin = DeepSpeedPlugin(
+        gradient_accumulation_steps=accumulation_steps,
+        gradient_clipping=float(clipping) if clipping is not None else None,
+    )
+    # DeepSpeed ZeRO-2 partitions gradients and explicitly rejects
+    # ``engine.no_sync()``. Accelerate normally enters no_sync on non-boundary
+    # micro-batches, which crashes before the first E2E forward when
+    # gradient_accumulation_steps > 1. Keep the same numerical accumulation,
+    # but synchronize each micro-batch so DeepSpeed can own accumulation and
+    # optimizer-boundary handling without the unsupported context.
+    zero_no_sync_guard = accumulation_steps > 1
+    accumulation_plugin = GradientAccumulationPlugin(
+        num_steps=accumulation_steps,
+        sync_each_batch=zero_no_sync_guard,
+    )
+    result = Accelerator(
+        deepspeed_plugin=plugin,
+        gradient_accumulation_plugin=accumulation_plugin,
+    )
+    if int(result.gradient_accumulation_steps) != accumulation_steps:
+        raise RuntimeError(
+            "Accelerate ignored trainer.gradient_accumulation_steps: "
+            f"requested {accumulation_steps}, active {result.gradient_accumulation_steps}."
+        )
+    deepspeed_accumulation = plugin.get_value("gradient_accumulation_steps")
+    if deepspeed_accumulation != "auto" and int(deepspeed_accumulation) != accumulation_steps:
+        raise RuntimeError(
+            "DeepSpeed accumulation disagrees with the training YAML: "
+            f"requested {accumulation_steps}, active {deepspeed_accumulation}."
+        )
+    accumulation_kwargs = result.gradient_state.plugin_kwargs
+    if zero_no_sync_guard and not bool(accumulation_kwargs.get("sync_each_batch", False)):
+        raise RuntimeError(
+            "DeepSpeed ZeRO accumulation requires GradientAccumulationPlugin(sync_each_batch=True) "
+            "to avoid the unsupported engine.no_sync() path."
+        )
+    result.print(result.state)
+    result.print(
+        f"[train] gradient_accumulation_steps={result.gradient_accumulation_steps} "
+        f"deepspeed={deepspeed_accumulation} "
+        f"zero_no_sync_guard={str(zero_no_sync_guard).lower()}"
+    )
+    return result
 
 
 def load_fast_tokenizer():
@@ -178,12 +234,29 @@ class VLATrainer(TrainerUtils):
                 self._jointflow_weights = [float(weights[k]) for k in self._jointflow_tasks]
                 if not self._jointflow_tasks:
                     raise ValueError("framework.tasks.weights must contain at least one positive task weight.")
+                # ``joint_e2e`` already computes action + world losses in the
+                # same forward pass.  Sampling it together with policy/passive
+                # would silently reintroduce alternating single-objective
+                # updates and bypass the configured action->world ramp on the
+                # policy-only steps.  Treat this as a startup-time invariant,
+                # so a bad merge/config can never run for hours unnoticed.
+                if "joint_e2e" in self._jointflow_tasks and len(self._jointflow_tasks) != 1:
+                    raise ValueError(
+                        "framework.tasks.weights: joint_e2e is exclusive because it already optimizes "
+                        "action_loss + world_loss in every batch; positive companion tasks are not allowed. "
+                        f"Active tasks: {self._jointflow_tasks}."
+                    )
                 if self.accelerator.is_main_process:
                     logger.info(
                         "Active QwenGR00T task sampler: tasks=%s weights=%s",
                         self._jointflow_tasks,
                         self._jointflow_weights,
                     )
+                    if self._jointflow_tasks == ["joint_e2e"]:
+                        logger.info(
+                            "Verified joint E2E objective: every optimizer step uses one batch for "
+                            "action_loss + weighted world_loss; no policy/passive alternation."
+                        )
         #######
 
         #######
@@ -232,6 +305,7 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
         )
 
+        self._validate_runtime_batch_contract()
         self._configure_unused_param_anchors()
 
         #######
@@ -253,6 +327,54 @@ class VLATrainer(TrainerUtils):
         #######
 
         self._init_wandb()
+
+    @staticmethod
+    def _runtime_int(obj, name: str):
+        value = getattr(obj, name, None)
+        if value is None:
+            return None
+        value = value() if callable(value) else value
+        return int(value)
+
+    def _validate_runtime_batch_contract(self) -> None:
+        """Fail immediately if Accelerate/DeepSpeed changed the YAML batch ABI."""
+
+        expected_accumulation = int(self.config.trainer.gradient_accumulation_steps)
+        active_accumulation = int(self.accelerator.gradient_accumulation_steps)
+        if active_accumulation != expected_accumulation:
+            raise RuntimeError(
+                "Accelerate runtime accumulation differs from the training YAML: "
+                f"yaml={expected_accumulation}, runtime={active_accumulation}."
+            )
+
+        expected_micro_batch = int(self.config.datasets.vla_data.per_device_batch_size)
+        expected_global_batch = expected_micro_batch * int(self.accelerator.num_processes) * expected_accumulation
+        engine_values = {}
+        if self._using_deepspeed:
+            for name, expected in (
+                ("gradient_accumulation_steps", expected_accumulation),
+                ("train_micro_batch_size_per_gpu", expected_micro_batch),
+                ("train_batch_size", expected_global_batch),
+            ):
+                active = self._runtime_int(self.model, name)
+                if active is None:
+                    raise RuntimeError(f"DeepSpeed engine does not expose {name}; cannot verify the batch contract.")
+                engine_values[name] = active
+                if active != expected:
+                    raise RuntimeError(
+                        f"DeepSpeed {name} differs from the training YAML/runtime topology: "
+                        f"expected={expected}, active={active}."
+                    )
+
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Verified runtime batch contract: micro=%d x world=%d x accumulation=%d = global=%d; deepspeed=%s",
+                expected_micro_batch,
+                self.accelerator.num_processes,
+                expected_accumulation,
+                expected_global_batch,
+                engine_values or "disabled",
+            )
 
     def _configure_unused_param_anchors(self) -> None:
         """Skip dense zero-gradient communication when ZeRO-2 can preserve the same optimizer update."""
@@ -450,14 +572,50 @@ class VLATrainer(TrainerUtils):
         return self._jointflow_cur_task
 
     # 中文注释：模型每个 task 返回的 loss key 名 / 日志名（idm→inverse，对齐需求）。
-    _TASK_LOSS_KEY = {"policy": "action_loss", "idm": "idm_loss", "fdm": "fdm_loss", "passive": "passive_loss"}
-    _TASK_LOGNAME = {"policy": "policy", "idm": "inverse", "fdm": "fdm", "passive": "passive"}
+    _TASK_LOSS_KEY = {
+        "policy": "action_loss",
+        "idm": "idm_loss",
+        "fdm": "fdm_loss",
+        "passive": "passive_loss",
+        "joint_e2e": "action_loss",
+    }
+    _TASK_LOGNAME = {
+        "policy": "policy",
+        "idm": "inverse",
+        "fdm": "fdm",
+        "passive": "passive",
+        "joint_e2e": "joint_e2e",
+    }
 
     @classmethod
     def _build_loss_metrics(cls, output_dict: dict, task: str, total_loss: torch.Tensor) -> dict:
         """per-task 原始/加权/total loss（train/ 前缀）。一任务/优化步 → 每步只记当前 task，
         **不为未启用任务写零值**。区分 raw（视觉头原始 MSE，模型返回的 *_loss_raw）与 weighted（× 权重，实际反传）。
         policy/idm 无内部权重 → raw == weighted。"""
+        if task == "joint_e2e":
+            action = output_dict["action_loss"]
+            world = output_dict["world_loss"]
+            world_raw = output_dict.get("world_loss_raw", world)
+            ratio = world.detach().abs() / action.detach().abs().clamp_min(1.0e-12)
+            return {
+                "train/task": task,
+                "train/loss_total": float(total_loss.detach()),
+                "train/loss_policy": float(action.detach()),
+                "train/loss_policy_weighted": float(action.detach()),
+                "train/loss_policy_raw": float(action.detach()),
+                "train/loss_world": float(world.detach()),
+                "train/loss_world_weighted": float(world.detach()),
+                "train/loss_world_raw": float(world_raw.detach()),
+                "train/world_to_policy_loss_ratio": float(ratio),
+                "train/action_world_grad_scale": float(output_dict["action_world_grad_scale"].detach()),
+                # Effective residual multiplier is tanh(raw_gate): 0=closed,
+                # 1=full-magnitude world cross-attention.  Mean absolute value
+                # is the clearest single "open degree"; signed/max expose
+                # cancellation and one-layer outliers without logging 8 curves.
+                "train/world_gate_openness": float(output_dict["world_gate_openness"].detach()),
+                "train/world_gate_signed_mean": float(output_dict["world_gate_signed_mean"].detach()),
+                "train/world_gate_max_openness": float(output_dict["world_gate_max_openness"].detach()),
+            }
         logname = cls._TASK_LOGNAME.get(task, task)
         loss_key = cls._TASK_LOSS_KEY.get(task, f"{task}_loss")
         weighted = output_dict.get(loss_key)
@@ -551,12 +709,16 @@ class VLATrainer(TrainerUtils):
             data_elapsed = t_end_data - t_start_data
             model_elapsed = t_end_model - t_start_model
             task_name = str(self._jointflow_cur_task or "action")
+            did_optimizer_step = bool(self.accelerator.sync_gradients)
 
-            if self.accelerator.sync_gradients:
+            if did_optimizer_step:
                 progress_bar.update(1)
                 self.completed_steps += 1
 
-            if self.accelerator.is_local_main_process:
+            # Show one progress record per optimizer step. With accumulation,
+            # printing every micro-batch duplicates the same step number and
+            # makes the task stream look like alternating optimization.
+            if did_optimizer_step and self.accelerator.is_local_main_process:
                 progress_bar.set_postfix(
                     {
                         "rank": self.accelerator.process_index,
@@ -566,15 +728,23 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if self.completed_steps % self.config.trainer.eval_interval == 0:
+            if did_optimizer_step and self.completed_steps % self.config.trainer.eval_interval == 0:
                 step_metrics = self.eval_action_model(step_metrics)
 
-            step_metrics["timing/data"] = data_elapsed
-            step_metrics["timing/model"] = model_elapsed
-            step_metrics[f"timing/model_{task_name}"] = model_elapsed
-            self._log_metrics(step_metrics)
+            # Eval/log/save are optimizer-step events.  An accumulation
+            # micro-batch keeps ``completed_steps`` unchanged; running these
+            # hooks there duplicates expensive evals and checkpoint writes.
+            if did_optimizer_step:
+                step_metrics["timing/data"] = data_elapsed
+                step_metrics["timing/model"] = model_elapsed
+                step_metrics[f"timing/model_{task_name}"] = model_elapsed
+                self._log_metrics(step_metrics)
 
-            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+            if (
+                did_optimizer_step
+                and self.completed_steps % self.config.trainer.save_interval == 0
+                and self.completed_steps > 0
+            ):
                 self._save_checkpoint()
 
             if self.completed_steps >= self.config.trainer.max_train_steps:
@@ -613,15 +783,17 @@ class VLATrainer(TrainerUtils):
     def _train_step(self, batch_vla, batch_vlm=None):
         """Execute single training step."""
         with self.accelerator.accumulate(self.model):
-            self.optimizer.zero_grad()
-
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 #######
                 # 中文注释：JointFlow-style 训练复用原生 trainer；配置 tasks.weights 时每步采样一个任务，
                 # 模型返回 *_loss / loss_* 指标。没有配置时保持旧 QwenGR00T action_loss 路径。
                 jointflow_task = self._sample_jointflow_task()
                 if jointflow_task is not None:
-                    output_dict = self.model.forward(batch_vla, task=jointflow_task)
+                    output_dict = self.model.forward(
+                        batch_vla,
+                        task=jointflow_task,
+                        global_step=self.completed_steps,
+                    )
                     loss_values = [
                         value
                         for key, value in output_dict.items()
@@ -644,8 +816,9 @@ class VLATrainer(TrainerUtils):
             # 中文注释：梯度统计时序——必须 backward 之后、step/zero_grad 之前。
             # ① 先做 clip（DeepSpeed 下 accelerate clip 实为 no-op/返回 None，真正 clip 在 engine.step 内；
             #    非-DS 时返回总范数，留作 grad_norm_total 兜底）。
+            sync = bool(self.accelerator.sync_gradients)        # 在 accumulate 块内捕获，块外可能失效
             self._last_clip_norm = None
-            if self.config.trainer.gradient_clipping is not None:
+            if sync and self.config.trainer.gradient_clipping is not None:
                 clipped = self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
                 if clipped is not None:
                     try:
@@ -653,7 +826,6 @@ class VLATrainer(TrainerUtils):
                     except Exception:
                         self._last_clip_norm = None
 
-            sync = bool(self.accelerator.sync_gradients)        # 在 accumulate 块内捕获，块外可能失效
             will_log = self._is_log_step(sync)
             # 中文注释：**梯度记录总开关**——log_grad_norms=false 时 want_grad 恒 False → 既不取 grad_norm_total、
             # 也不算 per-head，训练**零梯度开销**；true 时才在 logging 步算全部 per-task 梯度。
@@ -694,6 +866,12 @@ class VLATrainer(TrainerUtils):
                     if not self._grad_warned and self.accelerator.is_main_process:
                         logger.warning("grad-norm finalize failed (%s); skipping.", e)
                     self._grad_warned = True
+            # Accelerate performs ``step``/``zero_grad`` only on the sync
+            # micro-batch.  Clearing at that micro-batch's start discards the
+            # gradients accumulated by all preceding micro-batches.  Clearing
+            # here, after step and optional gradient logging, preserves the
+            # configured effective batch size.
+            self.optimizer.zero_grad()
             #######
 
         #######
@@ -738,6 +916,9 @@ class VLATrainer(TrainerUtils):
 
 
 def main(cfg) -> None:
+    global accelerator
+    if accelerator is None:
+        accelerator = build_training_accelerator(cfg)
     logger.info("VLA Training :: Warming Up")
 
     cfg = wrap_config(cfg)
@@ -753,8 +934,13 @@ def main(cfg) -> None:
     if (
         action_cfg is not None
         and bool(action_cfg.get("use_correlated_noise", False))
-        and hasattr(vla, "set_action_correlation")
     ):
+        if not hasattr(vla, "set_action_correlation"):
+            raise RuntimeError(
+                "framework.action_model.use_correlated_noise=true but the selected framework "
+                "does not implement set_action_correlation."
+            )
+        from starVLA.dataloader.action_correlation import validate_action_correlation_cholesky
         from starVLA.dataloader.jointflow.joint_dataset import compute_action_correlation_cholesky
         import numpy as _np
 
@@ -764,6 +950,7 @@ def main(cfg) -> None:
         # → 落盘 → barrier → 所有 rank 从盘读。已有缓存直接加载，免重算（resume/重跑秒过）。
         # 落盘文件供评测 server 读，保证推理初始噪声分布与训练一致（buffer persistent=False 不进 ckpt）。
         cache_path = os.path.join(output_dir, "action_correlation_cholesky.npy")
+        cache_metadata_path = os.path.join(output_dir, "action_correlation_metadata.json")
         _exp = int(action_cfg.get("action_horizon", 0)) * int(action_cfg.get("action_dim", 0))
         if _exp <= 0:
             raise ValueError(
@@ -782,20 +969,59 @@ def main(cfg) -> None:
                     "Configured correlation_cholesky_path does not exist; refusing to recompute a different "
                     f"ablation matrix: {_source_path}"
                 )
-            _source_chol = _np.load(_source_path, allow_pickle=False)
-            if tuple(_source_chol.shape) != (_exp, _exp):
-                raise ValueError(
-                    f"correlation_cholesky_path has shape {_source_chol.shape}, expected ({_exp}, {_exp}): "
-                    f"{_source_path}"
+            try:
+                _source_chol = validate_action_correlation_cholesky(
+                    _np.load(_source_path, allow_pickle=False),
+                    expected_size=_exp,
                 )
-            if not _np.isfinite(_source_chol).all():
-                raise ValueError(f"correlation_cholesky_path contains non-finite values: {_source_path}")
+            except (OSError, TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid correlation_cholesky_path {_source_path}: {exc}") from exc
+
+        _correlation_spec = {
+            "schema_version": 1,
+            "data_root_dir": str(cfg.datasets.vla_data.data_root_dir),
+            "data_mix": str(cfg.datasets.vla_data.data_mix),
+            "action_horizon": int(action_cfg.get("action_horizon")),
+            "action_dim": int(action_cfg.get("action_dim")),
+            "matrix_type": str(action_cfg.get("correlation_matrix_type", "covariance")).lower(),
+            "beta": float(action_cfg.get("correlation_beta", 0.5)),
+            "num_samples": int(action_cfg.get("correlation_num_samples", 4096)),
+            "source_path": str(_source_path) if _source_path else None,
+        }
+
+        def _write_correlation_metadata() -> None:
+            with open(cache_metadata_path, "w", encoding="utf-8") as handle:
+                json.dump(_correlation_spec, handle, indent=2, sort_keys=True)
+
+        def _reusable_local_correlation() -> bool:
+            if not os.path.isfile(cache_path) or not os.path.isfile(cache_metadata_path):
+                return False
+            try:
+                with open(cache_metadata_path, "r", encoding="utf-8") as handle:
+                    cached_spec = json.load(handle)
+                if cached_spec != _correlation_spec:
+                    logger.warning(
+                        "correlated-noise: refusing stale cache because provenance changed: cached=%s current=%s",
+                        cached_spec,
+                        _correlation_spec,
+                    )
+                    return False
+                validate_action_correlation_cholesky(
+                    _np.load(cache_path, allow_pickle=False),
+                    expected_size=_exp,
+                )
+                return True
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning("correlated-noise: invalid cache %s; recomputing (%s)", cache_path, exc)
+                return False
+
         if accelerator.is_main_process:
             #######
             # 中文注释：严格消融可通过 correlation_cholesky_path 固定使用已完成 baseline 的矩阵。
             # 指定后必须存在、维度正确且数值有限；失败时直接退出，禁止静默重算引入额外变量。
             if _source_path:
                 _np.save(cache_path, _np.asarray(_source_chol))
+                _write_correlation_metadata()
                 logger.info(
                     "correlated-noise: copied fixed baseline Cholesky(%sx%s) from %s -> %s",
                     _exp,
@@ -804,11 +1030,10 @@ def main(cfg) -> None:
                     cache_path,
                 )
             else:
-                # 中文注释：未固定外部矩阵时，缓存复用——文件存在且维度正确就直接使用；
-                # 维度不符(改了 horizon/action_dim)则重算，防止用到过期 Cholesky。
-                _reuse = os.path.exists(cache_path) and tuple(
-                    _np.load(cache_path, allow_pickle=False).shape
-                ) == (_exp, _exp)
+                # 中文注释：未固定外部矩阵时，只有 dataset/mix/horizon/估计参数全部一致且
+                # 数组通过严格 Cholesky 校验才复用。这样 clean/full 即使误用同一输出目录，
+                # 也不会因为形状相同而静默共享 correlation。
+                _reuse = _reusable_local_correlation()
                 if _reuse:
                     logger.info(f"correlated-noise: 复用已缓存 Cholesky({_exp}x{_exp}) → {cache_path}")
                 else:
@@ -818,7 +1043,9 @@ def main(cfg) -> None:
                         beta=float(action_cfg.get("correlation_beta", 0.5)),
                         matrix_type=str(action_cfg.get("correlation_matrix_type", "covariance")),
                     )
-                    _np.save(cache_path, _np.asarray(chol))
+                    chol = validate_action_correlation_cholesky(chol, expected_size=_exp)
+                    _np.save(cache_path, chol)
+                    _write_correlation_metadata()
                     logger.info(
                         "correlated-noise Cholesky ready: shape=%s, beta=%s, matrix_type=%s -> %s",
                         chol.shape,
@@ -828,9 +1055,15 @@ def main(cfg) -> None:
                     )
         if dist.is_initialized():
             dist.barrier()  # 等 rank0 算好/存好,其余 rank 再读
-        _loaded_chol = _np.load(cache_path, allow_pickle=False)
-        if tuple(_loaded_chol.shape) != (_exp, _exp) or not _np.isfinite(_loaded_chol).all():
-            raise ValueError(f"Invalid correlated-noise Cholesky after synchronization: {cache_path}")
+        try:
+            _loaded_chol = validate_action_correlation_cholesky(
+                _np.load(cache_path, allow_pickle=False),
+                expected_size=_exp,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid correlated-noise Cholesky after synchronization: {cache_path}: {exc}"
+            ) from exc
         vla.set_action_correlation(_loaded_chol)
         #######
     #######
@@ -875,6 +1108,11 @@ if __name__ == "__main__":
 
     # Store source config path for later copying to output dir
     cfg.config_yaml = args.config_yaml
+
+    # Must happen after YAML/CLI merging: DeepSpeed's config uses "auto" and
+    # therefore needs the run-specific accumulation value at construction.
+    accelerator = build_training_accelerator(cfg)
+    configure_torch_runtime()
 
     if cfg.is_debug and dist.is_initialized() and dist.get_rank() == 0:
         import debugpy

@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 
+from starVLA.dataloader.action_correlation import validate_action_correlation_cholesky
 from deployment.model_server.checkpoint_contract import (
     load_checkpoint_contract_config,
     resolve_config_expects_state,
@@ -58,16 +59,55 @@ class PolicyServerWrapper:
     ) -> None:
         self._ckpt_path = str(ckpt_path)
 
+        # Read both snapshots before model placement. ``config.yaml`` remains
+        # authoritative for construction; ``config.full.yaml`` supplies strict
+        # runtime ABI fields such as state/image/correlated-noise settings.
+        model_cfg, norm_stats = read_mode_config(self._ckpt_path)
+        contract_cfg, contract_cfg_path = load_checkpoint_contract_config(
+            self._ckpt_path,
+            accessed_config=model_cfg,
+        )
+
         logging.info("PolicyServerWrapper: loading framework from %s", self._ckpt_path)
         framework = baseframework.from_pretrained(self._ckpt_path)
-        #######
-        # 中文注释：E1.3 correlated noise——Cholesky buffer persistent=False 不进 ckpt，评测时从 ckpt 上两级目录
-        # 的 action_correlation_cholesky.npy 读出并注入；缺文件或非 jointflow 模型时安全跳过（不影响其它实验）。
+
+        # Correlated-noise is part of the checkpoint's inference distribution,
+        # not an optional optimization artifact.  If the run declares it, fail
+        # before serving rather than silently falling back to iid noise.
+        contract_action_cfg = ((contract_cfg.get("framework") or {}).get("action_model") or {})
+        accessed_action_cfg = ((model_cfg.get("framework") or {}).get("action_model") or {})
+        action_contract = {**accessed_action_cfg, **contract_action_cfg}
+        uses_correlated_noise = bool(action_contract.get("use_correlated_noise", False))
         chol_path = Path(self._ckpt_path).parents[1] / "action_correlation_cholesky.npy"
-        if chol_path.exists() and hasattr(framework, "set_action_correlation"):
-            framework.set_action_correlation(np.load(str(chol_path)))
+        if uses_correlated_noise:
+            if not chol_path.is_file():
+                raise FileNotFoundError(
+                    "Checkpoint declares use_correlated_noise=true but the required run artifact is missing: "
+                    f"{chol_path}. Sync action_correlation_cholesky.npy together with the checkpoint."
+                )
+            if not hasattr(framework, "set_action_correlation"):
+                raise RuntimeError(
+                    "Checkpoint declares use_correlated_noise=true but the loaded framework cannot inject its "
+                    "Cholesky factor."
+                )
+            horizon = int(action_contract.get("action_horizon", 0))
+            action_dim = int(action_contract.get("action_dim", 0))
+            expected_size = horizon * action_dim
+            if expected_size <= 0:
+                raise ValueError(
+                    "Invalid correlated-noise checkpoint contract: "
+                    f"action_horizon={horizon}, action_dim={action_dim}."
+                )
+            try:
+                cholesky = validate_action_correlation_cholesky(
+                    np.load(chol_path, allow_pickle=False),
+                    expected_size=expected_size,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                raise ValueError(f"Invalid correlated-noise artifact {chol_path}: {exc}") from exc
+            framework.set_action_correlation(cholesky)
             logging.info("PolicyServerWrapper: injected correlated-noise Cholesky from %s", chol_path)
-        #######
+
         #######
         # 中文注释：jointflow 训练用离线 DINO 特征（按 per-suite stats 标准化），eval 在线提取必须用同一份 stats。
         # 不加载则在线特征是原始尺度→视觉条件失效→SR≈0。stats 随 suite 不同，由 --dino_stats_path 指定。
@@ -81,13 +121,12 @@ class PolicyServerWrapper:
         self._framework = framework
 
         # Co-located metadata.
-        model_cfg, _ = read_mode_config(self._ckpt_path)
         self._model_cfg = model_cfg
-        contract_cfg, contract_cfg_path = load_checkpoint_contract_config(
-            self._ckpt_path,
-            accessed_config=model_cfg,
-        )
         self._contract_cfg_path = str(contract_cfg_path)
+        contract_vla_cfg = (contract_cfg.get("datasets") or {}).get("vla_data") or {}
+        self._image_layout = str(contract_vla_cfg.get("image_layout", "separate_views"))
+        self._composite_view_key = contract_vla_cfg.get("composite_view_key")
+        self._composite_source_view_keys = list(contract_vla_cfg.get("composite_source_view_keys", []) or [])
         self._state_normalizer: Optional[ComposedModalityTransform] = None
         self._state_keys: List[str] = []
         self._state_key_dims: Dict[str, int] = {}
@@ -99,6 +138,7 @@ class PolicyServerWrapper:
             self._state_contract_source,
             self._contract_cfg_path,
         )
+        self._sync_framework_state_contract(framework)
 
         # action_chunk_size = future_action_window_size + 1 (matches old client).
         action_model_cfg = model_cfg["framework"]["action_model"]
@@ -119,8 +159,7 @@ class PolicyServerWrapper:
         self._norm_processors: Dict[str, PolicyNormProcessor] = {}
 
         # Peek at available keys without building a full processor.
-        _, _ns = read_mode_config(self._ckpt_path)
-        self._available_unnorm_keys: List[str] = list(_ns.keys())
+        self._available_unnorm_keys: List[str] = list(norm_stats.keys())
 
         # Eagerly build when unambiguous; defer for multi-key / no explicit key.
         if unnorm_key is not None or len(self._available_unnorm_keys) == 1:
@@ -144,13 +183,49 @@ class PolicyServerWrapper:
             )
 
         if self._expects_state:
-            self._build_state_normalizer(contract_cfg, _ns)
+            self._build_state_normalizer(contract_cfg, norm_stats)
 
     @classmethod
     def _config_expects_state(cls, model_cfg: dict) -> bool:
         """Compatibility shim for callers/tests that only have a config dict."""
 
         return resolve_config_expects_state(model_cfg)[0]
+
+    def _sync_framework_state_contract(self, framework: baseframework) -> None:
+        """Make the loaded model consume exactly the checkpoint-declared state ABI.
+
+        Model construction intentionally uses the compact accessed-only config,
+        while the complete checkpoint contract may come from ``config.full.yaml``.
+        WAM checks ``framework.config`` again during every forward, so an old
+        compact config that omitted ``include_state`` must be synchronized after
+        construction. This changes only runtime input routing, not model shape.
+        """
+
+        source = self._state_contract_source
+        if not source.startswith("datasets.vla_data.include_state"):
+            return
+        uses_action_state = getattr(framework, "_uses_action_state", None)
+        if not callable(uses_action_state) or bool(uses_action_state()) == self._expects_state:
+            return
+
+        datasets_cfg = getattr(getattr(framework, "config", None), "datasets", None)
+        vla_cfg = getattr(datasets_cfg, "vla_data", None) if datasets_cfg is not None else None
+        if vla_cfg is None:
+            raise RuntimeError(
+                "PolicyServerWrapper: checkpoint declares a FastWAM state ABI, but the loaded framework has no "
+                "datasets.vla_data config to enforce it"
+            )
+        try:
+            vla_cfg["include_state"] = self._expects_state
+        except (TypeError, KeyError):
+            setattr(vla_cfg, "include_state", self._expects_state)
+        if bool(uses_action_state()) != self._expects_state:
+            raise RuntimeError("PolicyServerWrapper: failed to synchronize the framework's include_state contract")
+        logging.info(
+            "PolicyServerWrapper: synchronized framework include_state=%s from %s",
+            self._expects_state,
+            self._contract_cfg_path,
+        )
 
     def _build_state_normalizer(self, model_cfg: dict, norm_stats: dict) -> None:
         unnorm_key = self._default_unnorm_key
@@ -274,6 +349,9 @@ class PolicyServerWrapper:
             "expects_state": self._expects_state,
             "state_contract_source": self._state_contract_source,
             "contract_config": self._contract_cfg_path,
+            "image_layout": self._image_layout,
+            "composite_view_key": self._composite_view_key,
+            "composite_source_view_keys": self._composite_source_view_keys,
         }
         # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:

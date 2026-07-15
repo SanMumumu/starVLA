@@ -360,7 +360,8 @@ class FlowmatchingActionHead(nn.Module):
 
         #######
         # 中文注释：E1.3 correlated noise 的 Cholesky 缓存（flat=action_horizon·action_dim 的下三角），
-        # 训练启动时由 trainer 算好并 set_action_correlation 注入；未注入时即便开关打开也回退独立噪声。
+        # 训练启动时由 trainer 算好并 set_action_correlation 注入。开关打开但未注入属于 ABI 错误，
+        # _sample_initial_noise 会立即失败，禁止静默退回独立噪声。
         self.use_correlated_noise = bool(getattr(config, "use_correlated_noise", False))
         self.flow_matching_steps = int(getattr(config, "flow_matching_steps", 1))
         self.prediction_type = str(getattr(config, "prediction_type", "velocity")).lower()
@@ -417,14 +418,29 @@ class FlowmatchingActionHead(nn.Module):
     # 中文注释：E1.3——注入 correlated noise 的 Cholesky。训练时 trainer 启动算好注入；评测时 server 从
     # <run_dir>/action_correlation_cholesky.npy 读出注入（buffer persistent=False 不进 ckpt）。L 形状 [flat,flat]。
     def set_action_correlation(self, chol: torch.Tensor) -> None:
-        chol = torch.as_tensor(chol, dtype=torch.float32)
+        chol = torch.as_tensor(chol, dtype=torch.float32, device="cpu")
+        expected = tuple(self._action_corr_chol.shape)
+        if tuple(chol.shape) != expected:
+            raise ValueError(f"Action-correlation Cholesky shape={tuple(chol.shape)}, expected={expected}.")
+        if not bool(torch.isfinite(chol).all()):
+            raise ValueError("Action-correlation Cholesky contains NaN or infinite values.")
+        if not torch.allclose(chol, torch.tril(chol), rtol=0.0, atol=1.0e-6):
+            raise ValueError("Action-correlation Cholesky must be lower triangular.")
+        if not bool((torch.diagonal(chol) > 0).all()):
+            raise ValueError("Action-correlation Cholesky must have a strictly positive diagonal.")
         self._action_corr_chol.copy_(chol.to(self._action_corr_chol.device))
         self._action_corr_loaded = True
 
-    # 中文注释：采样 flow-matching 初始噪声（按 shape）。开关开且已注入 Σ-Cholesky 时用相关噪声 z@L^T，否则独立噪声。
+    # 中文注释：采样 flow-matching 初始噪声（按 shape）。开关开时必须已注入 Σ-Cholesky；
+    # 只有开关关闭时才使用独立噪声。
     # 训练 forward 与推理 predict_action 必须走同一个分布，否则 flow 从错误起点积分（E1.3 之前推理误用 randn → 0% SR）。
     def _sample_initial_noise(self, batch_size: int, device, dtype) -> torch.Tensor:
-        if self.use_correlated_noise and self._action_corr_loaded:
+        if self.use_correlated_noise:
+            if not self._action_corr_loaded:
+                raise RuntimeError(
+                    "use_correlated_noise=true but no action-correlation Cholesky factor was injected. "
+                    "Call set_action_correlation before training or inference."
+                )
             z = torch.randn(batch_size, self.action_horizon * self.action_dim, device=device, dtype=dtype)
             L = self._action_corr_chol.to(device=device, dtype=dtype)
             return (z @ L.T).reshape(batch_size, self.action_horizon, self.action_dim)

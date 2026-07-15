@@ -175,6 +175,23 @@ def test_padding_reduction_matches_fastwam_per_sample_mean():
     torch.testing.assert_close(loss, torch.tensor(6.0))
 
 
+def test_correlated_noise_never_silently_falls_back_to_iid():
+    head = FlowmatchingActionHead(_minimal_head_config())
+    head.use_correlated_noise = True
+
+    try:
+        head._sample_initial_noise(1, torch.device("cpu"), torch.float32)
+    except RuntimeError as exc:
+        assert "no action-correlation Cholesky" in str(exc)
+    else:
+        raise AssertionError("correlated-noise sampling unexpectedly fell back to IID")
+
+    head.set_action_correlation(torch.eye(4))
+    noise = head._sample_initial_noise(3, torch.device("cpu"), torch.float32)
+    assert noise.shape == (3, 2, 2)
+    assert torch.isfinite(noise).all()
+
+
 if __name__ == "__main__":
     test_lawam_dit_shape_is_consistent()
     test_velocity_parameterization_is_identity()
@@ -183,3 +200,4 @@ if __name__ == "__main__":
     test_prediction_type_does_not_change_checkpoint_structure()
     test_all_padded_actions_contribute_zero_loss()
     test_padding_reduction_matches_fastwam_per_sample_mean()
+    test_correlated_noise_never_silently_falls_back_to_iid()

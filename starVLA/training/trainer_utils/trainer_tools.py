@@ -604,8 +604,22 @@ def build_task_grad_groups(model):
     if world_model_head:
         groups["world_model_head"] = world_model_head
 
-    task_head = {"policy": "policy_head", "idm": "policy_head", "fdm": "world_model_head", "passive": "world_model_head"}
-    task_logname = {"policy": "policy", "idm": "inverse", "fdm": "fdm", "passive": "passive"}
+    task_head = {
+        "policy": "policy_head",
+        "idm": "policy_head",
+        "fdm": "world_model_head",
+        "passive": "world_model_head",
+        # Joint E2E activates both heads, so the single-head decomposition used
+        # by legacy alternating tasks is intentionally disabled for this task.
+        "joint_e2e": None,
+    }
+    task_logname = {
+        "policy": "policy",
+        "idm": "inverse",
+        "fdm": "fdm",
+        "passive": "passive",
+        "joint_e2e": "joint_e2e",
+    }
     return groups, task_head, task_logname
 
 

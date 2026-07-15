@@ -94,8 +94,8 @@ framework:
     correlation_beta: 0.5
     correlation_num_samples: 4096
     correlation_matrix_type: correlation
-    # Reuse the exact baseline matrix; fail instead of silently re-estimating.
-    correlation_cholesky_path: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_robotwin/starvla_qwengroot_robotwin_fastwam_jitx_corrnoise/action_correlation_cholesky.npy
+    # Clean-only must estimate its own 50 Hz/H=32 matrix from the 2,500 clean
+    # episodes.  Do not point this stage at the full/rand baseline matrix.
     num_target_vision_tokens: 32
 
     diffusion_model_cfg:
@@ -126,11 +126,15 @@ framework:
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/robotwin2.0-fastwam
+    data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/robotwin2.0-fastwam-clean-only
     data_mix: robotwin_fastwam
     lerobot_version: v2.0
-    fastwam_dataset_stats_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/robotwin2.0-fastwam/dataset_stats.json
+    fastwam_dataset_stats_path: /horizon-bucket/robot_lab/users/sen.wang-labs/robotwin2.0-fastwam-clean-only/dataset_stats.json
     fastwam_expected_fps: 50
+    fastwam_expected_episodes: 2500
+    # Clean frame count is checked against episodes.jsonl instead of hard-coding
+    # the full-release count (6,075,103).
+    fastwam_expected_frames: 0
     fastwam_val_fraction: 0.01
     fastwam_split: train
     fastwam_split_seed: 42
@@ -143,6 +147,7 @@ datasets:
     fastwam_wam_target: composite
     fastwam_future_stride: 32
 
+    # Clean branch intentionally conditions on current 14-D proprioception.
     include_state: true
     action_type: abs_qpos
     action_mode: abs

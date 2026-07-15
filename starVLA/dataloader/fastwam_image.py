@@ -15,6 +15,12 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as tvf
 
 
+FASTWAM_COMPOSITE_LAYOUT = "fastwam_composite"
+FASTWAM_COMPOSITE_VIEW_KEY = "video.fastwam_composite"
+# PIL/config order is (width, height); numpy/tensor order is (height, width).
+FASTWAM_COMPOSITE_SIZE = (320, 384)
+
+
 def _to_chw_float(image: Image.Image | np.ndarray) -> torch.Tensor:
     array = np.array(image.convert("RGB") if isinstance(image, Image.Image) else image, copy=True)
     if array.ndim != 3 or array.shape[-1] not in (1, 3, 4):
@@ -49,4 +55,9 @@ def build_robotwin_composite(images: Sequence[Image.Image | np.ndarray]) -> Imag
     return Image.fromarray(array, mode="RGB")
 
 
-__all__ = ["build_robotwin_composite"]
+__all__ = [
+    "FASTWAM_COMPOSITE_LAYOUT",
+    "FASTWAM_COMPOSITE_SIZE",
+    "FASTWAM_COMPOSITE_VIEW_KEY",
+    "build_robotwin_composite",
+]

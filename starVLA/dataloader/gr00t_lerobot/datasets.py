@@ -595,8 +595,13 @@ class LeRobotSingleDataset(Dataset):
         self.data_cfg = data_cfg
         if not Path(dataset_path).exists():
             raise FileNotFoundError(f"Dataset path {dataset_path} does not exist")
-        # indict letobot version
-        self._lerobot_version =  self.data_cfg.get("lerobot_version", "v2.0") #self._indict_lerobot_version(**kwargs)
+        # LeRobot v2.1 keeps the v2 episode-per-file layout consumed by this
+        # loader.  Normalize the public version name to the internal v2 path
+        # instead of forcing dataset configs to incorrectly declare v2.0.
+        requested_lerobot_version = str(self.data_cfg.get("lerobot_version", "v2.0"))
+        self._lerobot_version = (
+            "v2.0" if requested_lerobot_version in {"v2.0", "v2.1"} else requested_lerobot_version
+        )
 
         self._action_mode = None
         self._action_mode_state_map = {}
@@ -1395,11 +1400,35 @@ class LeRobotSingleDataset(Dataset):
 
     def _pack_sample(self, data: dict) -> dict:
         """Pack transformed modality data into training sample format."""
-        step_images = []
-        for video_key in self.modality_keys["video"]:
-            image = data[video_key][0]
-            image = Image.fromarray(image).resize((224, 224))
-            step_images.append(image)
+        video_keys = list(self.modality_keys["video"])
+        image_layout = str(
+            self.data_cfg.get("image_layout", "separate_views") if self.data_cfg is not None else "separate_views"
+        ).lower()
+        if image_layout == "fastwam_composite":
+            from starVLA.dataloader.fastwam_image import (
+                FASTWAM_COMPOSITE_SIZE,
+                build_robotwin_composite,
+            )
+
+            expected_source_keys = list(self.data_cfg.get("composite_source_view_keys", []))
+            if expected_source_keys and video_keys != expected_source_keys:
+                raise ValueError(
+                    "FastWAM composite camera order mismatch: "
+                    f"dataset={video_keys}, configured={expected_source_keys}"
+                )
+            step_images = [build_robotwin_composite([data[key][0] for key in video_keys])]
+            configured_size = tuple(int(value) for value in self.data_cfg.get("obs_image_size", FASTWAM_COMPOSITE_SIZE))
+            if configured_size != FASTWAM_COMPOSITE_SIZE or step_images[0].size != FASTWAM_COMPOSITE_SIZE:
+                raise ValueError(
+                    f"FastWAM composite must be {FASTWAM_COMPOSITE_SIZE} (width,height), "
+                    f"configured={configured_size}, actual={step_images[0].size}"
+                )
+        else:
+            step_images = []
+            for video_key in video_keys:
+                image = data[video_key][0]
+                image = Image.fromarray(image).resize((224, 224))
+                step_images.append(image)
 
         language = data[self.modality_keys["language"][0]][0]
         action = []

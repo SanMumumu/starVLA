@@ -5,8 +5,9 @@ ckpt_setting: null
 seed: null
 instruction_type: unseen
 
-# Checkpoint-compatible FastWAM client: one 384x320 composite image, current
-# 14-D proprio, release-order action vectors, and a 24/32 execution horizon.
+# Checkpoint-compatible FastWAM client: one 384x320 composite image,
+# checkpoint-declared optional 14-D proprio, release-order action vectors,
+# and a 24/32 execution horizon.
 host: "127.0.0.1"
 port: 5694
 unnorm_key: "new_embodiment"

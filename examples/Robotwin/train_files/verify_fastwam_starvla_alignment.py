@@ -27,6 +27,7 @@ def _job_path(name: str) -> Path:
         [
             REPO_ROOT.parent / "RBT" / name,
             REPO_ROOT / "RBT" / name,
+            REPO_ROOT / "执行脚本" / "RBT" / name,
         ]
     )
     for candidate in candidates:

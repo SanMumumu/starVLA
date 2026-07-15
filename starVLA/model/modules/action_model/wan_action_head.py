@@ -263,12 +263,26 @@ class WanFlowMatchingActionHead(nn.Module):
         return (self.noise_s - s) / self.noise_s
 
     def set_action_correlation(self, chol):
-        chol = torch.as_tensor(chol, dtype=torch.float32)
+        chol = torch.as_tensor(chol, dtype=torch.float32, device="cpu")
+        expected = tuple(self._action_corr_chol.shape)
+        if tuple(chol.shape) != expected:
+            raise ValueError(f"Action-correlation Cholesky shape={tuple(chol.shape)}, expected={expected}.")
+        if not bool(torch.isfinite(chol).all()):
+            raise ValueError("Action-correlation Cholesky contains NaN or infinite values.")
+        if not torch.allclose(chol, torch.tril(chol), rtol=0.0, atol=1.0e-6):
+            raise ValueError("Action-correlation Cholesky must be lower triangular.")
+        if not bool((torch.diagonal(chol) > 0).all()):
+            raise ValueError("Action-correlation Cholesky must have a strictly positive diagonal.")
         self._action_corr_chol.copy_(chol.to(self._action_corr_chol.device))
         self._action_corr_loaded = True
 
     def _sample_initial_noise(self, bsz, device, dtype):
-        if self.use_correlated_noise and self._action_corr_loaded:
+        if self.use_correlated_noise:
+            if not self._action_corr_loaded:
+                raise RuntimeError(
+                    "use_correlated_noise=true but no action-correlation Cholesky factor was injected. "
+                    "Call set_action_correlation before training or inference."
+                )
             z = torch.randn(bsz, self.action_horizon * self.action_dim, device=device, dtype=dtype)
             L = self._action_corr_chol.to(device=device, dtype=dtype)
             return (z @ L.T).reshape(bsz, self.action_horizon, self.action_dim)

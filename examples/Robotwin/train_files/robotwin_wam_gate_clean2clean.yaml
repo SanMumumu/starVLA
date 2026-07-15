@@ -1,5 +1,7 @@
 #######
 # FastWAM corrnoise strict ablation: FastWAM Clean subset, predicted gated bridge.
+# Stage 1 oracle warmup is 80k optimizer steps; this Stage 2 gate fine-tune is
+# 20k optimizer steps, so the two-stage budget matches the 100k joint-E2E run.
 #
 # Shared baseline contract: 50 Hz, z-score, action chunk 32, one 320x384
 # FastWAM composite, current 14-D proprio, release-order actions, batch 16,
@@ -8,7 +10,7 @@
 # and its gated dual-cross-attention injection into the action DiT.
 #######
 
-run_id: robotwin_wam_m5_fastwam_gate_clean2clean_h32_jitx_corrnoise
+run_id: robotwin_wam_m5_fastwam_gate_clean2clean_h32_jitx_corrnoise_20k
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin
 seed: 42
 wandb_entity: axi-the-cat
@@ -94,8 +96,8 @@ framework:
     correlation_beta: 0.5
     correlation_num_samples: 4096
     correlation_matrix_type: correlation
-    # Reuse the exact baseline matrix; fail instead of silently re-estimating.
-    correlation_cholesky_path: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_robotwin/starvla_qwengroot_robotwin_fastwam_jitx_corrnoise/action_correlation_cholesky.npy
+    # Reuse only the matrix estimated by the clean-only warmup stage.
+    correlation_cholesky_path: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin/robotwin_wam_m5_fastwam_warmup_clean_h32_jitx_corrnoise/action_correlation_cholesky.npy
     num_target_vision_tokens: 32
 
     diffusion_model_cfg:
@@ -126,11 +128,15 @@ framework:
 datasets:
   vla_data:
     dataset_py: lerobot_datasets
-    data_root_dir: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/robotwin2.0-fastwam
+    data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/robotwin2.0-fastwam-clean-only
     data_mix: robotwin_fastwam
     lerobot_version: v2.0
-    fastwam_dataset_stats_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/robotwin2.0-fastwam/dataset_stats.json
+    fastwam_dataset_stats_path: /horizon-bucket/robot_lab/users/sen.wang-labs/robotwin2.0-fastwam-clean-only/dataset_stats.json
     fastwam_expected_fps: 50
+    fastwam_expected_episodes: 2500
+    # Clean frame count is checked against episodes.jsonl instead of hard-coding
+    # the full-release count (6,075,103).
+    fastwam_expected_frames: 0
     fastwam_val_fraction: 0.01
     fastwam_split: train
     fastwam_split_seed: 42
@@ -143,6 +149,7 @@ datasets:
     fastwam_wam_target: composite
     fastwam_future_stride: 32
 
+    # Must match the clean warmup checkpoint's proprio-conditioned ABI.
     include_state: true
     action_type: abs_qpos
     action_mode: abs
@@ -160,7 +167,7 @@ datasets:
     persistent_workers: false
 
 trainer:
-  max_train_steps: 80000
+  max_train_steps: 20000
   num_warmup_steps: 2000
   save_interval: 10000
   eval_interval: 1000

@@ -19,6 +19,8 @@ from deployment.model_server.checkpoint_contract import (  # noqa: E402
     load_checkpoint_contract_config,
     resolve_config_expects_state,
 )
+from starVLA.dataloader.gr00t_lerobot.registry import ROBOT_TYPE_CONFIG_MAP  # noqa: E402
+from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform  # noqa: E402
 
 
 def _get(config: dict, path: str):
@@ -62,12 +64,6 @@ def verify(checkpoint: Path, replan_steps: int) -> dict:
             errors.append(f"{path}: expected {wanted!r}, got {actual!r}")
 
     expects_state, state_contract_source = resolve_config_expects_state(config)
-    if not expects_state:
-        errors.append(
-            "checkpoint must use the current 14-D proprio state; "
-            f"resolved expects_state=False ({state_contract_source}, config={contract_config_path})"
-        )
-
     if replan_steps != 24:
         errors.append(f"replan_steps must be 24 for this FastWAM evaluation, got {replan_steps}")
     if not 1 <= replan_steps <= 32:
@@ -77,7 +73,8 @@ def verify(checkpoint: Path, replan_steps: int) -> dict:
         errors.append(f"dataset_statistics.json must contain one embodiment, got {list(stats)}")
     else:
         tag, tag_stats = next(iter(stats.items()))
-        for modality in ("state", "action"):
+        required_modalities = ("state", "action") if expects_state else ("action",)
+        for modality in required_modalities:
             modality_stats = tag_stats.get(modality, {})
             for name in ("min", "max", "mean", "std", "q01", "q99"):
                 values = np.asarray(modality_stats.get(name), dtype=np.float64)
@@ -97,6 +94,25 @@ def verify(checkpoint: Path, replan_steps: int) -> dict:
             if matrix.shape != (448, 448) or not np.isfinite(matrix).all():
                 errors.append(f"invalid correlated-noise Cholesky: shape={matrix.shape}, path={cholesky}")
 
+    # Z-score is implemented by the robot data registry rather than a YAML
+    # scalar.  Check the exact transforms used by both training and server
+    # un-normalization so a stale uploaded registry cannot silently fall back
+    # to min-max/binary normalization.
+    data_config = ROBOT_TYPE_CONFIG_MAP.get("robotwin_fastwam")
+    if data_config is None:
+        errors.append("robotwin_fastwam data registry is missing")
+    else:
+        transforms = [
+            transform
+            for transform in data_config.transform().transforms
+            if isinstance(transform, StateActionTransform)
+        ]
+        if len(transforms) != 2 or any(
+            set(transform.normalization_modes.values()) != {"fastwam_zscore"}
+            for transform in transforms
+        ):
+            errors.append("robotwin_fastwam state/action transforms must both use fastwam_zscore")
+
     if errors:
         raise ValueError("FastWAM checkpoint contract failed:\n- " + "\n- ".join(errors))
     return {
@@ -107,7 +123,8 @@ def verify(checkpoint: Path, replan_steps: int) -> dict:
         "chunk": 32,
         "replan": replan_steps,
         "image": "one 320x384 composite",
-        "state": "14-D release order",
+        "state": "14-D release order" if expects_state else "disabled (request state is omitted)",
+        "expects_state": expects_state,
         "state_contract_source": state_contract_source,
         "action": "14-D release order",
     }

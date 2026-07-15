@@ -16,26 +16,30 @@ from starVLA.dataloader.fastwam_image import build_robotwin_composite
 
 
 class FastWAMRobotWinModelClient(StandardModelClient):
-    """Use the same composite/state/action ordering as FastWAM training."""
+    """Use FastWAM's composite/action ABI and its checkpoint-declared state ABI."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         if self.action_chunk_size != 32:
             raise RuntimeError(f"FastWAM checkpoint must expose action_chunk_size=32, got {self.action_chunk_size}")
-        if self.server_meta.get("expects_state") is not True:
+        expects_state = self.server_meta.get("expects_state")
+        if not isinstance(expects_state, bool):
             raise RuntimeError(
-                "FastWAM server did not declare expects_state=true. Refusing to evaluate because "
-                "dropping the checkpoint's 14-D proprio input would violate its training ABI. "
+                "FastWAM server did not declare a boolean expects_state contract. Refusing to guess whether "
+                "the checkpoint was trained with proprioception. "
                 f"server_meta={self.server_meta}"
             )
+        self.expects_state = expects_state
 
     def _prepare_images(self, images: list[np.ndarray]) -> list[np.ndarray]:
         composite = build_robotwin_composite(images)
         return [np.asarray(composite, dtype=np.uint8)]
 
-    def _prepare_state_for_server(self, state: Optional[np.ndarray]) -> np.ndarray:
+    def _prepare_state_for_server(self, state: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if not self.expects_state:
+            return None
         if state is None:
-            raise ValueError("FastWAM checkpoint requires the current 14-D proprio state")
+            raise ValueError("This FastWAM checkpoint was trained with include_state=true and requires 14-D state")
         state = np.asarray(state, dtype=np.float32)
         if state.size != 14:
             raise ValueError(f"FastWAM checkpoint requires exactly 14 state values, got shape={state.shape}")

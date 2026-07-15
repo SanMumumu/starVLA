@@ -225,7 +225,16 @@ def merge_framework_config(default_config_cls, cfg):
         yaml_fw = OmegaConf.create({})
 
     # 3. Merge: defaults first, YAML overrides (YAML wins on conflicts)
+    # ``tasks.weights`` is an atomic task set, not a bag of per-key defaults.
+    # A recursive DictConfig merge would otherwise turn YAML
+    # ``{joint_e2e: 1}`` plus the QwenGR00T default ``{policy: 1}`` into two
+    # active tasks, silently changing the requested objective.
+    yaml_task_weights = OmegaConf.select(yaml_fw, "tasks.weights", default=None)
     merged_fw = OmegaConf.merge(defaults_omega, yaml_fw)
+    if yaml_task_weights is not None:
+        merged_fw.tasks.weights = OmegaConf.create(
+            OmegaConf.to_container(yaml_task_weights, resolve=False)
+        )
 
     # 4. Write back into the original cfg
     #    Handle both OmegaConf and AccessTrackedConfig transparently

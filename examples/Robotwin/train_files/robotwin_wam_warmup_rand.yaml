@@ -2,7 +2,7 @@
 # FastWAM corrnoise strict ablation: full FastWAM release (27,500 episodes), oracle warmup.
 #
 # Shared baseline contract: 50 Hz, z-score, action chunk 32, one 320x384
-# FastWAM composite, current 14-D proprio, release-order actions, batch 16,
+# FastWAM composite, no proprio input, release-order actions, batch 16,
 # seeded 99/1 split and without-replacement global-frame sampling.
 # Added components are limited to the future-composite DINO-L prediction head
 # and its gated dual-cross-attention injection into the action DiT.
@@ -142,7 +142,8 @@ datasets:
     fastwam_wam_target: composite
     fastwam_future_stride: 32
 
-    include_state: true
+    # Rand branch follows the standard StarVLA no-proprio policy ABI.
+    include_state: false
     action_type: abs_qpos
     action_mode: abs
     sequential_step_sampling: false

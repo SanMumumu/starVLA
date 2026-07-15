@@ -5,7 +5,9 @@ fields can therefore be absent even though they are present in the complete
 ``config.full.yaml`` saved beside it.  Model construction must keep using the
 accessed snapshot for backwards compatibility, while deployment code may use
 the complete snapshot to recover input/output ABI facts such as whether the
-checkpoint was conditioned on proprioception.
+checkpoint was conditioned on proprioception. The server may synchronize such
+an input-routing flag after strict model construction because it does not alter
+the checkpoint's parameter structure.
 """
 
 from __future__ import annotations
@@ -54,60 +56,26 @@ def load_checkpoint_contract_config(
     return config, selected_path
 
 
-def _get(config: dict, path: str, default: Any = None) -> Any:
-    value: Any = config
-    for key in path.split("."):
-        if not isinstance(value, dict) or key not in value:
-            return default
-        value = value[key]
-    return value
-
-
 def _truthy(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"", "0", "false", "none", "no"}
     return bool(value)
 
 
-def _is_legacy_fastwam_iid_contract(config: dict) -> bool:
-    """Recognize the original FastWAM IID ABI when no full config survives."""
-
-    markers = {
-        "framework.name": "QwenGR00T",
-        "framework.action_model.action_dim": 14,
-        "framework.action_model.state_dim": 14,
-        "framework.action_model.action_horizon": 32,
-        "datasets.vla_data.dataset_py": "lerobot_datasets",
-        "datasets.vla_data.data_mix": "robotwin_fastwam",
-        "datasets.vla_data.fastwam_expected_fps": 50,
-        "datasets.vla_data.fastwam_direct_frame_sampling": True,
-        "datasets.vla_data.action_mode": "abs",
-        "datasets.vla_data.obs_image_size": [320, 384],
-    }
-    return all(_get(config, path) == wanted for path, wanted in markers.items())
-
-
 def resolve_config_expects_state(config: dict) -> Tuple[bool, str]:
-    """Resolve whether inference must provide state, plus an audit reason.
+    """Read the training YAML's state switch for inference.
 
-    An explicit ``include_state`` always wins, including explicit ``false``.
-    The strict FastWAM fallback is only for old accessed-only snapshots where
-    the key is absent and every other distinctive IID ABI marker is present.
+    ``config.full.yaml`` preserves the submitted YAML.  Do not infer this ABI
+    from run names, dataset markers, or AIDI metadata: an absent field keeps the
+    historical no-state behavior.
     """
 
     vla_cfg = (config.get("datasets") or {}).get("vla_data") or {}
     if "include_state" in vla_cfg:
         enabled = _truthy(vla_cfg["include_state"])
-        return enabled, f"explicit datasets.vla_data.include_state={enabled}"
+        return enabled, f"datasets.vla_data.include_state={enabled}"
 
-    state_cfg = (config.get("framework") or {}).get("state") or {}
-    if str(state_cfg.get("inject_mode", "none")) == "token":
-        return True, "framework.state.inject_mode=token"
-
-    if _is_legacy_fastwam_iid_contract(config):
-        return True, "legacy FastWAM IID ABI inferred from strict 50Hz/32-step/320x384 markers"
-
-    return False, "no explicit state-conditioning contract"
+    return False, "datasets.vla_data.include_state missing; default=False"
 
 
 __all__ = [

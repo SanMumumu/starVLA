@@ -3,10 +3,53 @@
 import numpy as np
 
 
+def validate_action_correlation_cholesky(
+    cholesky: np.ndarray,
+    *,
+    expected_size: int | None = None,
+    triangular_atol: float = 1.0e-6,
+) -> np.ndarray:
+    """Validate and return a float32 action-noise Cholesky factor.
+
+    Correlated-noise checkpoints depend on this matrix at both training and
+    inference time.  Silently accepting a malformed/stale array (or falling
+    back to iid noise) changes the model's sampling distribution, so keep the
+    artifact contract deliberately strict.
+    """
+
+    matrix = np.asarray(cholesky)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError(f"Expected a square Cholesky matrix, got shape={matrix.shape}.")
+    if expected_size is not None and matrix.shape != (int(expected_size), int(expected_size)):
+        raise ValueError(
+            f"Cholesky shape={matrix.shape}, expected ({int(expected_size)}, {int(expected_size)})."
+        )
+    if not np.issubdtype(matrix.dtype, np.number):
+        raise TypeError(f"Cholesky matrix must be numeric, got dtype={matrix.dtype}.")
+    matrix = matrix.astype(np.float64, copy=False)
+    if not np.isfinite(matrix).all():
+        raise ValueError("Cholesky matrix contains NaN or infinite values.")
+    if not np.allclose(matrix, np.tril(matrix), rtol=0.0, atol=float(triangular_atol)):
+        # The matrix is guaranteed non-empty above.  Avoid ndarray.max(initial=...)
+        # so this validation also works with the older NumPy shipped by some
+        # cluster images.
+        upper_max = float(np.abs(np.triu(matrix, k=1)).max())
+        raise ValueError(f"Cholesky matrix is not lower triangular (max upper value={upper_max:g}).")
+    diagonal = np.diag(matrix)
+    if np.any(diagonal <= 0.0):
+        raise ValueError(
+            "Cholesky matrix must have a strictly positive diagonal; "
+            f"minimum diagonal={float(diagonal.min()):g}."
+        )
+    return matrix.astype(np.float32, copy=False)
+
+
 def _validate_action_rows(rows: np.ndarray) -> np.ndarray:
     rows = np.asarray(rows, dtype=np.float64)
     if rows.ndim != 2 or rows.shape[0] < 2:
         raise ValueError(f"Expected at least two flattened action chunks, got shape={rows.shape}.")
+    if not np.isfinite(rows).all():
+        raise ValueError("Flattened action chunks contain NaN or infinite values.")
     return rows
 
 

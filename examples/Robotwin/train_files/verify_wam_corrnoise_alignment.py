@@ -22,6 +22,7 @@ WAM_NAMES = (
     "robotwin_wam_gate_clean2clean.yaml",
 )
 DINO_LOCAL_DIR = "/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO/"
+CLEAN_DATA_ROOT = "/horizon-bucket/robot_lab/users/sen.wang-labs/robotwin2.0-fastwam-clean-only"
 
 
 def _job_dir() -> Path:
@@ -38,6 +39,7 @@ def _job_dir() -> Path:
         [
             REPO_ROOT.parent / "RBT",
             REPO_ROOT / "RBT",
+            REPO_ROOT / "执行脚本" / "RBT",
         ]
     )
     for candidate in candidates:
@@ -71,6 +73,12 @@ def main(*, check_files: bool = False, target: str | None = None) -> None:
     job_dir = _job_dir()
     errors = []
     baseline_cholesky = str(Path(baseline["run_root_dir"]) / baseline["run_id"] / "action_correlation_cholesky.npy")
+    clean_warmup = configs["robotwin_wam_warmup_clean.yaml"]
+    clean_warmup_cholesky = str(
+        Path(clean_warmup["run_root_dir"])
+        / clean_warmup["run_id"]
+        / "action_correlation_cholesky.npy"
+    )
 
     for name, config in configs.items():
         clean = "warmup_clean" in name or "clean2clean" in name
@@ -91,20 +99,36 @@ def main(*, check_files: bool = False, target: str | None = None) -> None:
         action_diff = _diff(action, baseline["framework"]["action_model"])
         if action_diff:
             errors.append(f"{name}: action_model differs from baseline at {action_diff}")
-        if source != baseline_cholesky:
-            errors.append(f"{name}: must reuse baseline Cholesky {baseline_cholesky}, got {source!r}")
+        if clean and not gate:
+            if source is not None:
+                errors.append(
+                    f"{name}: clean warmup must estimate its own Cholesky, got external source {source!r}"
+                )
+        else:
+            expected_source = clean_warmup_cholesky if clean else baseline_cholesky
+            if source != expected_source:
+                errors.append(f"{name}: correlation source expected {expected_source}, got {source!r}")
         if "flow_matching_steps" in framework["action_model"]:
             errors.append(f"{name}: flow_matching_steps must not replace baseline repeated_diffusion_steps")
         if "n_action_query" in framework["action_model"]:
             errors.append(f"{name}: effective n_action_query must inherit action_horizon=32")
 
         data = deepcopy(config["datasets"]["vla_data"])
+        baseline_data = deepcopy(baseline["datasets"]["vla_data"])
         wam_targets = data.pop("fastwam_wam_targets", None)
         wam_target = data.pop("fastwam_wam_target", None)
         future_stride = data.pop("fastwam_future_stride", None)
         domain = data.pop("fastwam_domain", "all")
         expected_domain_count = data.pop("fastwam_expected_domain_episodes", None)
-        data_diff = _diff(data, baseline["datasets"]["vla_data"])
+        expected_episode_count = data.pop("fastwam_expected_episodes", None)
+        expected_frame_count = data.pop("fastwam_expected_frames", None)
+        data_root = data.pop("data_root_dir", None)
+        stats_path = data.pop("fastwam_dataset_stats_path", None)
+        include_state = data.pop("include_state", None)
+        baseline_root = baseline_data.pop("data_root_dir", None)
+        baseline_stats_path = baseline_data.pop("fastwam_dataset_stats_path", None)
+        baseline_data.pop("include_state", None)
+        data_diff = _diff(data, baseline_data)
         if data_diff:
             errors.append(f"{name}: shared dataset config differs from baseline at {data_diff}")
         if wam_targets is not True or wam_target != "composite" or future_stride != 32:
@@ -114,20 +138,46 @@ def main(*, check_files: bool = False, target: str | None = None) -> None:
         if clean:
             if domain != "clean" or expected_domain_count != 2500:
                 errors.append(f"{name}: clean subset must be provenance-filtered to exactly 2500 episodes")
-        elif domain != "all" or expected_domain_count is not None:
-            errors.append(f"{name}: rand/full setting must use the complete FastWAM release")
+            if data_root != CLEAN_DATA_ROOT or stats_path != f"{CLEAN_DATA_ROOT}/dataset_stats.json":
+                errors.append(f"{name}: clean setting must use the exported clean-only dataset at {CLEAN_DATA_ROOT}")
+            if expected_episode_count != 2500 or expected_frame_count != 0:
+                errors.append(
+                    f"{name}: clean preflight must expect 2500 episodes and derive its frame count from metadata"
+                )
+            if include_state is not True:
+                errors.append(f"{name}: clean setting must use include_state=true")
+        else:
+            if domain != "all" or expected_domain_count is not None:
+                errors.append(f"{name}: rand/full setting must use the complete FastWAM release")
+            if data_root != baseline_root or stats_path != baseline_stats_path:
+                errors.append(f"{name}: rand/full setting must reuse the corrnoise baseline dataset and statistics")
+            if expected_episode_count is not None or expected_frame_count is not None:
+                errors.append(f"{name}: rand/full setting must retain the full-release preflight defaults")
+            if include_state is not False:
+                errors.append(f"{name}: rand/full setting must use include_state=false")
 
         trainer = deepcopy(config["trainer"])
         pretrained = trainer.pop("pretrained_checkpoint", None)
         is_resume = trainer.pop("is_resume", None)
+        max_train_steps = int(trainer.pop("max_train_steps", 0))
         trainer.pop("log_grad_norms", None)
         trainer.pop("deepspeed_skip_unused_param_anchors", None)
-        trainer_diff = _diff(trainer, baseline["trainer"])
+        baseline_trainer = deepcopy(baseline["trainer"])
+        baseline_max_train_steps = int(baseline_trainer.pop("max_train_steps", 0))
+        trainer_diff = _diff(trainer, baseline_trainer)
         if trainer_diff:
             errors.append(f"{name}: shared trainer hyperparameters differ from baseline at {trainer_diff}")
+        expected_steps = 20000 if gate else baseline_max_train_steps
+        if max_train_steps != expected_steps:
+            errors.append(
+                f"{name}: max_train_steps expected {expected_steps} "
+                f"({'80k warmup + 20k gate = 100k' if gate else 'stage-1 warmup'}), got {max_train_steps}"
+            )
         if is_resume is not False:
             errors.append(f"{name}: is_resume must be false")
         if gate:
+            if not str(config.get("run_id", "")).endswith("_20k"):
+                errors.append(f"{name}: 20k gate run_id must end with '_20k'")
             warmup = "clean" if clean else "rand"
             wanted = (
                 "/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin/"
@@ -139,13 +189,14 @@ def main(*, check_files: bool = False, target: str | None = None) -> None:
             errors.append(f"{name}: warmup must start without a pretrained WAM checkpoint")
 
         if check_files and (target is None or name == target):
-            matrix_path = Path(source)
-            if not matrix_path.is_file():
-                errors.append(f"{name}: missing fixed baseline Cholesky {matrix_path}")
-            else:
-                matrix = np.load(matrix_path, allow_pickle=False)
-                if matrix.shape != (448, 448) or not np.isfinite(matrix).all():
-                    errors.append(f"{name}: invalid baseline Cholesky shape/content at {matrix_path}")
+            if source is not None:
+                matrix_path = Path(source)
+                if not matrix_path.is_file():
+                    errors.append(f"{name}: missing configured Cholesky {matrix_path}")
+                else:
+                    matrix = np.load(matrix_path, allow_pickle=False)
+                    if matrix.shape != (448, 448) or not np.isfinite(matrix).all():
+                        errors.append(f"{name}: invalid Cholesky shape/content at {matrix_path}")
             dino_cfg = framework.get("dino", {})
             if dino_cfg.get("loader") in {"auto", "torchhub"}:
                 repo = Path(str(dino_cfg.get("repo_or_dir", "")))
@@ -232,9 +283,11 @@ def main(*, check_files: bool = False, target: str | None = None) -> None:
         if job.get("REQUIRED", {}).get("WORKER_MIN_NUM") != 6 or job.get("REQUIRED", {}).get("GPU_PER_WORKER") != 8:
             errors.append(f"{name}: AIDI scale must remain 6x8")
         remark = str(job.get("OPTIONAL", {}).get("REMARK", "")).lower()
-        for token in ("h32", "composite", "proprio", "bs16"):
+        for token in ("h32", "composite", "bs16", "proprio" if clean else "no-state"):
             if token not in remark:
                 errors.append(f"{name}: AIDI remark missing {token!r}")
+        if gate and "20k" not in remark:
+            errors.append(f"{name}: AIDI remark must declare the 20k gate budget")
 
     model_source = (REPO_ROOT / "starVLA/model/framework/VLM4A/QwenGR00T.py").read_text(encoding="utf-8")
     for symbol in (
@@ -271,8 +324,10 @@ def main(*, check_files: bool = False, target: str | None = None) -> None:
     if errors:
         raise SystemExit("WAM/FastWAM strict-ablation audit failed:\n- " + "\n- ".join(errors))
     print(
-        "WAM/FastWAM strict-ablation PASS: shared action/data/trainer fields equal the corrnoise baseline; "
-        "only future three-view-composite prediction/gating delivery and clean-domain selection differ."
+        "WAM/FastWAM contract PASS: warmup=80k and gate=20k (two-stage total=100k); "
+        "shared action/data/trainer fields equal the corrnoise baseline; "
+        "rand reuses the full-release correlation, clean estimates/reuses only its own correlation, and the "
+        "declared factors are future-composite prediction/gating plus clean=true/rand=false proprio conditioning."
     )
 
 

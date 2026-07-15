@@ -229,6 +229,8 @@ def test_fastwam_checkpoint_sample_and_direct_sampler() -> None:
         wrapper._expects_state = True
         prepared = wrapper._prepare_examples([{"state": source.copy(), "image": sample["image"]}])[0]
         np.testing.assert_allclose(prepared["state"][0], normalized, rtol=2e-5, atol=2e-5)
+        wrapper._expects_state = False
+        assert "state" not in wrapper._prepare_examples([{"state": source.copy(), "image": sample["image"]}])[0]
         from examples.Robotwin.eval_files.verify_fastwam_checkpoint_contract import verify
 
         assert verify(checkpoint, replan_steps=24)["replan"] == 24
@@ -270,6 +272,11 @@ def test_fastwam_split_domain_and_wam_composite_target() -> None:
         np.random.default_rng(42).shuffle(order)
         assert split.trajectory_ids.tolist() == order[:3]
 
+        no_state = get_vla_dataset(_config(root, include_state=False))
+        _mock_video(no_state)
+        no_state_sample = no_state._pack_sample(no_state.transforms(no_state.get_step_data(0, 0)))
+        assert "state" not in no_state_sample
+
 
 def test_fastwam_train_infer_order_and_contract() -> None:
     from deployment.model_server.policy_wrapper import PolicyServerWrapper
@@ -286,7 +293,10 @@ def test_fastwam_train_infer_order_and_contract() -> None:
     prepared = client._prepare_images(images)
     assert len(prepared) == 1 and prepared[0].shape == (384, 320, 3)
     state = np.arange(14, dtype=np.float32)
+    client.expects_state = True
     np.testing.assert_array_equal(client._prepare_state_for_server(state), state.reshape(1, 14))
+    client.expects_state = False
+    assert client._prepare_state_for_server(state) is None
     np.testing.assert_array_equal(client._prepare_action_for_env(state), state)
 
 
@@ -297,6 +307,7 @@ def test_fastwam_real_cluster_config_snapshots() -> None:
         load_checkpoint_contract_config,
         resolve_config_expects_state,
     )
+    from deployment.model_server.policy_wrapper import PolicyServerWrapper
     from examples.Robotwin.eval_files.verify_fastwam_checkpoint_contract import verify
 
     snapshot_dir = REPO_ROOT / "执行脚本/集群FastWAM IID checkpoint yaml"
@@ -310,8 +321,27 @@ def test_fastwam_real_cluster_config_snapshots() -> None:
     explicit_false["datasets"]["vla_data"]["include_state"] = False
     assert resolve_config_expects_state(explicit_false) == (
         False,
-        "explicit datasets.vla_data.include_state=False",
+        "datasets.vla_data.include_state=False",
     )
+
+    class _RuntimeFramework:
+        def __init__(self):
+            self.config = OmegaConf.create({"datasets": {"vla_data": {}}})
+
+        def _uses_action_state(self):
+            return bool(self.config.datasets.vla_data.get("include_state", False))
+
+    runtime_framework = _RuntimeFramework()
+    wrapper = PolicyServerWrapper.__new__(PolicyServerWrapper)
+    wrapper._expects_state = True
+    wrapper._state_contract_source = "datasets.vla_data.include_state=True"
+    wrapper._contract_cfg_path = "config.full.yaml"
+    wrapper._sync_framework_state_contract(runtime_framework)
+    assert runtime_framework._uses_action_state() is True
+    wrapper._expects_state = False
+    wrapper._state_contract_source = "datasets.vla_data.include_state=False"
+    wrapper._sync_framework_state_contract(runtime_framework)
+    assert runtime_framework._uses_action_state() is False
 
     values = [0.0] * 14
     modality_stats = {
@@ -343,19 +373,27 @@ def test_fastwam_real_cluster_config_snapshots() -> None:
         assert contract_path.name == "config.full.yaml"
         assert resolve_config_expects_state(contract_cfg) == (
             True,
-            "explicit datasets.vla_data.include_state=True",
+            "datasets.vla_data.include_state=True",
         )
         summary = verify(checkpoint, replan_steps=24)
         assert Path(summary["contract_config"]).name == "config.full.yaml"
+        assert summary["expects_state"] is True
 
-        # Old runs without a full snapshot are accepted only through the
-        # distinctive, strict FastWAM IID marker set.
+        full_no_state = yaml.safe_load(full_source.read_text(encoding="utf-8"))
+        full_no_state["datasets"]["vla_data"]["include_state"] = False
+        (run_dir / "config.full.yaml").write_text(yaml.safe_dump(full_no_state), encoding="utf-8")
+        no_state_summary = verify(checkpoint, replan_steps=24)
+        assert no_state_summary["expects_state"] is False
+        assert no_state_summary["state"] == "disabled (request state is omitted)"
+
+        # If an old run has no full snapshot and its compact config omitted the
+        # switch, inference keeps the historical no-state default.
         (run_dir / "config.full.yaml").unlink()
         fallback_cfg, fallback_path = load_checkpoint_contract_config(checkpoint, accessed_config=accessed)
         expects_state, source = resolve_config_expects_state(fallback_cfg)
         assert fallback_path.name == "config.yaml"
-        assert expects_state is True
-        assert source.startswith("legacy FastWAM IID ABI inferred")
+        assert expects_state is False
+        assert source == "datasets.vla_data.include_state missing; default=False"
         assert verify(checkpoint, replan_steps=24)["state_contract_source"] == source
 
 
@@ -376,6 +414,324 @@ def test_fastwam_cluster_preflight_fixture() -> None:
         assert summary["domain_counts"] == {"clean": 2, "randomized": 2, "unknown": 0}
 
 
+def test_correlated_noise_artifact_is_a_strict_train_deploy_contract() -> None:
+    from unittest.mock import patch
+
+    import deployment.model_server.policy_wrapper as wrapper_module
+    from starVLA.dataloader.action_correlation import validate_action_correlation_cholesky
+
+    expected_size = 4
+    valid = np.eye(expected_size, dtype=np.float32)
+    np.testing.assert_array_equal(
+        validate_action_correlation_cholesky(valid, expected_size=expected_size),
+        valid,
+    )
+    invalid_upper = valid.copy()
+    invalid_upper[0, 1] = 0.1
+    with np.testing.assert_raises_regex(ValueError, "lower triangular"):
+        validate_action_correlation_cholesky(invalid_upper, expected_size=expected_size)
+    invalid_diagonal = valid.copy()
+    invalid_diagonal[-1, -1] = 0.0
+    with np.testing.assert_raises_regex(ValueError, "positive diagonal"):
+        validate_action_correlation_cholesky(invalid_diagonal, expected_size=expected_size)
+
+    class _Framework:
+        def __init__(self):
+            self.injected = None
+
+        def set_action_correlation(self, value):
+            self.injected = np.asarray(value)
+
+        def to(self, *_args, **_kwargs):
+            return self
+
+        def eval(self):
+            return self
+
+    config = {
+        "framework": {
+            "action_model": {
+                "use_correlated_noise": True,
+                "action_horizon": 2,
+                "action_dim": 2,
+            }
+        },
+        "datasets": {"vla_data": {"include_state": False}},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "run"
+        checkpoint = run_dir / "checkpoints" / "steps_1_pytorch_model.pt"
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.touch()
+        framework = _Framework()
+
+        def construct():
+            with (
+                patch.object(wrapper_module.baseframework, "from_pretrained", return_value=framework),
+                patch.object(wrapper_module, "read_mode_config", return_value=(config, {})),
+                patch.object(
+                    wrapper_module,
+                    "load_checkpoint_contract_config",
+                    return_value=(config, run_dir / "config.full.yaml"),
+                ),
+            ):
+                return wrapper_module.PolicyServerWrapper(str(checkpoint), device="cpu")
+
+        with np.testing.assert_raises_regex(FileNotFoundError, "required run artifact"):
+            construct()
+
+        np.save(run_dir / "action_correlation_cholesky.npy", valid)
+        construct()
+        np.testing.assert_array_equal(framework.injected, valid)
+
+        # The new joint-E2E runs explicitly use IID noise. Deployment must not
+        # require or inject a Cholesky artifact when the checkpoint says false.
+        config["framework"]["action_model"]["use_correlated_noise"] = False
+        (run_dir / "action_correlation_cholesky.npy").unlink()
+        framework.injected = None
+        construct()
+        assert framework.injected is None
+
+
+def test_joint_e2e_rand_clean_yaml_contracts() -> None:
+    """The two E2E runs differ only where the experiment requires it."""
+
+    from deployment.model_server.checkpoint_contract import resolve_config_expects_state
+    from starVLA.dataloader.gr00t_lerobot.registry import ROBOT_TYPE_CONFIG_MAP
+    from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
+
+    config_dir = REPO_ROOT / "examples/Robotwin/train_files"
+    rand = yaml.safe_load((config_dir / "robotwin_wam_e2e_rand.yaml").read_text(encoding="utf-8"))
+    clean = yaml.safe_load((config_dir / "robotwin_wam_e2e_clean.yaml").read_text(encoding="utf-8"))
+
+    for cfg in (rand, clean):
+        weights = cfg["framework"]["tasks"]["weights"]
+        assert [name for name, weight in weights.items() if float(weight) > 0] == ["joint_e2e"]
+        guidance = cfg["framework"]["wam"]["guidance"]
+        assert guidance["bridge_source"] == "predicted"
+        assert guidance["detach_world"] is False
+        assert guidance["oracle_ratio"] == 0.0
+        assert guidance["gate_init"] == 0.0
+        assert guidance["exclude_post_query_context"] is True
+        assert guidance["action_world_gradient_ramp"] == {
+            "enabled": True,
+            "start_step": 10000,
+            "end_step": 30000,
+            "start_scale": 0.0,
+            "end_scale": 1.0,
+        }
+        assert cfg["framework"]["wam"]["dino_loss_weight"] == 0.01
+        assert cfg["framework"]["action_model"]["action_horizon"] == 32
+        assert cfg["datasets"]["vla_data"]["fastwam_future_stride"] == 32
+        assert cfg["datasets"]["vla_data"]["obs_image_size"] == [320, 384]
+        assert cfg["framework"]["dino"]["image_size"] == [384, 320]
+        assert cfg["framework"]["dino"]["future_view_keys"] == ["video.robotwin_composite"]
+        assert cfg["framework"]["visual_model"]["max_target_tokens"] == 480
+        assert cfg["datasets"]["vla_data"]["per_device_batch_size"] == 16
+        assert cfg["trainer"]["gradient_accumulation_steps"] == 1
+        action_cfg = cfg["framework"]["action_model"]
+        assert action_cfg["use_correlated_noise"] is False
+        assert "correlation_cholesky_path" not in action_cfg
+        assert not any(str(key).startswith("correlation_") for key in action_cfg)
+        assert cfg["framework"]["qwenvl"]["attn_implementation"] == "flash_attention_2"
+        assert "iidnoise" in cfg["run_id"] and "corrnoise" not in cfg["run_id"]
+
+    assert resolve_config_expects_state(rand)[0] is False
+    assert resolve_config_expects_state(clean)[0] is True
+    assert rand["datasets"]["vla_data"]["fastwam_dataset_stats_path"] != clean["datasets"]["vla_data"][
+        "fastwam_dataset_stats_path"
+    ]
+    assert clean["datasets"]["vla_data"]["fastwam_domain"] == "clean"
+
+    data_config = ROBOT_TYPE_CONFIG_MAP["robotwin_fastwam"]
+    state_action_transforms = [
+        transform for transform in data_config.transform().transforms if isinstance(transform, StateActionTransform)
+    ]
+    assert len(state_action_transforms) == 2
+    assert all(
+        set(transform.normalization_modes.values()) == {"fastwam_zscore"}
+        for transform in state_action_transforms
+    )
+
+
+def test_robodojo_train_and_deploy_contracts() -> None:
+    """RoboDojo must keep one 25 Hz state/image/action ABI end to end."""
+
+    from starVLA.dataloader.gr00t_lerobot.registry import (
+        DATASET_NAMED_MIXTURES,
+        ROBOT_TYPE_CONFIG_MAP,
+    )
+    from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
+
+    train_dir = REPO_ROOT / "examples/RoboDojo/train_files"
+    configs = {
+        name: yaml.safe_load((train_dir / name).read_text(encoding="utf-8"))
+        for name in (
+            "starvla_qwengroot_robodojo_baseline.yaml",
+            "starvla_qwengroot_robodojo_wam_warmup.yaml",
+            "starvla_qwengroot_robodojo_wam_gate.yaml",
+            "starvla_qwengroot_robodojo_wam_e2e.yaml",
+        )
+    }
+    source_views = ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
+    for cfg in configs.values():
+        action_cfg = cfg["framework"]["action_model"]
+        data_cfg = cfg["datasets"]["vla_data"]
+        assert action_cfg["action_dim"] == action_cfg["state_dim"] == 14
+        assert action_cfg["action_horizon"] == 16
+        assert data_cfg["data_root_dir"] == "/horizon-bucket/robot_lab/users/sen.wang-labs/RoboDojo"
+        assert data_cfg["data_mix"] == "robodojo_v21"
+        assert data_cfg["include_state"] is True
+        assert data_cfg["video_backend"] == "pyav"
+        assert data_cfg["image_layout"] == "fastwam_composite"
+        assert data_cfg["composite_source_view_keys"] == source_views
+        assert data_cfg["composite_view_key"] == "video.fastwam_composite"
+        assert data_cfg["obs_image_size"] == [320, 384]
+
+    baseline = configs["starvla_qwengroot_robodojo_baseline.yaml"]
+    warmup = configs["starvla_qwengroot_robodojo_wam_warmup.yaml"]
+    gate = configs["starvla_qwengroot_robodojo_wam_gate.yaml"]
+    e2e = configs["starvla_qwengroot_robodojo_wam_e2e.yaml"]
+    assert baseline["datasets"]["vla_data"]["dataset_py"] == "lerobot_datasets"
+    assert "correlation_cholesky_path" not in baseline["framework"]["action_model"]
+    for cfg in (warmup, gate, e2e):
+        assert cfg["datasets"]["vla_data"]["dataset_py"] == "jointflow"
+        assert cfg["datasets"]["vla_data"]["action_horizon"] == 16
+        assert cfg["datasets"]["vla_data"]["world_model"]["future_stride"] == 16
+        assert cfg["datasets"]["vla_data"]["future_valid_requires_full_stride"] is True
+        assert cfg["framework"]["dino"]["image_size"] == [384, 320]
+        assert cfg["framework"]["dino"]["future_view_keys"] == ["video.fastwam_composite"]
+        assert cfg["framework"]["visual_model"]["max_target_tokens"] == 480
+
+    warm_corr = warmup["framework"]["action_model"]["correlation_cholesky_path"]
+    gate_corr = gate["framework"]["action_model"]["correlation_cholesky_path"]
+    assert baseline["run_id"] in warm_corr
+    assert warmup["run_id"] in gate_corr
+    assert "robotwin" not in warm_corr.lower() and "robotwin" not in gate_corr.lower()
+    assert gate["trainer"]["pretrained_checkpoint"].startswith(
+        f"{gate['run_root_dir']}/{warmup['run_id']}/"
+    )
+    assert warmup["framework"]["wam"]["guidance"]["bridge_source"] == "oracle"
+    assert warmup["framework"]["wam"]["guidance"]["oracle_ratio"] == 1.0
+    assert gate["framework"]["wam"]["guidance"]["bridge_source"] == "predicted"
+    assert gate["framework"]["wam"]["guidance"]["oracle_ratio"] == 0.0
+
+    e2e_weights = e2e["framework"]["tasks"]["weights"]
+    assert [name for name, weight in e2e_weights.items() if float(weight) > 0] == ["joint_e2e"]
+    e2e_guidance = e2e["framework"]["wam"]["guidance"]
+    assert e2e_guidance["bridge_source"] == "predicted"
+    assert e2e_guidance["detach_world"] is False
+    assert e2e_guidance["oracle_ratio"] == 0.0
+    assert e2e_guidance["gate_init"] == 0.0
+    assert e2e_guidance["exclude_post_query_context"] is True
+    assert e2e_guidance["action_world_gradient_ramp"] == {
+        "enabled": True,
+        "start_step": 10000,
+        "end_step": 30000,
+        "start_scale": 0.0,
+        "end_scale": 1.0,
+    }
+    assert e2e["framework"]["wam"]["dino_loss_weight"] == 0.01
+    assert e2e["framework"]["action_model"]["use_correlated_noise"] is False
+    assert not any(
+        str(key).startswith("correlation_") for key in e2e["framework"]["action_model"]
+    )
+    assert e2e["datasets"]["vla_data"]["per_device_batch_size"] == 16
+    assert e2e["trainer"]["gradient_accumulation_steps"] == 1
+    assert e2e["trainer"]["max_train_steps"] == 100000
+    assert e2e["trainer"]["pretrained_checkpoint"] is None
+    assert "iidnoise" in e2e["run_id"] and "corrnoise" not in e2e["run_id"]
+
+    data_config = ROBOT_TYPE_CONFIG_MAP["robodojo_arx_x5"]
+    expected_state = [
+        "state.left_joints",
+        "state.left_gripper",
+        "state.right_joints",
+        "state.right_gripper",
+    ]
+    expected_action = [key.replace("state.", "action.") for key in expected_state]
+    assert data_config.video_keys == source_views
+    assert data_config.state_keys == expected_state
+    assert data_config.action_keys == expected_action
+    assert DATASET_NAMED_MIXTURES["robodojo_v21"] == [
+        ("RoboDojo_lerobot_v21_video", 1.0, "robodojo_arx_x5")
+    ]
+    normalization = [
+        transform
+        for transform in data_config.transform().transforms
+        if isinstance(transform, StateActionTransform)
+    ]
+    assert len(normalization) == 2
+    assert all(
+        set(transform.normalization_modes.values()) == {"fastwam_zscore"}
+        for transform in normalization
+    )
+
+    eval_dir = REPO_ROOT / "examples/RoboDojo/eval_files"
+    eval_script = (eval_dir / "eval_robodojo.sh").read_text(encoding="utf-8")
+    model_script = (eval_dir / "robodojo_model.py").read_text(encoding="utf-8")
+    run_notes = (REPO_ROOT / "执行脚本/RBT/run.sh").read_text(encoding="utf-8")
+    client_job = yaml.safe_load((REPO_ROOT / "执行脚本/RBT/job_client_robodojo.yaml").read_text(encoding="utf-8"))
+    e2e_job = yaml.safe_load((REPO_ROOT / "执行脚本/RBT/robodojo_wam_e2e.yaml").read_text(encoding="utf-8"))
+    assert "build_robotwin_composite" in model_script
+    assert "task_instruction" in model_script
+    assert '"state": state' in model_script
+    assert "XPolicyLab/policy/starVLA/eval.sh" not in run_notes
+    assert "examples/RoboDojo/eval_files/eval_robodojo.sh" in run_notes
+    assert "aidi-inf-cli job submit -f robodojo_wam_e2e.yaml" in run_notes
+    assert "starvla_qwengroot_robodojo_wam_e2e.yaml" in e2e_job["REQUIRED"]["RUN_SCRIPTS"]
+    assert "Third_github" not in eval_script
+    assert "run_aidi_robodojo.sh" in client_job["REQUIRED"]["RUN_SCRIPTS"]
+    assert "ppu" not in client_job["OPTIONAL"]["DOCKER_IMAGE"].lower()
+
+
+def test_robodojo_checkpoint_preflight() -> None:
+    """The selected state/corrnoise checkpoint must carry every server artifact."""
+
+    from examples.RoboDojo.eval_files.verify_robodojo_checkpoint_contract import verify
+
+    source = REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_baseline.yaml"
+    zeros = [0.0] * 14
+    stats = {
+        "new_embodiment": {
+            modality: {
+                "min": zeros,
+                "max": zeros,
+                "mean": zeros,
+                "std": [1.0] * 14,
+                "q01": zeros,
+                "q99": zeros,
+                "mask": [True] * 14,
+            }
+            for modality in ("state", "action")
+        }
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "robodojo_baseline"
+        checkpoint = run_dir / "checkpoints/steps_70000_pytorch_model.pt"
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.touch()
+        config_text = source.read_text(encoding="utf-8")
+        (run_dir / "config.yaml").write_text(config_text, encoding="utf-8")
+        (run_dir / "config.full.yaml").write_text(config_text, encoding="utf-8")
+        (run_dir / "dataset_statistics.json").write_text(json.dumps(stats), encoding="utf-8")
+        np.save(run_dir / "action_correlation_cholesky.npy", np.eye(16 * 14, dtype=np.float32))
+
+        summary = verify(str(checkpoint))
+        assert summary["include_state"] is True
+        assert summary["action_chunk"] == [16, 14]
+        assert summary["use_correlated_noise"] is True
+        assert summary["correlation_shape"] == [224, 224]
+
+        (run_dir / "action_correlation_cholesky.npy").unlink()
+        try:
+            verify(str(checkpoint))
+        except FileNotFoundError as exc:
+            assert "Cholesky artifact is missing" in str(exc)
+        else:
+            raise AssertionError("corrnoise checkpoint without its Cholesky artifact was accepted")
+
+
 if __name__ == "__main__":
     test_fastwam_metadata_and_composite()
     test_fastwam_checkpoint_sample_and_direct_sampler()
@@ -383,3 +739,7 @@ if __name__ == "__main__":
     test_fastwam_train_infer_order_and_contract()
     test_fastwam_real_cluster_config_snapshots()
     test_fastwam_cluster_preflight_fixture()
+    test_correlated_noise_artifact_is_a_strict_train_deploy_contract()
+    test_joint_e2e_rand_clean_yaml_contracts()
+    test_robodojo_train_and_deploy_contracts()
+    test_robodojo_checkpoint_preflight()

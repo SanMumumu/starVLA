@@ -251,6 +251,7 @@ class Qwen_GR00T(baseframework):
         super().__init__()
         # Merge framework defaults with YAML config (YAML wins on conflicts)
         self.config = merge_framework_config(QwenGR00TDefaultConfig, config)
+        self._validate_joint_e2e_contract()
         self.qwen_vl_interface = get_vlm_model(config=self.config)
         # align dims --> we should put them to config or no?
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = (
@@ -310,6 +311,60 @@ class Qwen_GR00T(baseframework):
         if self.wam_enabled:
             self._init_wam_modules()
         #######
+
+    #######
+    def _validate_joint_e2e_contract(self) -> None:
+        """Fail before loading large backbones if joint E2E semantics are broken."""
+
+        framework = self.config.framework
+        tasks = framework.get("tasks", {})
+        weights = tasks.get("weights", {}) if hasattr(tasks, "get") else {}
+        active = [str(name) for name, weight in weights.items() if float(weight) > 0.0]
+        if "joint_e2e" not in active:
+            return
+        if active != ["joint_e2e"]:
+            raise ValueError(
+                "joint_e2e is an exclusive task because each of its batches already computes "
+                f"action_loss + world_loss; active tasks={active}."
+            )
+
+        wam = framework.get("wam", {})
+        guidance = wam.get("guidance", {}) if hasattr(wam, "get") else {}
+        problems = []
+        if not bool(wam.get("enabled", False)):
+            problems.append("framework.wam.enabled must be true")
+        if not bool(guidance.get("enabled", False)):
+            problems.append("framework.wam.guidance.enabled must be true")
+        if str(guidance.get("prompt_mode", "")).lower() != "dual_query":
+            problems.append("guidance.prompt_mode must be dual_query")
+        if not bool(guidance.get("exclude_post_query_context", False)):
+            problems.append("guidance.exclude_post_query_context must be true")
+        if str(guidance.get("bridge_source", "")).lower() != "predicted":
+            problems.append("guidance.bridge_source must be predicted")
+        if bool(guidance.get("detach_world", True)):
+            problems.append("guidance.detach_world must be false")
+        if str(guidance.get("signal", "")).lower() not in {"z_pred", "delta_z_pred"}:
+            problems.append("guidance.signal must be z_pred or delta_z_pred")
+        if float(wam.get("dino_loss_weight", 0.0)) <= 0.0:
+            problems.append("framework.wam.dino_loss_weight must be positive")
+        action_cfg = framework.get("action_model", {})
+        if bool(action_cfg.get("use_correlated_noise", False)):
+            problems.append("framework.action_model.use_correlated_noise must be false for the E2E experiment")
+
+        ramp = guidance.get("action_world_gradient_ramp", {})
+        if hasattr(ramp, "get") and bool(ramp.get("enabled", False)):
+            start = int(ramp.get("start_step", 0))
+            end = int(ramp.get("end_step", 0))
+            start_scale = float(ramp.get("start_scale", 0.0))
+            end_scale = float(ramp.get("end_scale", 1.0))
+            if start < 0 or end < start:
+                problems.append(f"gradient ramp requires 0 <= start_step <= end_step, got {start} -> {end}")
+            if start_scale < 0.0 or end_scale < 0.0:
+                problems.append(
+                    f"gradient ramp scales must be non-negative, got {start_scale} -> {end_scale}"
+                )
+        if problems:
+            raise ValueError("Invalid joint_e2e configuration: " + "; ".join(problems))
 
     #######
     # 中文注释：在构造 action head 前，把 guidance 的 M5/M6/M6+ 开关注入 action_model.diffusion_model_cfg，
@@ -924,6 +979,13 @@ class Qwen_GR00T(baseframework):
         if bool(dino_cfg.get("load_live_backbone", False)):
             self._set_dino_teacher(DINOv3Backbone(**self._jointflow_dino_spec))
         self.wam_visual_head = VisualFlowMatchingHead(self.config)
+        # End-to-end predicted-future guidance unrolls the visual flow head
+        # several times before the action loss.  Checkpoint its DiT blocks so
+        # this graph remains practical at the FastWAM 480-token resolution.
+        if bool(wam_cfg.get("visual_gradient_checkpointing", False)):
+            visual_dit = getattr(self.wam_visual_head, "model", None)
+            if visual_dit is not None and hasattr(visual_dit, "gradient_checkpointing"):
+                visual_dit.gradient_checkpointing = True
         # WAM keeps the baseline batch/repeat objective. Checkpoint only the
         # action-DiT blocks to avoid materializing activations for the effective
         # batch (micro-batch x repeated_diffusion_steps); parameters, precision,
@@ -955,6 +1017,10 @@ class Qwen_GR00T(baseframework):
             "signal": "none",
             # prompt：action_only(原 WAM 单 query) | dual_query(act+future 占位同一 forward)。
             "prompt_mode": "action_only",
+            # 原生 causal 顺序是 ACT→FUTURE；FUTURE 可读取动作意图，ACT 不能直接读取 FUTURE。
+            # add_generation_prompt 产生的后缀 token 能同时读取两组 query；新 E2E 必须将其从
+            # action/world raw context memory 排除。默认 false 只用于兼容旧 checkpoint 的原始语义。
+            "exclude_post_query_context": False,
             # bridge：predicted(用 world head 预测) | oracle(用 GT DINO) | scheduled(按 oracle_ratio 混)。
             "bridge_source": "predicted",
             "detach_world": True,  # True=action loss 不回传 world head（Stage1/2）；False=e2e(Stage3)
@@ -968,6 +1034,16 @@ class Qwen_GR00T(baseframework):
             "gate_init": 0.0,  # M5 world_gate 初值（tanh(0)=0 → 平滑从 baseline 起步），DiT 阶段用
             "world_dropout": 0.0,
             "include_context_in_world_memory": True,  # action memory 是否保留 Qwen 图文 context
+            # End-to-end mode keeps predicted future in the forward path from
+            # step 0, but can linearly ramp only the action-loss gradient that
+            # enters the world predictor. Disabled defaults preserve old runs.
+            "action_world_gradient_ramp": {
+                "enabled": False,
+                "start_step": 0,
+                "end_step": 0,
+                "start_scale": 1.0,
+                "end_scale": 1.0,
+            },
             # 因果消融(plan §11，eval 时生效)：correct|off|zero|shuffled|wrong_task|gt
             "world_eval_mode": "correct",
         }
@@ -1046,10 +1122,13 @@ class Qwen_GR00T(baseframework):
             self.wam_future_ph_id = int(tok.convert_tokens_to_ids(self.wam_future_ph))
             self.qwen_vl_interface.model.resize_token_embeddings(len(tok))
         logger.info(
-            "WAM guidance ON: mode=%s signal=%s prompt=%s bridge=%s detach_world=%s (adapter=%s qformer=%s fusion=%s pooler=%s)",
+            "WAM guidance ON: mode=%s signal=%s prompt=%s exclude_post_query_context=%s "
+            "bridge=%s detach_world=%s "
+            "(adapter=%s qformer=%s fusion=%s pooler=%s)",
             mode,
             signal,
             g["prompt_mode"],
+            bool(g["exclude_post_query_context"]),
             g["bridge_source"],
             g["detach_world"],
             self.world_adapter is not None,
@@ -1440,15 +1519,61 @@ class Qwen_GR00T(baseframework):
     # alternate/dual_xattn/adaln/dual_xattn_adaln(M4/M5/M6/M6+) 需 DiT 改造，留任务 #14(P6-P8)。
     #######################################################################
 
+    @staticmethod
+    def _wam_validate_dual_query_layout(
+        act_mask: torch.Tensor,
+        future_mask: torch.Tensor,
+        expected_act: int,
+        expected_future: int,
+    ) -> None:
+        """Validate the token layout that gives ACT -> FUTURE causal direction."""
+
+        if act_mask.ndim != 2 or future_mask.shape != act_mask.shape:
+            raise ValueError(
+                "Dual-query masks must have the same [B,T] shape; "
+                f"got ACT={tuple(act_mask.shape)}, FUTURE={tuple(future_mask.shape)}"
+            )
+        act_mask = act_mask.to(dtype=torch.bool)
+        future_mask = future_mask.to(dtype=torch.bool)
+        act_counts = act_mask.sum(dim=1)
+        future_counts = future_mask.sum(dim=1)
+        if not bool((act_counts == int(expected_act)).all()) or not bool(
+            (future_counts == int(expected_future)).all()
+        ):
+            raise ValueError(
+                "Unexpected dual-query placeholder counts: "
+                f"ACT={act_counts.tolist()} (expected {expected_act}), "
+                f"FUTURE={future_counts.tolist()} (expected {expected_future})"
+            )
+        positions = torch.arange(act_mask.shape[1], device=act_mask.device).unsqueeze(0)
+        last_act = positions.masked_fill(~act_mask, -1).max(dim=1).values
+        first_future = positions.masked_fill(~future_mask, act_mask.shape[1]).min(dim=1).values
+        if not bool((last_act < first_future).all()):
+            raise ValueError(
+                "Dual-query prompt must place every ACT placeholder before every FUTURE placeholder "
+                "to preserve ACT->FUTURE causal conditioning without a direct FUTURE->ACT path"
+            )
+
+    @staticmethod
+    def _wam_query_suffix_exclusion_mask(act_mask: torch.Tensor, future_mask: torch.Tensor) -> torch.Tensor:
+        """Exclude both query groups and every later template token from raw context memory."""
+
+        act_mask = act_mask.to(dtype=torch.bool)
+        future_mask = future_mask.to(dtype=torch.bool)
+        if not bool(act_mask.any(dim=1).all()) or not bool(future_mask.any(dim=1).all()):
+            raise ValueError("Every dual-query sample must contain ACT and FUTURE placeholders")
+        query_mask = act_mask | future_mask
+        return query_mask.to(dtype=torch.int64).cumsum(dim=1) > 0
+
     def _build_wam_guided_inputs(self, examples: List[dict], task: str = "policy"):
         """dual-query prompt：指令后接 act 占位×n_act + future 占位×n_flow（同一 forward）。
 
-        中文注释：与 _build_wam_inputs 同构，但**每个任务**都同时放两组 query 占位——这样 h_future 永远
-        在「带 act-query」的同一上下文里被算出来（M0-Q 控制组的前提：双 query 本身会改 Qwen 表征）。
-        返回 inputs + act_mask + future_mask（按各自占位 id 定位）。
+        中文注释：与 _build_wam_inputs 同构，但**每个任务**都同时放两组 query 占位。原生 causal 顺序
+        使 h_future 可读取 h_act 的动作意图，而 h_act 不可读取 future query；future→action 只经显式 gate 返回。
+        返回 inputs + act_mask + future_mask + 原始 2D padding mask + raw-context 排除 mask。
         """
         task = str(task)
-        is_action = task in ("policy", "idm")
+        is_action = task in ("policy", "idm", "joint_e2e")
         include_future = task == "idm"
         act_str = " ".join([self.wam_ph] * self.wam_n_act)
         fut_str = " ".join([self.wam_future_ph] * self.wam_n_flow)
@@ -1482,20 +1607,43 @@ class Qwen_GR00T(baseframework):
         inputs = inputs.to(self.qwen_vl_interface.model.device)
         act_mask = inputs["input_ids"] == self.wam_ph_id
         fut_mask = inputs["input_ids"] == self.wam_future_ph_id
-        return inputs, act_mask, fut_mask
+        self._wam_validate_dual_query_layout(
+            act_mask,
+            fut_mask,
+            expected_act=self.wam_n_act,
+            expected_future=self.wam_n_flow,
+        )
+        attention_2d = inputs.get("attention_mask", None)
+        if attention_2d is None:
+            attention_2d = torch.ones_like(inputs["input_ids"], dtype=torch.bool)
+        else:
+            attention_2d = attention_2d.to(dtype=torch.bool)
+
+        if bool(self.wam_guidance.get("exclude_post_query_context", False)):
+            # Tokens emitted by add_generation_prompt occur after both query
+            # groups and can attend to both.  They must not re-enter either the
+            # action memory or the gated world memory as an implicit bridge.
+            context_exclusion_mask = self._wam_query_suffix_exclusion_mask(act_mask, fut_mask)
+        else:
+            # Historical behavior for old guided checkpoints/config snapshots.
+            context_exclusion_mask = act_mask | fut_mask
+        return inputs, act_mask, fut_mask, attention_2d, context_exclusion_mask
 
     def _wam_guided_backbone(self, examples: List[dict], task: str = "policy"):
-        """跑 Qwen，取 h_act[B,n_act,D] 与 h_future[B,n_flow,D]，并返回完整 hidden/padding/占位 mask。"""
-        inputs, act_mask, fut_mask = self._build_wam_guided_inputs(examples, task=task)
+        """Run Qwen and return both query groups plus raw-context validity/exclusion masks."""
+        inputs, act_mask, fut_mask, attention_2d, context_exclusion_mask = self._build_wam_guided_inputs(
+            examples, task=task
+        )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             hidden = self._wam_qwen_hidden(inputs)
         bsz = len(examples)
         d = hidden.shape[-1]
         h_act = hidden[act_mask].view(bsz, self.wam_n_act, d)
         h_future = hidden[fut_mask].view(bsz, self.wam_n_flow, d)
-        attn = inputs.get("attention_mask", None)
-        ph_mask = act_mask | fut_mask  # 两组占位都从 raw context 里屏蔽
-        return h_act, h_future, hidden, attn, ph_mask
+        # Downstream DiT memories use the original 2D validity mask. New E2E
+        # configs make context_exclusion_mask remove every post-query
+        # chat-template token, closing the only non-gate FUTURE->action bridge.
+        return h_act, h_future, hidden, attention_2d, context_exclusion_mask
 
     def _wam_world_target(self, examples: List[dict]) -> torch.Tensor:
         """GT 未来 world 监督 target：absolute=DINO(image_1)；delta=标准化(DINO(img1)-DINO(img0))。
@@ -1510,7 +1658,55 @@ class Qwen_GR00T(baseframework):
         z = z1 - z0.to(z1.device, z1.dtype)
         return z / (z.std(dim=(0, 1), keepdim=True) + 1e-6)
 
-    def _build_world_signal(self, h_future: torch.Tensor, examples: List[dict], eval_mode: str = "correct"):
+    def _wam_action_world_grad_scale(self, global_step: int) -> float:
+        """Scale only the action-loss gradient entering the world branch."""
+
+        ramp = self.wam_guidance.get("action_world_gradient_ramp", {})
+        if not hasattr(ramp, "get") or not bool(ramp.get("enabled", False)):
+            return 1.0
+        from starVLA.model.framework.VLM4A.wam_guidance import linear_gradient_ramp
+
+        return linear_gradient_ramp(
+            global_step=global_step,
+            start_step=ramp.get("start_step", 0),
+            end_step=ramp.get("end_step", 0),
+            start_scale=ramp.get("start_scale", 0.0),
+            end_scale=ramp.get("end_scale", 1.0),
+        )
+
+    def _wam_world_gate_metrics(self) -> dict[str, torch.Tensor]:
+        """Return the effective strength of every gated world cross-attention.
+
+        The residual multiplier used by the DiT is ``tanh(world_gate)``.  Log
+        statistics of that effective multiplier (rather than the unbounded raw
+        parameter) so ``openness=0`` means fully closed and values approaching
+        one mean that the world residual is being admitted at full scale.
+        """
+
+        action_dit = getattr(self.action_model, "model", None)
+        blocks = getattr(action_dit, "transformer_blocks", ())
+        gates = [getattr(block, "world_gate", None) for block in blocks]
+        gates = [gate for gate in gates if gate is not None]
+        if not gates:
+            raise RuntimeError(
+                "WAM dual_xattn is active but the action DiT exposes no world_gate parameters; "
+                "cannot verify or log the gated world branch."
+            )
+        with torch.no_grad():
+            effective = torch.cat([torch.tanh(gate.detach().float()).reshape(-1) for gate in gates])
+            return {
+                "world_gate_openness": effective.abs().mean(),
+                "world_gate_signed_mean": effective.mean(),
+                "world_gate_max_openness": effective.abs().max(),
+            }
+
+    def _build_world_signal(
+        self,
+        h_future: torch.Tensor,
+        examples: List[dict],
+        eval_mode: str = "correct",
+        action_world_grad_scale: float = 1.0,
+    ):
         """产出注入 action 的 world tokens [B,N_w,D_model]（或 None=不注入）。
 
         中文注释：按 guidance.signal 取信号——h_future(直接用 future-query hidden)；z_pred/delta_z_pred
@@ -1518,7 +1714,11 @@ class Qwen_GR00T(baseframework):
         predicted/oracle/scheduled 混合；detach_world 决定 action loss 是否回传 world head。最后用
         adapter(concat/dual/adaln) 或 qformer(M3) 投到 d_model。eval_mode 实现因果消融(off/zero/shuffled)。
         """
-        from starVLA.model.framework.VLM4A.wam_guidance import mix_world_tokens, shuffle_along_batch
+        from starVLA.model.framework.VLM4A.wam_guidance import (
+            mix_world_tokens,
+            scale_gradient,
+            shuffle_along_batch,
+        )
 
         g = self.wam_guidance
         signal = str(g["signal"]).lower()
@@ -1586,13 +1786,26 @@ class Qwen_GR00T(baseframework):
         # 投影到 action cross-attn 维度。
         if mode == "qformer" and self.world_qformer is not None:
             qd = self._jointflow_module_dtype(self.world_qformer, fallback=base.dtype)
-            return self.world_qformer(base.to(qd)).to(h_future.dtype)
-        if self.world_adapter is not None:
+            world = self.world_qformer(base.to(qd)).to(h_future.dtype)
+        elif self.world_adapter is not None:
             ad = self._jointflow_module_dtype(self.world_adapter, fallback=base.dtype)
-            return self.world_adapter(base.to(ad)).to(h_future.dtype)
-        return base
+            world = self.world_adapter(base.to(ad)).to(h_future.dtype)
+        else:
+            world = base
+        # Forward is always the predicted future.  This identity operation only
+        # scales action-loss gradients through the complete world path
+        # (adapter + visual predictor + future-query representation).
+        return scale_gradient(world, action_world_grad_scale)
 
-    def _build_guided_action_memory(self, h_act, h_future, hidden, attn, ph_mask, world_tokens):
+    def _build_guided_action_memory(
+        self,
+        h_act,
+        h_future,
+        hidden,
+        attn,
+        context_exclusion_mask,
+        world_tokens,
+    ):
         """组装 action DiT 的 cross-attn memory（concat-family）。
 
         中文注释（plan §4.2）：
@@ -1618,8 +1831,8 @@ class Qwen_GR00T(baseframework):
                 blocks.append(wt)
                 masks.append(torch.ones(wt.shape[:2], dtype=torch.bool, device=wt.device))
         if bool(g["include_context_in_world_memory"]):
-            non_ph = ~ph_mask.to(torch.bool)
-            keep = (attn.to(torch.bool) & non_ph) if attn is not None else non_ph
+            context_positions = ~context_exclusion_mask.to(torch.bool)
+            keep = (attn.to(torch.bool) & context_positions) if attn is not None else context_positions
             blocks.append(hidden.to(dtype))
             masks.append(keep.to(hidden.device))
         return torch.cat(blocks, dim=1), torch.cat(masks, dim=1)
@@ -1627,14 +1840,14 @@ class Qwen_GR00T(baseframework):
     #######
     # 中文注释：World memory（M4 alternate / M5,M6+ dual cross-attn 用）：M_w=[world_tokens ; qwen_context]
     # （plan §4.5，include_context_in_world_memory 控制是否带 context）。供 action DiT 的 world cross-attn 读。
-    def _build_world_memory(self, world_tokens, hidden, attn, ph_mask):
+    def _build_world_memory(self, world_tokens, hidden, attn, context_exclusion_mask):
         g = self.wam_guidance
         dtype = world_tokens.dtype
         blocks = [world_tokens]
         masks = [torch.ones(world_tokens.shape[:2], dtype=torch.bool, device=world_tokens.device)]
         if bool(g["include_context_in_world_memory"]):
-            non_ph = ~ph_mask.to(torch.bool)
-            keep = (attn.to(torch.bool) & non_ph) if attn is not None else non_ph
+            context_positions = ~context_exclusion_mask.to(torch.bool)
+            keep = (attn.to(torch.bool) & context_positions) if attn is not None else context_positions
             blocks.append(hidden.to(dtype))
             masks.append(keep.to(hidden.device))
         return torch.cat(blocks, dim=1), torch.cat(masks, dim=1)
@@ -1647,11 +1860,32 @@ class Qwen_GR00T(baseframework):
     _DIT_XATTN_MODES = ("alternate_xattn", "dual_xattn", "dual_xattn_adaln")
     _DIT_ADALN_MODES = ("adaln", "dual_xattn_adaln")
 
-    def _assemble_guided_inputs(self, mode, h_act, h_future, hidden, attn, ph_mask, world_tokens):
-        mem, mem_mask = self._build_guided_action_memory(h_act, h_future, hidden, attn, ph_mask, world_tokens)
+    def _assemble_guided_inputs(
+        self,
+        mode,
+        h_act,
+        h_future,
+        hidden,
+        attn,
+        context_exclusion_mask,
+        world_tokens,
+    ):
+        mem, mem_mask = self._build_guided_action_memory(
+            h_act,
+            h_future,
+            hidden,
+            attn,
+            context_exclusion_mask,
+            world_tokens,
+        )
         world_embs, world_mask, world_global = None, None, None
         if mode in self._DIT_XATTN_MODES and world_tokens is not None:
-            world_embs, world_mask = self._build_world_memory(world_tokens, hidden, attn, ph_mask)
+            world_embs, world_mask = self._build_world_memory(
+                world_tokens,
+                hidden,
+                attn,
+                context_exclusion_mask,
+            )
         if mode in self._DIT_ADALN_MODES and world_tokens is not None and self.world_pooler is not None:
             pd = self._jointflow_module_dtype(self.world_pooler, fallback=world_tokens.dtype)
             world_global = self.world_pooler(world_tokens.to(pd)).to(h_act.dtype)
@@ -1674,7 +1908,7 @@ class Qwen_GR00T(baseframework):
             "pooler": getattr(self, "world_pooler", None),
         }
         used: set[str] = set()
-        if task in ("policy", "idm"):
+        if task in ("policy", "idm", "joint_e2e"):
             used.add("action")
             if signal != "none":
                 if mode == "qformer":
@@ -1700,14 +1934,63 @@ class Qwen_GR00T(baseframework):
     def _wam_guided_forward(self, examples: List[dict], task: str = "policy", **kwargs) -> dict:
         task = str(task)
         mode = str(self.wam_guidance["mode"]).lower()
-        h_act, h_future, hidden, attn, ph_mask = self._wam_guided_backbone(examples, task=task)
+        h_act, h_future, hidden, attn, context_exclusion_mask = self._wam_guided_backbone(examples, task=task)
+        if task == "joint_e2e":
+            # One causal batch, one Qwen forward, two objectives.  The action
+            # branch never sees GT future features; GT is used only as the
+            # auxiliary world-prediction target.
+            bridge = str(self.wam_guidance["bridge_source"]).lower()
+            if bridge != "predicted" or bool(self.wam_guidance["detach_world"]):
+                raise ValueError(
+                    "joint_e2e requires guidance.bridge_source=predicted and detach_world=false; "
+                    f"got bridge_source={bridge!r}, detach_world={self.wam_guidance['detach_world']!r}."
+                )
+
+            z_gt = self._wam_world_target(examples)
+            vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=h_future.dtype)
+            raw_world_loss = self._wam_visual_loss(h_future.to(vh), z_gt, examples)
+            world_loss = self.wam_dino_loss_weight * raw_world_loss
+
+            grad_scale = self._wam_action_world_grad_scale(int(kwargs.get("global_step", 0)))
+            world_tokens = self._build_world_signal(
+                h_future,
+                examples,
+                action_world_grad_scale=grad_scale,
+            )
+            mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
+                mode, h_act, h_future, hidden, attn, context_exclusion_mask, world_tokens
+            )
+            actions = self._stack_jointflow_field(examples, "action", required=True)
+            actions = actions[:, -self.action_horizon :, : self.action_dim].float()
+            state, action_is_pad = self._wam_action_state_and_mask(examples)
+            hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
+            action_loss = self._wam_action_loss(
+                mem.to(hd),
+                actions.to(hd),
+                state.to(hd) if state is not None else None,
+                mem_mask,
+                action_is_pad,
+                world_embs=(w_embs.to(hd) if w_embs is not None else None),
+                world_attention_mask=w_mask,
+                world_global=(w_global.to(hd) if w_global is not None else None),
+                guidance_mode=mode,
+            )
+            action_loss = action_loss + self._wam_guided_unused_anchor(task, action_loss)
+            output = {
+                "action_loss": action_loss,
+                "world_loss": world_loss,
+                "world_loss_raw": raw_world_loss.detach(),
+                "action_world_grad_scale": action_loss.detach().new_tensor(grad_scale),
+            }
+            output.update(self._wam_world_gate_metrics())
+            return output
         if task in ("policy", "idm"):
             actions = self._stack_jointflow_field(examples, "action", required=True)
             actions = actions[:, -self.action_horizon :, : self.action_dim].float()
             state, action_is_pad = self._wam_action_state_and_mask(examples)
             world_tokens = self._build_world_signal(h_future, examples)
             mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
-                mode, h_act, h_future, hidden, attn, ph_mask, world_tokens
+                mode, h_act, h_future, hidden, attn, context_exclusion_mask, world_tokens
             )
             hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
             loss = self._wam_action_loss(
@@ -1745,11 +2028,13 @@ class Qwen_GR00T(baseframework):
         if not isinstance(examples, list):
             examples = [examples]
         mode = str(self.wam_guidance["mode"]).lower()
-        h_act, h_future, hidden, attn, ph_mask = self._wam_guided_backbone(examples, task="policy")
+        h_act, h_future, hidden, attn, context_exclusion_mask = self._wam_guided_backbone(
+            examples, task="policy"
+        )
         eval_mode = str(self.wam_guidance.get("world_eval_mode", "correct")).lower()
         world_tokens = self._build_world_signal(h_future, examples, eval_mode=eval_mode)
         mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
-            mode, h_act, h_future, hidden, attn, ph_mask, world_tokens
+            mode, h_act, h_future, hidden, attn, context_exclusion_mask, world_tokens
         )
         hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
         state, _ = self._wam_action_state_and_mask(examples)

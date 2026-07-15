@@ -1,0 +1,27 @@
+policy_name: starVLA
+protocol: ws
+bench_name: null
+task_name: null
+env_cfg_type: null
+action_type: joint
+gpu_id: null
+seed: null
+eval_batch: false
+
+# Repository-owned StarVLA server reached by the lightweight XPolicy adapter.
+host: localhost
+port: 6000
+starvla_server_host: 127.0.0.1
+starvla_server_port: 5694
+unnorm_key: new_embodiment
+use_ddim: true
+num_ddim_steps: 10
+
+# These are hard ABI checks, not image-processing suggestions.
+image_size: [320, 384]
+expected_image_layout: fastwam_composite
+expected_composite_view_key: video.fastwam_composite
+include_state: true
+expected_action_chunk_size: 16
+expected_action_dim: 14
+expected_state_dim: 14

@@ -23,6 +23,12 @@ from PIL import Image
 from torch.utils.data import DataLoader
 
 from starVLA.dataloader.action_correlation import compute_action_noise_matrix
+from starVLA.dataloader.fastwam_image import (
+    FASTWAM_COMPOSITE_LAYOUT,
+    FASTWAM_COMPOSITE_SIZE,
+    FASTWAM_COMPOSITE_VIEW_KEY,
+    build_robotwin_composite,
+)
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset, LeRobotSingleDataset, ModalityConfig
 from starVLA.dataloader.gr00t_lerobot.registry import EmbodimentTag, ROBOT_TYPE_CONFIG_MAP
 from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
@@ -449,6 +455,8 @@ class JointLiberoDataset(LeRobotSingleDataset):
         action = np.concatenate(action, axis=1).astype(self._action_pack_dtype, copy=False)
 
         future_index, future_steps, future_stride = self._future_dino_index(trajectory_id, base_index)
+        require_full_future = bool(_cfg_get(self.data_cfg, "future_valid_requires_full_stride", False))
+        future_valid = future_steps == future_stride if require_full_future else future_steps > 0
         sample = {
             "action": action,
             "lang": data[self.modality_keys["language"][0]][0],
@@ -457,7 +465,7 @@ class JointLiberoDataset(LeRobotSingleDataset):
             "trajectory_id": np.int64(trajectory_id),
             "base_index": np.int64(base_index),
             "future_index": np.int64(future_index),
-            "future_valid": bool(future_steps > 0),
+            "future_valid": bool(future_valid),
             "future_valid_steps": np.int64(future_steps),
             "future_stride": np.int64(future_stride),
         }
@@ -467,28 +475,63 @@ class JointLiberoDataset(LeRobotSingleDataset):
             # decode_future_video=true 时再返回 image_1=未来帧；纯 policy/passive WAM 使用预计算
             # dino_1 监督，不消费未来 RGB，可关闭该项以省掉三路未来视频解码且不改变模型输入。
             # 形状 [V,H,W,C] uint8；view 顺序 = self.modality_keys["video"]（LIBERO: primary 在前）。
-            view_keys = list(self.modality_keys.get("video", []))
+            source_view_keys = list(self.modality_keys.get("video", []))
             if self._last_video_frames is None:
                 raise RuntimeError("JointLiberoDataset(online) requires get_step_data to decode video first.")
-            img0, img1 = [], []
-            target_size = _cfg_get(self.data_cfg, "obs_image_size", None)
-            target_size = tuple(int(v) for v in target_size) if target_size else None
-            for key in view_keys:
+            decode_future = bool(_cfg_get(self.data_cfg, "decode_future_video", True))
+            image_layout = str(_cfg_get(self.data_cfg, "image_layout", "separate_views")).lower()
+            current_views, future_views = [], []
+            for key in source_view_keys:
                 frames = np.asarray(self._last_video_frames[key])  # [T,H,W,C]
-                current = Image.fromarray(frames[0])
-                if target_size and current.size != target_size:
-                    current = current.resize(target_size)
-                img0.append(np.asarray(current))
-                if bool(_cfg_get(self.data_cfg, "decode_future_video", True)):
-                    future = Image.fromarray(frames[min(1, frames.shape[0] - 1)])
+                current_views.append(frames[0])
+                if decode_future:
+                    future_views.append(frames[min(1, frames.shape[0] - 1)])
+
+            if image_layout == FASTWAM_COMPOSITE_LAYOUT:
+                expected_source_keys = list(_cfg_get(self.data_cfg, "composite_source_view_keys", []))
+                if expected_source_keys and source_view_keys != expected_source_keys:
+                    raise ValueError(
+                        "FastWAM composite camera order mismatch: "
+                        f"dataset={source_view_keys}, configured={expected_source_keys}"
+                    )
+                configured_size = tuple(
+                    int(value) for value in _cfg_get(self.data_cfg, "obs_image_size", FASTWAM_COMPOSITE_SIZE)
+                )
+                if configured_size != FASTWAM_COMPOSITE_SIZE:
+                    raise ValueError(
+                        f"FastWAM composite must be configured as {FASTWAM_COMPOSITE_SIZE} (width,height), "
+                        f"got {configured_size}"
+                    )
+                composite_view_key = str(
+                    _cfg_get(self.data_cfg, "composite_view_key", FASTWAM_COMPOSITE_VIEW_KEY)
+                )
+                img0 = [np.asarray(build_robotwin_composite(current_views), dtype=np.uint8)]
+                img1 = (
+                    [np.asarray(build_robotwin_composite(future_views), dtype=np.uint8)] if decode_future else []
+                )
+                view_keys = [composite_view_key]
+            else:
+                img0, img1 = [], []
+                target_size = _cfg_get(self.data_cfg, "obs_image_size", None)
+                target_size = tuple(int(v) for v in target_size) if target_size else None
+                for current_array in current_views:
+                    current = Image.fromarray(current_array)
+                    if target_size and current.size != target_size:
+                        current = current.resize(target_size)
+                    img0.append(np.asarray(current))
+                for future_array in future_views:
+                    future = Image.fromarray(future_array)
                     if target_size and future.size != target_size:
                         future = future.resize(target_size)
                     img1.append(np.asarray(future))
+                view_keys = source_view_keys
             sample["image_0"] = np.stack(img0, axis=0)
             if img1:
                 sample["image_1"] = np.stack(img1, axis=0)
             sample["image_view_keys"] = view_keys
             sample["dino_view_keys"] = view_keys
+            if image_layout == FASTWAM_COMPOSITE_LAYOUT:
+                sample["dino_target_view_keys"] = view_keys
             #######
             # 中文注释：hybrid——在线出 raw 图的同时,再读预存的 DINO latent（已按 store stats 标准化）当 target。
             # dino_0=当前帧(delta 用)、dino_1=未来帧。wam 优先用它当世界模型 target,省掉在线 DINO 抽取。
@@ -919,6 +962,13 @@ def compute_action_correlation_cholesky(
     JointFlow 子数据集走 `read_action_only`（同 __getitem__ transform，但跳过 PyAV + latent）；无该接口的
     原生数据集回退到 mixture __getitem__。逐样本 try/except 跳过坏样本，单个坏轨迹不拖垮启动。
     """
+    target = int(num_samples)
+    if target < 2:
+        raise ValueError(f"num_samples must be at least 2, got {target}.")
+    beta = float(beta)
+    if not 0.0 <= beta <= 1.0:
+        raise ValueError(f"correlation beta must be in [0, 1], got {beta}.")
+
     rng = np.random.default_rng(seed)
     datasets = list(getattr(mixture_dataset, "datasets", None) or [mixture_dataset])
     dataset_probs = getattr(mixture_dataset, "dataset_sampling_weights", None)
@@ -927,9 +977,10 @@ def compute_action_correlation_cholesky(
     dataset_probs = np.asarray(dataset_probs, dtype=np.float64)
     dataset_probs = dataset_probs / dataset_probs.sum()
     mixture_trajectory_probs = getattr(mixture_dataset, "trajectory_sampling_weights", None)
-    target = int(num_samples)
     rows: list[np.ndarray] = []
     tries = 0
+    rejected = 0
+    last_error: Exception | None = None
     max_tries = max(target * 4, 16)
     while len(rows) < target and tries < max_tries:
         tries += 1
@@ -959,21 +1010,40 @@ def compute_action_correlation_cholesky(
                     a = d.read_action_only(int(traj_id), int(base_index))
             else:  # 回退：非 jointflow 数据集，走全量 __getitem__
                 a = mixture_dataset[int(rng.integers(0, len(mixture_dataset)))].get("action")
-        except Exception:
+        except Exception as exc:
+            rejected += 1
+            last_error = exc
             continue  # 坏样本/坏轨迹直接跳过，不拖垮启动
         if a is None:
             continue
         a = a.detach().cpu().numpy() if torch.is_tensor(a) else np.asarray(a)
-        rows.append(a.reshape(-1).astype(np.float32))
-    if not rows:
-        raise RuntimeError("compute_action_correlation_cholesky: 采不到 action，检查数据集。")
+        flattened = a.reshape(-1).astype(np.float32)
+        if not np.isfinite(flattened).all():
+            rejected += 1
+            last_error = ValueError("sample action contains NaN or infinite values")
+            continue
+        if rows and flattened.shape != rows[0].shape:
+            rejected += 1
+            last_error = ValueError(
+                f"inconsistent flattened action shape {flattened.shape}; expected {rows[0].shape}"
+            )
+            continue
+        rows.append(flattened)
+    if len(rows) != target:
+        detail = f"; last_error={type(last_error).__name__}: {last_error}" if last_error is not None else ""
+        raise RuntimeError(
+            "compute_action_correlation_cholesky could not collect the requested action sample count: "
+            f"collected={len(rows)}, requested={target}, tries={tries}, rejected={rejected}{detail}"
+        )
     X = np.stack(rows, axis=0)  # [M, flat]
     flat = X.shape[1]
     action_matrix = compute_action_noise_matrix(X, matrix_type=matrix_type)
-    Sigma_reg = float(beta) * action_matrix + (1.0 - float(beta)) * np.eye(flat)
+    Sigma_reg = beta * action_matrix + (1.0 - beta) * np.eye(flat)
     # 数值稳健：对角加微小抖动后 Cholesky
     L = np.linalg.cholesky(Sigma_reg + 1e-6 * np.eye(flat))
-    return L.astype(np.float32)
+    from starVLA.dataloader.action_correlation import validate_action_correlation_cholesky
+
+    return validate_action_correlation_cholesky(L, expected_size=flat)
 
 
 #######
