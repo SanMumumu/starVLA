@@ -629,7 +629,49 @@ class VLATrainer(TrainerUtils):
         m[f"train/loss_{logname}"] = float(weighted.detach())
         m[f"train/loss_{logname}_weighted"] = float(weighted.detach())
         m[f"train/loss_{logname}_raw"] = float(raw.detach())
+        # Two-stage gate runs use policy/passive task sampling rather than the
+        # joint_e2e task. Forward the same detached effective-gate statistics
+        # whenever the model explicitly exposes them.
+        for key in (
+            "world_gate_openness",
+            "world_gate_signed_mean",
+            "world_gate_max_openness",
+        ):
+            value = output_dict.get(key)
+            if value is not None:
+                m[f"train/{key}"] = float(value.detach())
         return m
+
+    @staticmethod
+    def _build_native_loss_metrics(output_dict: dict, total_loss: torch.Tensor) -> dict:
+        """Build single-objective metrics without changing legacy semantics."""
+
+        if "coflow_action_loss_raw" not in output_dict:
+            value = float(total_loss.detach())
+            return {
+                "train/task": "action",
+                "train/loss_total": value,
+                "train/loss_action": value,
+                "train/loss_action_raw": value,
+                "train/loss_action_weighted": value,
+            }
+        # ``action_loss`` remains the trainer's single optimization ABI and is
+        # the weighted action+world total for Co-Flow.  Do not label that total
+        # as policy loss in W&B.
+        return {
+            "train/task": "action_world_coflow",
+            "train/loss_total": float(total_loss.detach()),
+            "train/loss_action": float(output_dict["coflow_action_loss_raw"].detach()),
+            "train/loss_action_raw": float(output_dict["coflow_action_loss_raw"].detach()),
+            "train/loss_action_weighted": float(
+                output_dict["coflow_action_loss_weighted"].detach()
+            ),
+            "train/loss_world": float(output_dict["coflow_world_loss_raw"].detach()),
+            "train/loss_world_raw": float(output_dict["coflow_world_loss_raw"].detach()),
+            "train/loss_world_weighted": float(
+                output_dict["coflow_world_loss_weighted"].detach()
+            ),
+        }
 
     # ---- 梯度范数日志（全部单任务梯度；ZeRO-2 下从 DeepSpeed 取全局范数 + 仅 gather 小 head）----
     def _is_log_step(self, sync_gradients: bool) -> bool:
@@ -805,7 +847,18 @@ class VLATrainer(TrainerUtils):
                         )
                     total_loss = sum(loss_values)
                 else:
-                    output_dict = self.model.forward(batch_vla)
+                    # Co-Flow's scheduled GT->predicted Z16 exposure is tied
+                    # to optimizer steps.  No legacy framework receives a new
+                    # argument unless the explicit opt-in flag is active.
+                    framework_cfg = getattr(self.config, "framework", None)
+                    coflow_enabled = bool(
+                        framework_cfg is not None
+                        and framework_cfg.get("enable_action_world_coflow", False)
+                    )
+                    if coflow_enabled:
+                        output_dict = self.model.forward(batch_vla, global_step=self.completed_steps)
+                    else:
+                        output_dict = self.model.forward(batch_vla)
                     action_loss = output_dict["action_loss"]
                     total_loss = action_loss
                 #######
@@ -881,13 +934,14 @@ class VLATrainer(TrainerUtils):
         if jointflow_task is not None:
             metrics = self._build_loss_metrics(output_dict, jointflow_task, total_loss)
         else:  # 原生（非多任务）路径
-            metrics = {
-                "train/task": "action",
-                "train/loss_total": float(total_loss.detach()),
-                "train/loss_action": float(total_loss.detach()),
-                "train/loss_action_raw": float(total_loss.detach()),
-                "train/loss_action_weighted": float(total_loss.detach()),
-            }
+            metrics = self._build_native_loss_metrics(output_dict, total_loss)
+            # The isolated Co-Flow model exposes detached audit scalars without
+            # changing the trainer's single ``action_loss`` optimization ABI.
+            # Old models return no ``coflow_*`` keys and are byte-for-byte on
+            # the pre-existing metrics path.
+            for key, value in output_dict.items():
+                if key.startswith("coflow_") and torch.is_tensor(value) and value.numel() == 1:
+                    metrics[f"train/{key}"] = float(value.detach())
         metrics.update(grad_metrics)
         return metrics
         #######

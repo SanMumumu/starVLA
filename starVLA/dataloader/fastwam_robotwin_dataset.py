@@ -249,6 +249,10 @@ def build_fastwam_dataset_metadata(
     video_modalities = {}
     for name, original_key in _VIDEO_KEYS.items():
         width, height, channels, fps = _get_video_shape(info, original_key)
+        if not np.isclose(fps, expected_fps):
+            raise ValueError(
+                f"Expected {original_key} at the same {expected_fps:g} FPS as state/action, got {fps:g}"
+            )
         video_modalities[name] = {
             "resolution": [width, height],
             "channels": channels,
@@ -282,6 +286,10 @@ class FastWAMRobotWinDataset(LeRobotSingleDataset):
         self._fastwam_wam_targets = False
         self._fastwam_wam_target = "composite"
         self._fastwam_future_stride = 32
+        # Independent opt-in contract for Physically-Aligned Action--World
+        # Co-Flow.  Old WAM keeps its existing [t,t+stride] fields unchanged.
+        self._fastwam_action_world_coflow_targets = False
+        self._fastwam_coflow_future_strides = (16, 32)
         if data_cfg is not None:
             configured_stats = data_cfg.get("fastwam_dataset_stats_path")
             if configured_stats:
@@ -294,6 +302,11 @@ class FastWAMRobotWinDataset(LeRobotSingleDataset):
             self._fastwam_wam_targets = bool(data_cfg.get("fastwam_wam_targets", False))
             self._fastwam_wam_target = str(data_cfg.get("fastwam_wam_target", "composite")).lower()
             self._fastwam_future_stride = int(data_cfg.get("fastwam_future_stride", 32))
+            self._fastwam_action_world_coflow_targets = bool(
+                data_cfg.get("fastwam_action_world_coflow_targets", False)
+            )
+            configured_strides = data_cfg.get("fastwam_coflow_future_strides", [16, 32])
+            self._fastwam_coflow_future_strides = tuple(int(value) for value in configured_strides)
         if not 0.0 <= self._fastwam_val_fraction < 1.0:
             raise ValueError(f"fastwam_val_fraction must be in [0,1), got {self._fastwam_val_fraction}")
         if self._fastwam_split not in {"all", "train", "val", "validation"}:
@@ -305,6 +318,16 @@ class FastWAMRobotWinDataset(LeRobotSingleDataset):
         if self._fastwam_wam_targets and self._fastwam_wam_target != "composite":
             raise ValueError(
                 f"FastWAM WAM only supports fastwam_wam_target='composite', got {self._fastwam_wam_target!r}"
+            )
+        if self._fastwam_wam_targets and self._fastwam_action_world_coflow_targets:
+            raise ValueError(
+                "fastwam_wam_targets and fastwam_action_world_coflow_targets are independent sample ABIs; "
+                "enable exactly one"
+            )
+        if self._fastwam_action_world_coflow_targets and self._fastwam_coflow_future_strides != (16, 32):
+            raise ValueError(
+                "RoboTwin Action--World Co-Flow requires frame-aligned future strides [16,32] at 50 Hz; "
+                f"got {self._fastwam_coflow_future_strides}"
             )
         super().__init__(*args, **kwargs)
         self._trajectory_index_by_id = {
@@ -367,6 +390,14 @@ class FastWAMRobotWinDataset(LeRobotSingleDataset):
             future_indices = np.asarray([0, self._fastwam_future_stride], dtype=np.int64)
             for video_key in self.modality_keys["video"]:
                 indices[video_key] = future_indices.copy()
+        elif self._fastwam_action_world_coflow_targets:
+            # All three camera streams and the 32-step action chunk use the
+            # release's same 50 Hz integer index.  Base video loading clamps
+            # out-of-episode indices; the explicit validity masks below make
+            # those padded targets loss-inert.
+            future_indices = np.asarray([0, *self._fastwam_coflow_future_strides], dtype=np.int64)
+            for video_key in self.modality_keys["video"]:
+                indices[video_key] = future_indices.copy()
         return indices
 
     def _get_all_steps(self) -> LazyEpisodeSteps:
@@ -381,6 +412,10 @@ class FastWAMRobotWinDataset(LeRobotSingleDataset):
         data["action_is_pad"] = base_index + action_offsets >= trajectory_length
         if self._fastwam_wam_targets:
             data["future_valid"] = np.float32(base_index + self._fastwam_future_stride < trajectory_length)
+        elif self._fastwam_action_world_coflow_targets:
+            stride16, stride32 = self._fastwam_coflow_future_strides
+            data["future_valid_16"] = np.float32(base_index + stride16 < trajectory_length)
+            data["future_valid_32"] = np.float32(base_index + stride32 < trajectory_length)
         return data
 
     @staticmethod
@@ -418,6 +453,22 @@ class FastWAMRobotWinDataset(LeRobotSingleDataset):
                     "future_valid": np.float32(data["future_valid"]),
                     "dino_target_view_keys": [_COMPOSITE_VIEW_KEY],
                     "dino_view_keys": [_COMPOSITE_VIEW_KEY],
+                }
+            )
+        elif self._fastwam_action_world_coflow_targets:
+            views16 = [data[key][1] for key in self.modality_keys["video"]]
+            views32 = [data[key][2] for key in self.modality_keys["video"]]
+            composite16 = build_robotwin_composite(views16)
+            composite32 = build_robotwin_composite(views32)
+            sample.update(
+                {
+                    "image_0": [composite],
+                    "image_16": [composite16],
+                    "image_32": [composite32],
+                    "future_valid_16": np.float32(data["future_valid_16"]),
+                    "future_valid_32": np.float32(data["future_valid_32"]),
+                    "coflow_future_strides": np.asarray(self._fastwam_coflow_future_strides, dtype=np.int64),
+                    "coflow_view_keys": [_COMPOSITE_VIEW_KEY],
                 }
             )
         return sample

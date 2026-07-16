@@ -377,6 +377,28 @@ def test_joint_e2e_trainer_metrics_expose_world_gate_to_wandb() -> None:
     assert metrics["train/world_gate_max_openness"] == float(output["world_gate_max_openness"])
 
 
+def test_two_stage_gate_metrics_expose_world_gate_to_wandb() -> None:
+    from starVLA.training.train_starvla import VLATrainer
+
+    for task, loss_key in (("policy", "action_loss"), ("passive", "passive_loss")):
+        output = {
+            loss_key: torch.tensor(0.002),
+            "world_gate_openness": torch.tensor(0.2),
+            "world_gate_signed_mean": torch.tensor(-0.05),
+            "world_gate_max_openness": torch.tensor(0.7),
+        }
+        if task == "passive":
+            output["passive_loss_raw"] = torch.tensor(0.02)
+        metrics = VLATrainer._build_loss_metrics(
+            output,
+            task=task,
+            total_loss=output[loss_key],
+        )
+        assert metrics["train/world_gate_openness"] == float(output["world_gate_openness"])
+        assert metrics["train/world_gate_signed_mean"] == float(output["world_gate_signed_mean"])
+        assert metrics["train/world_gate_max_openness"] == float(output["world_gate_max_openness"])
+
+
 def test_dual_query_layout_is_causal_act_to_future_and_suffix_is_not_context() -> None:
     # [padding/shared-prefix | ACT ACT | FUTURE FUTURE | assistant suffix]
     act = torch.tensor(
@@ -442,6 +464,55 @@ def test_new_e2e_context_mask_closes_post_query_gate_bypass() -> None:
     assert torch.equal(memory_mask, expected)
 
 
+def test_action_and_world_memory_context_can_be_decoupled() -> None:
+    harness = SimpleNamespace(
+        wam_guidance={
+            "mode": "dual_xattn",
+            "include_context_in_action_memory": True,
+            "include_context_in_world_memory": False,
+        }
+    )
+    h_act = torch.randn(1, 2, 4)
+    h_future = torch.randn(1, 2, 4)
+    hidden = torch.randn(1, 8, 4)
+    world_tokens = torch.randn(1, 3, 4)
+    attention = torch.tensor([[0, 1, 1, 1, 1, 1, 1, 1]], dtype=torch.bool)
+    act = torch.tensor([[0, 0, 0, 1, 1, 0, 0, 0]], dtype=torch.bool)
+    future = torch.tensor([[0, 0, 0, 0, 0, 1, 1, 0]], dtype=torch.bool)
+    excluded = Qwen_GR00T._wam_query_suffix_exclusion_mask(act, future)
+
+    action_memory, action_mask = Qwen_GR00T._build_guided_action_memory(
+        harness,
+        h_act,
+        h_future,
+        hidden,
+        attention,
+        excluded,
+        world_tokens,
+    )
+    world_memory, world_mask = Qwen_GR00T._build_world_memory(
+        harness,
+        world_tokens,
+        hidden,
+        attention,
+        excluded,
+    )
+
+    # The normal action cross-attention still sees h_act + Qwen context.
+    assert action_memory.shape == (1, 10, 4)
+    torch.testing.assert_close(action_memory[:, :2], h_act)
+    torch.testing.assert_close(action_memory[:, 2:], hidden)
+    expected_action_mask = torch.tensor(
+        [[1, 1, 0, 1, 1, 0, 0, 0, 0, 0]], dtype=torch.bool
+    )
+    assert torch.equal(action_mask, expected_action_mask)
+
+    # The gated world cross-attention receives predicted-future tokens only.
+    assert world_memory.shape == (1, 3, 4)
+    torch.testing.assert_close(world_memory, world_tokens)
+    assert torch.equal(world_mask, torch.ones(1, 3, dtype=torch.bool))
+
+
 def test_yaml_task_weights_replace_framework_default_task_set() -> None:
     cfg = OmegaConf.create(
         {
@@ -484,6 +555,8 @@ def test_e2e_yaml_injects_zero_initialized_world_gates() -> None:
 def test_e2e_yamls_pass_early_joint_contract() -> None:
     config_paths = (
         REPO_ROOT / "examples/Robotwin/train_files/robotwin_wam_e2e_rand.yaml",
+        REPO_ROOT
+        / "examples/Robotwin/train_files/robotwin_wam_e2e_rand_worldmem_nocontext.yaml",
         REPO_ROOT / "examples/Robotwin/train_files/robotwin_wam_e2e_clean.yaml",
         REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_wam_e2e.yaml",
     )
@@ -501,6 +574,10 @@ def test_e2e_yamls_pass_early_joint_contract() -> None:
         assert not any(str(key).startswith("correlation_") for key in cfg.framework.action_model.keys())
         assert int(cfg.datasets.vla_data.per_device_batch_size) == 16
         assert int(cfg.trainer.gradient_accumulation_steps) == 1
+        if config_path.name == "robotwin_wam_e2e_rand_worldmem_nocontext.yaml":
+            guidance = cfg.framework.wam.guidance
+            assert bool(guidance.include_context_in_action_memory)
+            assert not bool(guidance.include_context_in_world_memory)
 
 
 def test_robotwin_two_stage_budget_is_80k_warmup_plus_20k_gate() -> None:
@@ -667,8 +744,10 @@ if __name__ == "__main__":
     test_joint_e2e_one_backbone_forward_returns_action_and_world_losses()
     test_world_gate_metrics_report_effective_tanh_openness()
     test_joint_e2e_trainer_metrics_expose_world_gate_to_wandb()
+    test_two_stage_gate_metrics_expose_world_gate_to_wandb()
     test_dual_query_layout_is_causal_act_to_future_and_suffix_is_not_context()
     test_new_e2e_context_mask_closes_post_query_gate_bypass()
+    test_action_and_world_memory_context_can_be_decoupled()
     test_yaml_task_weights_replace_framework_default_task_set()
     test_e2e_yaml_injects_zero_initialized_world_gates()
     test_e2e_yamls_pass_early_joint_contract()

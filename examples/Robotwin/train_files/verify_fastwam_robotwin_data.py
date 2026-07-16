@@ -199,7 +199,15 @@ def verify_fastwam_robotwin_data(
             raise FileNotFoundError(parquet_path)
         frame = pd.read_parquet(
             parquet_path,
-            columns=["observation.state", "action", "task_index", "timestamp"],
+            columns=[
+                "observation.state",
+                "action",
+                "task_index",
+                "timestamp",
+                "episode_index",
+                "frame_index",
+                "index",
+            ],
         )
         if len(frame) != int(episode["length"]):
             raise ValueError(f"{parquet_path} has {len(frame)} rows, expected {episode['length']}")
@@ -212,6 +220,25 @@ def verify_fastwam_robotwin_data(
                 f"{parquet_path}: task_index range [{task_indices.min()}, {task_indices.max()}] "
                 f"falls outside tasks.jsonl with {task_count} rows"
             )
+        frame_indices = frame["frame_index"].to_numpy(dtype=np.int64, copy=False)
+        expected_frame_indices = np.arange(len(frame), dtype=np.int64)
+        if not np.array_equal(frame_indices, expected_frame_indices):
+            raise ValueError(f"{parquet_path}: frame_index is not contiguous [0, episode_length)")
+        episode_indices = frame["episode_index"].to_numpy(dtype=np.int64, copy=False)
+        if not bool((episode_indices == episode_index).all()):
+            raise ValueError(f"{parquet_path}: episode_index column disagrees with episode_{episode_index:06d}")
+        expected_timestamps = expected_frame_indices.astype(np.float64) / float(expected_fps)
+        timestamps = frame["timestamp"].to_numpy(dtype=np.float64, copy=False)
+        if not np.allclose(timestamps, expected_timestamps, rtol=0.0, atol=1.0e-4):
+            raise ValueError(
+                f"{parquet_path}: timestamps are not frame_index/{expected_fps:g}; "
+                f"max_error={float(np.max(np.abs(timestamps - expected_timestamps))):.6g}"
+            )
+        global_start = sum(int(item["length"]) for item in episodes[:position])
+        expected_global_indices = global_start + expected_frame_indices
+        global_indices = frame["index"].to_numpy(dtype=np.int64, copy=False)
+        if not np.array_equal(global_indices, expected_global_indices):
+            raise ValueError(f"{parquet_path}: global index column is inconsistent with episode lengths/order")
 
         for video_key in _VIDEO_KEYS:
             video_path = data_root / info["video_path"].format(video_key=video_key, **format_args)

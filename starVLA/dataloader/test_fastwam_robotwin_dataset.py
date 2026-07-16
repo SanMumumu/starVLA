@@ -278,6 +278,52 @@ def test_fastwam_split_domain_and_wam_composite_target() -> None:
         assert "state" not in no_state_sample
 
 
+def test_fastwam_action_world_coflow_dual_future_contract() -> None:
+    """t+16/t+32 targets share the 50 Hz index and have independent masks."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_fixture(root)
+        dataset = get_vla_dataset(
+            _config(
+                root,
+                fastwam_action_world_coflow_targets=True,
+                fastwam_coflow_future_strides=[16, 32],
+            )
+        )
+        _mock_video(dataset)
+        assert dataset.delta_indices["video.cam_high"].tolist() == [0, 16, 32]
+        sample = dataset._pack_sample(dataset.transforms(dataset.get_step_data(0, 0)))
+        assert sample["action"].shape == (32, 14)
+        assert sample["action_is_pad"].shape == (32,)
+        assert sample["future_valid_16"] == 1
+        assert sample["future_valid_32"] == 1
+        assert sample["coflow_future_strides"].tolist() == [16, 32]
+        assert sample["coflow_view_keys"] == ["video.robotwin_composite"]
+        assert sample["image_16"][0].size == sample["image_32"][0].size == (320, 384)
+        # Mock decoder returns one distinguishable image per requested delta.
+        assert int(np.asarray(sample["image_16"][0])[10, 10, 0]) == 21
+        assert int(np.asarray(sample["image_32"][0])[10, 10, 0]) == 22
+
+        tail = dataset._pack_sample(dataset.transforms(dataset.get_step_data(0, 10)))
+        assert tail["future_valid_16"] == 1
+        assert tail["future_valid_32"] == 0
+        assert int(tail["action_is_pad"].sum()) == 2
+
+        try:
+            get_vla_dataset(
+                _config(
+                    root,
+                    fastwam_wam_targets=True,
+                    fastwam_action_world_coflow_targets=True,
+                )
+            )
+        except ValueError as exc:
+            assert "enable exactly one" in str(exc)
+        else:
+            raise AssertionError("WAM and Co-Flow target ABIs must be mutually exclusive")
+
+
 def test_fastwam_train_infer_order_and_contract() -> None:
     from deployment.model_server.policy_wrapper import PolicyServerWrapper
     from examples.Robotwin.eval_files.model2robotwin_fastwam_interface import FastWAMRobotWinModelClient

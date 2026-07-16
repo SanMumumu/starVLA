@@ -7,6 +7,8 @@ possibly stale ``policy/starVLA`` directory is never imported.
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -38,6 +40,26 @@ _EXPECTED_SOURCE_VIEW_KEYS = [
     "video.cam_left_wrist",
     "video.cam_right_wrist",
 ]
+
+
+def _load_fastwam_image_module():
+    """Load the lightweight compositor without importing dataloader.__init__.
+
+    The RoboDojo client image intentionally does not carry StarVLA's training
+    environment. Importing ``starVLA.dataloader.fastwam_image`` normally first
+    executes ``starVLA.dataloader.__init__`` and pulls in training-only packages
+    such as Accelerate. Loading this single dependency-light file directly
+    keeps the client limited to Torch/TorchVision/PIL, all provided by the
+    RoboDojo Isaac environment.
+    """
+
+    module_path = Path(__file__).resolve().parents[3] / "starVLA/dataloader/fastwam_image.py"
+    spec = importlib.util.spec_from_file_location("_robodojo_fastwam_image", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load FastWAM compositor from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _as_bool(value: Any) -> bool:
@@ -126,12 +148,11 @@ class Model(ModelTemplate):
             )
 
         from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
-        from starVLA.dataloader.fastwam_image import (
-            FASTWAM_COMPOSITE_LAYOUT,
-            FASTWAM_COMPOSITE_SIZE,
-            FASTWAM_COMPOSITE_VIEW_KEY,
-            build_robotwin_composite,
-        )
+        fastwam_image = _load_fastwam_image_module()
+        FASTWAM_COMPOSITE_LAYOUT = fastwam_image.FASTWAM_COMPOSITE_LAYOUT
+        FASTWAM_COMPOSITE_SIZE = fastwam_image.FASTWAM_COMPOSITE_SIZE
+        FASTWAM_COMPOSITE_VIEW_KEY = fastwam_image.FASTWAM_COMPOSITE_VIEW_KEY
+        build_robotwin_composite = fastwam_image.build_robotwin_composite
 
         self._build_composite = build_robotwin_composite
         self.image_size = tuple(int(v) for v in self.model_cfg.get("image_size", FASTWAM_COMPOSITE_SIZE))

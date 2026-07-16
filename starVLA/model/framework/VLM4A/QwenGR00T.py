@@ -1032,8 +1032,17 @@ class Qwen_GR00T(baseframework):
             "qformer_heads": 8,
             "pooler_heads": 8,
             "gate_init": 0.0,  # M5 world_gate 初值（tanh(0)=0 → 平滑从 baseline 起步），DiT 阶段用
+            # Opt-in for two-stage policy/passive gate runs. joint_e2e logs
+            # these metrics unconditionally because the gate is part of its
+            # core training contract.
+            "log_gate_openness": False,
             "world_dropout": 0.0,
-            "include_context_in_world_memory": True,  # action memory 是否保留 Qwen 图文 context
+            # Backward compatibility: historically the world-memory flag also
+            # controlled whether action memory kept the Qwen image/language
+            # context.  A missing action-memory override therefore inherits the
+            # legacy world-memory value, preserving every existing YAML/ckpt.
+            "include_context_in_action_memory": None,
+            "include_context_in_world_memory": True,
             # End-to-end mode keeps predicted future in the forward path from
             # step 0, but can linearly ramp only the action-loss gradient that
             # enters the world predictor. Disabled defaults preserve old runs.
@@ -1052,6 +1061,8 @@ class Qwen_GR00T(baseframework):
         g_user = dict(wam_cfg.get("guidance", {})) if hasattr(wam_cfg, "get") else {}
         g = self._wam_guidance_defaults()
         g.update({k: v for k, v in g_user.items() if v is not None})
+        if g["include_context_in_action_memory"] is None:
+            g["include_context_in_action_memory"] = bool(g["include_context_in_world_memory"])
         self.wam_guidance = g
         self.wam_guidance_enabled = bool(g["enabled"])
         # world_target(absolute|delta)：guidance 下优先；否则回落已有 fdm_delta_dino。delta → world head 学差分。
@@ -1123,7 +1134,7 @@ class Qwen_GR00T(baseframework):
             self.qwen_vl_interface.model.resize_token_embeddings(len(tok))
         logger.info(
             "WAM guidance ON: mode=%s signal=%s prompt=%s exclude_post_query_context=%s "
-            "bridge=%s detach_world=%s "
+            "bridge=%s detach_world=%s action_context=%s world_context=%s "
             "(adapter=%s qformer=%s fusion=%s pooler=%s)",
             mode,
             signal,
@@ -1131,6 +1142,8 @@ class Qwen_GR00T(baseframework):
             bool(g["exclude_post_query_context"]),
             g["bridge_source"],
             g["detach_world"],
+            bool(g["include_context_in_action_memory"]),
+            bool(g["include_context_in_world_memory"]),
             self.world_adapter is not None,
             self.world_qformer is not None,
             self.world_fusion is not None,
@@ -1700,6 +1713,13 @@ class Qwen_GR00T(baseframework):
                 "world_gate_max_openness": effective.abs().max(),
             }
 
+    def _wam_maybe_logged_gate_metrics(self) -> dict[str, torch.Tensor]:
+        """Expose gate state for configured two-stage policy/passive runs."""
+
+        if not bool(self.wam_guidance.get("log_gate_openness", False)):
+            return {}
+        return self._wam_world_gate_metrics()
+
     def _build_world_signal(
         self,
         h_future: torch.Tensor,
@@ -1830,7 +1850,12 @@ class Qwen_GR00T(baseframework):
                 wt = world_tokens.to(dtype)
                 blocks.append(wt)
                 masks.append(torch.ones(wt.shape[:2], dtype=torch.bool, device=wt.device))
-        if bool(g["include_context_in_world_memory"]):
+        # The fallback also protects legacy in-memory harnesses/models whose
+        # guidance dict predates the explicit action-memory key.
+        include_action_context = g.get("include_context_in_action_memory", None)
+        if include_action_context is None:
+            include_action_context = g["include_context_in_world_memory"]
+        if bool(include_action_context):
             context_positions = ~context_exclusion_mask.to(torch.bool)
             keep = (attn.to(torch.bool) & context_positions) if attn is not None else context_positions
             blocks.append(hidden.to(dtype))
@@ -1839,7 +1864,8 @@ class Qwen_GR00T(baseframework):
 
     #######
     # 中文注释：World memory（M4 alternate / M5,M6+ dual cross-attn 用）：M_w=[world_tokens ; qwen_context]
-    # （plan §4.5，include_context_in_world_memory 控制是否带 context）。供 action DiT 的 world cross-attn 读。
+    # （include_context_in_world_memory 控制是否带 context）。它和 action memory 的 context 开关独立，
+    # 供 action DiT 的 gated world cross-attn 读取。
     def _build_world_memory(self, world_tokens, hidden, attn, context_exclusion_mask):
         g = self.wam_guidance
         dtype = world_tokens.dtype
@@ -2005,7 +2031,9 @@ class Qwen_GR00T(baseframework):
                 guidance_mode=mode,
             )
             key = "action_loss" if task == "policy" else "idm_loss"
-            return {key: loss + self._wam_guided_unused_anchor(task, loss)}
+            output = {key: loss + self._wam_guided_unused_anchor(task, loss)}
+            output.update(self._wam_maybe_logged_gate_metrics())
+            return output
         # passive / fdm：world head 监督（dual-query 的 h_future 为条件，与 policy 一致）。
         z_gt = self._wam_world_target(examples)
         cond = h_future
@@ -2018,10 +2046,15 @@ class Qwen_GR00T(baseframework):
         vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=cond.dtype)
         raw = self._wam_visual_loss(cond.to(vh), z_gt, examples)
         loss = self.wam_dino_loss_weight * raw
-        return {
+        output = {
             f"{task}_loss": loss + self._wam_guided_unused_anchor(task, loss),
             f"{task}_loss_raw": raw.detach(),
         }
+        # Log on passive/fdm steps too. This is a detached read of the same
+        # gate parameter, so it keeps a continuous W&B curve without changing
+        # either loss or gradient flow.
+        output.update(self._wam_maybe_logged_gate_metrics())
+        return output
 
     @torch.inference_mode()
     def _wam_guided_predict_action(self, examples: List[dict], **kwargs) -> dict:
