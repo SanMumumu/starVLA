@@ -50,9 +50,17 @@ class _QWen3_VL_Interface(nn.Module):
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3-VL-4B-Instruct")
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
+        require_attn_implementation = bool(
+            qwenvl_config.get("require_attn_implementation", False)
+        )
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
         if attn_implementation == "flash_attention_2":
             if not has_flash_attn():
+                if require_attn_implementation:
+                    raise RuntimeError(
+                        "Qwen3 was configured with required flash_attention_2, but flash-attn "
+                        "is unavailable in this image. Refusing an implicit SDPA fallback."
+                    )
                 print("[WARNING] flash_attn not installed, falling back to sdpa")
                 attn_implementation = "sdpa"
         print(f"[Qwen3] attn_implementation={attn_implementation}", flush=True)
@@ -82,6 +90,7 @@ class _QWen3_VL_Interface(nn.Module):
         self.model = model
         self.processor = processor
         self.config = config
+        self.attn_implementation = str(attn_implementation)
 
         # alin qwen3 with qwen2.5
         self.model.config.hidden_size = self.model.config.text_config.hidden_size

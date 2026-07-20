@@ -224,3 +224,46 @@ def test_fastwam_client_verifies_isolated_recipe_action_query_abi() -> None:
     with patch.object(adapter.StandardModelClient, "__init__", fake_missing_action_query):
         with pytest.raises(RuntimeError, match="ACT query count"):
             adapter.FastWAMRobotWinModelClient(policy_ckpt_path=requested)
+
+
+def test_fastwam_client_verifies_shared_qwen_query_abi() -> None:
+    sys.path.insert(0, str(EVAL_DIR))
+    try:
+        import model2robotwin_fastwam_interface as adapter
+    finally:
+        sys.path.pop(0)
+
+    requested = "/models/sharedqwen/checkpoints/steps_20000_pytorch_model.pt"
+
+    def fake_standard_init(self, *args, **kwargs):
+        self.action_chunk_size = 32
+        self.replan_steps = 24
+        self.server_meta = {
+            "ckpt_path": kwargs.get("policy_ckpt_path"),
+            "expects_state": True,
+            "wam_two_stage_recipe": "shared_qwen_queries_v5",
+            "wam_pretraining_aligned_queries": True,
+            "wam_future_query_through_qwen": True,
+            "qwen_attn_implementation": "flash_attention_2",
+            "wam_query_attention_pattern": "causal_act_then_future",
+            "wam_single_qwen_forward": True,
+            "wam_queries_are_final_suffix": True,
+            "wam_separate_world_backbone_pass": False,
+            "wam_detach_action_query_in_world_pass": False,
+            "wam_baseline_action_context": False,
+            "wam_action_query_count": 32,
+            "wam_future_query_capacity": 64,
+            "wam_future_query_count": 64,
+        }
+
+    with patch.object(adapter.StandardModelClient, "__init__", fake_standard_init):
+        client = adapter.FastWAMRobotWinModelClient(policy_ckpt_path=requested)
+        assert client.action_chunk_size == 32
+
+    def fake_post_qwen_future(self, *args, **kwargs):
+        fake_standard_init(self, *args, **kwargs)
+        self.server_meta["wam_future_query_through_qwen"] = False
+
+    with patch.object(adapter.StandardModelClient, "__init__", fake_post_qwen_future):
+        with pytest.raises(RuntimeError, match="FUTURE-query Qwen injection"):
+            adapter.FastWAMRobotWinModelClient(policy_ckpt_path=requested)

@@ -242,19 +242,59 @@ class PolicyServerWrapper:
             and getattr(future_query_bank, "max_queries", None) is not None
             else None
         )
-        if phase is not None and recipe == "isolated_queries_v4":
+        future_query_count = int(getattr(framework, "wam_n_flow", 0) or 0)
+        qwen_interface = getattr(framework, "qwen_vl_interface", None)
+        qwen_attn_implementation = (
+            str(getattr(qwen_interface, "attn_implementation", "")).lower()
+            if qwen_interface is not None
+            else ""
+        )
+        if phase is not None and recipe in {
+            "isolated_queries_v4",
+            "shared_qwen_queries_v5",
+        }:
             expected_action_queries = int(getattr(framework, "action_horizon", 0))
             if not pretraining_aligned_queries or action_query_count != expected_action_queries:
                 raise RuntimeError(
-                    "isolated_queries_v4 checkpoint did not restore its pretraining-aligned "
+                    f"{recipe} checkpoint did not restore its pretraining-aligned "
                     "ACT query bank: "
                     f"enabled={pretraining_aligned_queries}, count={action_query_count}, "
                     f"expected={expected_action_queries}"
                 )
             if future_query_capacity is None:
                 raise RuntimeError(
-                    "isolated_queries_v4 checkpoint did not restore its FUTURE query bank"
+                    f"{recipe} checkpoint did not restore its FUTURE query bank"
                 )
+            if recipe == "shared_qwen_queries_v5" and not bool(
+                runtime_guidance.get("future_query_through_qwen", False)
+            ):
+                raise RuntimeError(
+                    "shared_qwen_queries_v5 checkpoint did not restore FUTURE-query Qwen injection"
+                )
+            if recipe == "shared_qwen_queries_v5":
+                if action_query_count != 32 or int(getattr(framework, "action_horizon", 0)) != 32:
+                    raise RuntimeError(
+                        "shared_qwen_queries_v5 server requires ACT32/H32, got "
+                        f"queries={action_query_count}, horizon={getattr(framework, 'action_horizon', None)}"
+                    )
+                if future_query_count != 64 or future_query_capacity != 64:
+                    raise RuntimeError(
+                        "shared_qwen_queries_v5 server requires FUTURE64, got "
+                        f"active={future_query_count}, capacity={future_query_capacity}"
+                    )
+                if bool(runtime_guidance.get("separate_world_backbone_pass", False)):
+                    raise RuntimeError(
+                        "shared_qwen_queries_v5 checkpoint requests the obsolete two-pass Qwen path"
+                    )
+                if bool(runtime_guidance.get("detach_action_query_in_world_pass", False)):
+                    raise RuntimeError(
+                        "shared_qwen_queries_v5 checkpoint unexpectedly detaches ACT query from world loss"
+                    )
+                if qwen_attn_implementation != "flash_attention_2":
+                    raise RuntimeError(
+                        "shared_qwen_queries_v5 server requires active flash_attention_2, got "
+                        f"{qwen_attn_implementation!r}"
+                    )
         metadata: Dict[str, Any] = {
             "wam_enabled": wam_enabled,
             "wam_two_stage_phase": phase,
@@ -298,11 +338,45 @@ class PolicyServerWrapper:
             "wam_pretraining_aligned_queries": (
                 pretraining_aligned_queries if guidance_enabled else None
             ),
+            "wam_future_query_through_qwen": (
+                bool(runtime_guidance.get("future_query_through_qwen", False))
+                if guidance_enabled
+                else None
+            ),
+            "qwen_attn_implementation": qwen_attn_implementation or None,
+            "wam_query_attention_pattern": (
+                "causal_act_then_future"
+                if guidance_enabled and recipe == "shared_qwen_queries_v5"
+                else None
+            ),
+            "wam_single_qwen_forward": (
+                not bool(runtime_guidance.get("separate_world_backbone_pass", False))
+                if guidance_enabled and recipe == "shared_qwen_queries_v5"
+                else None
+            ),
+            "wam_queries_are_final_suffix": (
+                True
+                if guidance_enabled and recipe == "shared_qwen_queries_v5"
+                else None
+            ),
+            "wam_separate_world_backbone_pass": (
+                bool(runtime_guidance.get("separate_world_backbone_pass", False))
+                if guidance_enabled
+                else None
+            ),
+            "wam_detach_action_query_in_world_pass": (
+                bool(runtime_guidance.get("detach_action_query_in_world_pass", False))
+                if guidance_enabled
+                else None
+            ),
             "wam_action_query_count": (
                 action_query_count if guidance_enabled else None
             ),
             "wam_future_query_capacity": (
                 future_query_capacity if guidance_enabled else None
+            ),
+            "wam_future_query_count": (
+                future_query_count if guidance_enabled else None
             ),
             "wam_gate_openness": None,
             "wam_gate_signed_mean": None,

@@ -123,10 +123,11 @@ def verify(
         "policy_first_v2",
         "baseline_preserving_v3",
         "isolated_queries_v4",
+        "shared_qwen_queries_v5",
     }:
         errors.append(
             "trainer.wam_two_stage_recipe must be legacy_v1, policy_first_v2, "
-            "baseline_preserving_v3, or isolated_queries_v4, got "
+            "baseline_preserving_v3, isolated_queries_v4, or shared_qwen_queries_v5, got "
             f"{actual_wam_recipe!r}"
         )
     if expected_wam_phase is not None:
@@ -196,6 +197,46 @@ def verify(
                         errors.append(
                             "isolated_queries_v4 gate_ft is missing pretraining-aligned queries"
                         )
+            if actual_wam_recipe == "shared_qwen_queries_v5":
+                if bool(guidance_cfg.get("detach_action_backbone", False)):
+                    errors.append(
+                        "shared_qwen_queries_v5 gate_ft must keep detach_action_backbone=false"
+                    )
+                if bool(guidance_cfg.get("detach_world_backbone", False)):
+                    errors.append(
+                        "shared_qwen_queries_v5 gate_ft must preserve detach_world_backbone=false"
+                    )
+                if bool(guidance_cfg.get("baseline_action_context", False)):
+                    errors.append(
+                        "shared_qwen_queries_v5 gate_ft must use the explicit ACT query path"
+                    )
+                for key in (
+                    "pretraining_aligned_queries",
+                    "future_query_through_qwen",
+                ):
+                    if not bool(guidance_cfg.get(key, False)):
+                        errors.append(
+                            f"shared_qwen_queries_v5 gate_ft requires guidance.{key}=true"
+                        )
+                for obsolete_key in (
+                    "separate_world_backbone_pass",
+                    "detach_action_query_in_world_pass",
+                ):
+                    if bool(guidance_cfg.get(obsolete_key, False)):
+                        errors.append(
+                            "shared_qwen_queries_v5 gate_ft is one-pass and requires "
+                            f"guidance.{obsolete_key}=false"
+                        )
+                if str(framework_cfg.get("qwenvl", {}).get("attn_implementation", "")).lower() != "flash_attention_2":
+                    errors.append(
+                        "shared_qwen_queries_v5 gate_ft requires "
+                        "qwenvl.attn_implementation=flash_attention_2"
+                    )
+                if not bool(framework_cfg.get("qwenvl", {}).get("require_attn_implementation", False)):
+                    errors.append(
+                        "shared_qwen_queries_v5 gate_ft requires "
+                        "qwenvl.require_attn_implementation=true"
+                    )
         elif expected_wam_phase == "predictor_warmup":
             if not bool(guidance_cfg.get("action_world_bypass", False)):
                 errors.append("predictor_warmup checkpoint must have guidance.action_world_bypass=true")
@@ -231,6 +272,51 @@ def verify(
                         errors.append(
                             "isolated_queries_v4 predictor_warmup is missing pretraining-aligned queries"
                         )
+            elif actual_wam_recipe == "shared_qwen_queries_v5":
+                if bool(guidance_cfg.get("detach_action_backbone", False)):
+                    errors.append(
+                        "shared_qwen_queries_v5 predictor_warmup must let action loss update Qwen"
+                    )
+                if bool(guidance_cfg.get("detach_world_backbone", False)):
+                    errors.append(
+                        "shared_qwen_queries_v5 predictor_warmup must let world loss update Qwen"
+                    )
+                if bool(guidance_cfg.get("baseline_action_context", False)):
+                    errors.append(
+                        "shared_qwen_queries_v5 predictor_warmup must use the explicit ACT query path"
+                    )
+                for key in (
+                    "pretraining_aligned_queries",
+                    "future_query_through_qwen",
+                    "freeze_world_to_action_in_warmup",
+                ):
+                    if not bool(guidance_cfg.get(key, False)):
+                        errors.append(
+                            f"shared_qwen_queries_v5 predictor_warmup requires guidance.{key}=true"
+                        )
+                for obsolete_key in (
+                    "separate_world_backbone_pass",
+                    "detach_action_query_in_world_pass",
+                ):
+                    if bool(guidance_cfg.get(obsolete_key, False)):
+                        errors.append(
+                            "shared_qwen_queries_v5 predictor_warmup is one-pass and requires "
+                            f"guidance.{obsolete_key}=false"
+                        )
+                if str(framework_cfg.get("qwenvl", {}).get("attn_implementation", "")).lower() != "flash_attention_2":
+                    errors.append(
+                        "shared_qwen_queries_v5 predictor_warmup requires "
+                        "qwenvl.attn_implementation=flash_attention_2"
+                    )
+                if not bool(framework_cfg.get("qwenvl", {}).get("require_attn_implementation", False)):
+                    errors.append(
+                        "shared_qwen_queries_v5 predictor_warmup requires "
+                        "qwenvl.require_attn_implementation=true"
+                    )
+                if int(trainer_cfg.get("num_warmup_steps", 0)) != 2000:
+                    errors.append(
+                        "shared_qwen_queries_v5 predictor_warmup must use 2000 LR warmup steps"
+                    )
             elif not bool(guidance_cfg.get("detach_action_backbone", False)):
                 errors.append("legacy predictor_warmup checkpoint must detach the action backbone")
             if active_tasks != ["joint_detached"]:
@@ -239,6 +325,21 @@ def verify(
                 )
             if int(trainer_cfg.get("max_train_steps", 0)) != 80000:
                 errors.append("predictor_warmup checkpoint must record max_train_steps=80000")
+
+        if actual_wam_recipe == "shared_qwen_queries_v5":
+            if str(guidance_cfg.get("prompt_mode", "")).lower() != "dual_query":
+                errors.append("shared_qwen_queries_v5 requires guidance.prompt_mode=dual_query")
+            if not bool(guidance_cfg.get("exclude_post_query_context", False)):
+                errors.append(
+                    "shared_qwen_queries_v5 requires guidance.exclude_post_query_context=true"
+                )
+            if int(action_cfg.get("action_horizon", 0)) != 32:
+                errors.append("shared_qwen_queries_v5 requires action_horizon=32")
+            if int(action_cfg.get("n_action_query", 0)) != 32:
+                errors.append("shared_qwen_queries_v5 requires n_action_query=32")
+            visual_cfg = framework_cfg.get("visual_model", {})
+            if int(visual_cfg.get("n_flow_query", 0)) != 64:
+                errors.append("shared_qwen_queries_v5 requires n_flow_query=64")
 
     actual_world_to_action = bool(guidance_cfg.get("world_to_action_enabled", True))
     if (
@@ -320,6 +421,33 @@ def verify(
         "wam_pretraining_aligned_queries": bool(
             guidance_cfg.get("pretraining_aligned_queries", False)
         ),
+        "wam_future_query_through_qwen": bool(
+            guidance_cfg.get("future_query_through_qwen", False)
+        ),
+        "qwen_attn_implementation": str(
+            framework_cfg.get("qwenvl", {}).get("attn_implementation", "")
+        ).lower() or None,
+        "wam_query_attention_pattern": (
+            "causal_act_then_future"
+            if actual_wam_recipe == "shared_qwen_queries_v5" and actual_wam_phase
+            else None
+        ),
+        "wam_single_qwen_forward": (
+            not bool(guidance_cfg.get("separate_world_backbone_pass", False))
+            if actual_wam_recipe == "shared_qwen_queries_v5" and actual_wam_phase
+            else None
+        ),
+        "wam_queries_are_final_suffix": (
+            True
+            if actual_wam_recipe == "shared_qwen_queries_v5" and actual_wam_phase
+            else None
+        ),
+        "wam_separate_world_backbone_pass": bool(
+            guidance_cfg.get("separate_world_backbone_pass", False)
+        ),
+        "wam_detach_action_query_in_world_pass": bool(
+            guidance_cfg.get("detach_action_query_in_world_pass", False)
+        ),
         "wam_action_query_count": (
             int(action_cfg.get("n_action_query", action_cfg.get("action_horizon", 32)))
             if bool(guidance_cfg.get("pretraining_aligned_queries", False))
@@ -327,6 +455,11 @@ def verify(
         ),
         "wam_future_query_capacity": (
             int(framework_cfg.get("visual_model", {}).get("max_image_queries", 0))
+            if bool(guidance_cfg.get("pretraining_aligned_queries", False))
+            else None
+        ),
+        "wam_future_query_count": (
+            int(framework_cfg.get("visual_model", {}).get("n_flow_query", 0))
             if bool(guidance_cfg.get("pretraining_aligned_queries", False))
             else None
         ),

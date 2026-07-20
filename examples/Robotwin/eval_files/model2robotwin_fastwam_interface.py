@@ -62,27 +62,60 @@ class FastWAMRobotWinModelClient(StandardModelClient):
             )
         self.expects_state = expects_state
         actual_wam_recipe = self.server_meta.get("wam_two_stage_recipe")
-        if actual_wam_recipe == "isolated_queries_v4":
+        if actual_wam_recipe in {"isolated_queries_v4", "shared_qwen_queries_v5"}:
             if self.server_meta.get("wam_pretraining_aligned_queries") is not True:
                 raise RuntimeError(
-                    "isolated_queries_v4 server did not activate its pretraining-aligned ACT query path"
+                    f"{actual_wam_recipe} server did not activate its pretraining-aligned ACT query path"
                 )
             if self.server_meta.get("wam_baseline_action_context") is not False:
                 raise RuntimeError(
-                    "isolated_queries_v4 must condition the policy with ACT queries, not the query-free "
+                    f"{actual_wam_recipe} must condition the policy with ACT queries, not the query-free "
                     "native action context"
                 )
             if self.server_meta.get("wam_action_query_count") != self.action_chunk_size:
                 raise RuntimeError(
-                    "isolated_queries_v4 ACT query count does not match the action chunk: "
+                    f"{actual_wam_recipe} ACT query count does not match the action chunk: "
                     f"queries={self.server_meta.get('wam_action_query_count')}, "
                     f"chunk={self.action_chunk_size}"
                 )
             future_capacity = self.server_meta.get("wam_future_query_capacity")
             if isinstance(future_capacity, bool) or not isinstance(future_capacity, int) or future_capacity <= 0:
                 raise RuntimeError(
-                    "isolated_queries_v4 server did not expose a valid FUTURE query bank capacity"
+                    f"{actual_wam_recipe} server did not expose a valid FUTURE query bank capacity"
                 )
+            if (
+                actual_wam_recipe == "shared_qwen_queries_v5"
+                and self.server_meta.get("wam_future_query_through_qwen") is not True
+            ):
+                raise RuntimeError(
+                    "shared_qwen_queries_v5 server did not activate FUTURE-query Qwen injection"
+                )
+            if actual_wam_recipe == "shared_qwen_queries_v5":
+                if self.server_meta.get("wam_query_attention_pattern") != "causal_act_then_future":
+                    raise RuntimeError(
+                        "shared_qwen_queries_v5 server did not declare causal ACT->FUTURE attention"
+                    )
+                if self.server_meta.get("wam_single_qwen_forward") is not True:
+                    raise RuntimeError(
+                        "shared_qwen_queries_v5 server reports an obsolete two-pass Qwen path"
+                    )
+                if self.server_meta.get("wam_queries_are_final_suffix") is not True:
+                    raise RuntimeError(
+                        "shared_qwen_queries_v5 server did not declare context->ACT32->FUTURE64 "
+                        "as its physical final token suffix"
+                    )
+                if self.server_meta.get("wam_future_query_count") != 64:
+                    raise RuntimeError(
+                        "shared_qwen_queries_v5 server does not use exactly 64 FUTURE queries"
+                    )
+                if self.server_meta.get("wam_detach_action_query_in_world_pass") is not False:
+                    raise RuntimeError(
+                        "shared_qwen_queries_v5 server detached ACT intent from the world objective"
+                    )
+                if self.server_meta.get("qwen_attn_implementation") != "flash_attention_2":
+                    raise RuntimeError(
+                        "shared_qwen_queries_v5 server is not using flash_attention_2"
+                    )
         self.wam_expected_phase = (
             None if wam_expected_phase is None else str(wam_expected_phase).lower()
         )

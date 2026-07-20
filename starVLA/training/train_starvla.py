@@ -477,11 +477,11 @@ class VLATrainer(TrainerUtils):
             if trainer_cfg is not None
             else "legacy_v1"
         ).lower()
-        if recipe == "isolated_queries_v4":
+        if recipe in {"isolated_queries_v4", "shared_qwen_queries_v5"}:
             world_queries = getattr(self.model, "future_dino_queries", None)
             if not isinstance(world_queries, torch.nn.Module):
                 raise RuntimeError(
-                    "isolated_queries_v4 requires an explicit future_dino_queries module"
+                    f"{recipe} requires an explicit future_dino_queries module"
                 )
             query_params = [
                 parameter
@@ -490,7 +490,7 @@ class VLATrainer(TrainerUtils):
             ]
             if not query_params:
                 raise RuntimeError(
-                    "isolated_queries_v4 warmup requires trainable world-query parameters"
+                    f"{recipe} warmup requires trainable world-query parameters"
                 )
             world_params.extend(query_params)
 
@@ -522,6 +522,58 @@ class VLATrainer(TrainerUtils):
                 "World-predictor optimizer LR must be positive "
                 f"(scheduler initial/base LR), got {bad_groups}"
             )
+        if recipe == "shared_qwen_queries_v5":
+            action_modules = {
+                "qwen_vl_interface": getattr(self.model, "qwen_vl_interface", None),
+                "action_queries": getattr(self.model, "action_queries", None),
+                "action_model": getattr(self.model, "action_model", None),
+            }
+            action_params: list[torch.nn.Parameter] = []
+            seen: set[int] = set()
+            empty_modules: list[str] = []
+            for module_name, module in action_modules.items():
+                params = (
+                    [parameter for parameter in module.parameters() if parameter.requires_grad]
+                    if isinstance(module, torch.nn.Module)
+                    else []
+                )
+                if not params:
+                    empty_modules.append(module_name)
+                for parameter in params:
+                    if id(parameter) not in seen:
+                        seen.add(id(parameter))
+                        action_params.append(parameter)
+            if empty_modules:
+                raise RuntimeError(
+                    "shared_qwen_queries_v5 requires trainable action-path modules: "
+                    + ",".join(empty_modules)
+                )
+            missing_action = [
+                parameter for parameter in action_params if id(parameter) not in optimizer_lrs
+            ]
+            if missing_action:
+                raise RuntimeError(
+                    f"{len(missing_action)} trainable causal action-path parameters are absent "
+                    "from the optimizer"
+                )
+            action_groups = {optimizer_lrs[id(parameter)] for parameter in action_params}
+            bad_action_groups = sorted(
+                (name, initial_lr)
+                for name, initial_lr, _current_lr in action_groups
+                if initial_lr <= 0.0
+            )
+            if bad_action_groups:
+                raise RuntimeError(
+                    "Causal shared-query action-path optimizer LR must be positive, got "
+                    f"{bad_action_groups}"
+                )
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "Verified causal action optimizer: params=%d "
+                    "groups=(name, initial_lr, current_lr)=%s",
+                    sum(parameter.numel() for parameter in action_params),
+                    sorted(action_groups),
+                )
         if self.accelerator.is_main_process:
             logger.info(
                 "Verified joint world optimizer: task=%s params=%d "
@@ -549,6 +601,65 @@ class VLATrainer(TrainerUtils):
             if not isinstance(module, torch.nn.Module):
                 return []
             return [parameter for parameter in module.parameters() if parameter.requires_grad]
+
+        def validate_optimizer_coverage(
+            module_names: tuple[str, ...],
+            *,
+            label: str,
+        ) -> None:
+            """Prove every live parameter is assigned a positive base LR.
+
+            A scheduler with warmup legitimately exposes ``lr=0`` before its
+            first step, so the update-capable contract is ``initial_lr > 0``.
+            This catches both a stale freeze selector and a YAML LR group that
+            silently omitted Action DiT/query parameters.
+            """
+
+            optimizer_groups: dict[int, tuple[str, float, float]] = {}
+            for index, group in enumerate(self.optimizer.param_groups):
+                name = str(group.get("name", index))
+                current_lr = float(group.get("lr", 0.0))
+                initial_lr = float(group.get("initial_lr", current_lr))
+                for parameter in group["params"]:
+                    optimizer_groups[id(parameter)] = (name, initial_lr, current_lr)
+
+            parameters: list[torch.nn.Parameter] = []
+            seen: set[int] = set()
+            empty: list[str] = []
+            for module_name in module_names:
+                selected = trainable(module_name)
+                if not selected:
+                    empty.append(module_name)
+                for parameter in selected:
+                    if id(parameter) not in seen:
+                        seen.add(id(parameter))
+                        parameters.append(parameter)
+            if empty:
+                raise RuntimeError(
+                    f"{label} requires trainable modules missing at runtime: {empty}"
+                )
+            missing = [parameter for parameter in parameters if id(parameter) not in optimizer_groups]
+            if missing:
+                raise RuntimeError(
+                    f"{label} has {len(missing)} trainable parameters absent from the optimizer"
+                )
+            groups = {optimizer_groups[id(parameter)] for parameter in parameters}
+            bad = sorted(
+                (name, initial_lr)
+                for name, initial_lr, _current_lr in groups
+                if initial_lr <= 0.0
+            )
+            if bad:
+                raise RuntimeError(
+                    f"{label} optimizer groups must have positive initial/base LR, got {bad}"
+                )
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "Verified %s optimizer coverage: params=%d groups=%s",
+                    label,
+                    sum(parameter.numel() for parameter in parameters),
+                    sorted(groups),
+                )
 
         gates = [
             parameter
@@ -602,7 +713,12 @@ class VLATrainer(TrainerUtils):
         if phase == "predictor_warmup":
             if not trainable("wam_visual_head") or not trainable("wam_state_ctx"):
                 raise RuntimeError("predictor_warmup requires trainable visual head and state conditioner")
-            if recipe in {"policy_first_v2", "baseline_preserving_v3", "isolated_queries_v4"}:
+            if recipe in {
+                "policy_first_v2",
+                "baseline_preserving_v3",
+                "isolated_queries_v4",
+                "shared_qwen_queries_v5",
+            }:
                 if not trainable("qwen_vl_interface"):
                     raise RuntimeError(
                         f"{recipe} predictor_warmup requires trainable Qwen so action loss can update it"
@@ -611,14 +727,14 @@ class VLATrainer(TrainerUtils):
                     raise RuntimeError(
                         f"{recipe} predictor_warmup requires a trainable action model"
                     )
-            if recipe == "isolated_queries_v4":
+            if recipe in {"isolated_queries_v4", "shared_qwen_queries_v5"}:
                 if not trainable("action_queries"):
                     raise RuntimeError(
-                        "isolated_queries_v4 warmup requires a trainable action query bank"
+                        f"{recipe} warmup requires a trainable action query bank"
                     )
                 if not trainable("future_dino_queries"):
                     raise RuntimeError(
-                        "isolated_queries_v4 warmup requires a trainable world query bank"
+                        f"{recipe} warmup requires a trainable world query bank"
                     )
                 leaking_world_to_action = sum(
                     parameter.numel()
@@ -628,7 +744,7 @@ class VLATrainer(TrainerUtils):
                 ) + sum(parameter.numel() for parameter in gates if parameter.requires_grad)
                 if leaking_world_to_action:
                     raise RuntimeError(
-                        "isolated_queries_v4 warmup must physically freeze adapter/gate/"
+                        f"{recipe} warmup must physically freeze adapter/gate/"
                         f"world-attention parameters; trainable={leaking_world_to_action}"
                     )
         elif phase == "gate_ft":
@@ -639,7 +755,11 @@ class VLATrainer(TrainerUtils):
                     "wam_visual_head",
                     "wam_state_ctx",
                     "wam_act_ctx",
-                    "future_dino_queries" if recipe == "isolated_queries_v4" else "",
+                    (
+                        "future_dino_queries"
+                        if recipe in {"isolated_queries_v4", "shared_qwen_queries_v5"}
+                        else ""
+                    ),
                 )
                 if name
                 if trainable(name)
@@ -650,12 +770,33 @@ class VLATrainer(TrainerUtils):
                 )
             if not trainable("action_model") or not trainable("world_adapter"):
                 raise RuntimeError("gate_ft requires trainable action_model and world_adapter")
-            if recipe == "isolated_queries_v4" and not trainable("action_queries"):
+            if recipe in {"isolated_queries_v4", "shared_qwen_queries_v5"} and not trainable(
+                "action_queries"
+            ):
                 raise RuntimeError(
-                    "isolated_queries_v4 gate_ft requires a trainable action query bank"
+                    f"{recipe} gate_ft requires a trainable action query bank"
                 )
         else:
             raise RuntimeError(f"Unsupported wam_two_stage_phase={phase!r}")
+
+        if recipe == "shared_qwen_queries_v5":
+            if phase == "predictor_warmup":
+                validate_optimizer_coverage(
+                    (
+                        "qwen_vl_interface",
+                        "action_queries",
+                        "action_model",
+                        "future_dino_queries",
+                        "wam_visual_head",
+                        "wam_state_ctx",
+                    ),
+                    label="causal shared-query warmup",
+                )
+            else:
+                validate_optimizer_coverage(
+                    ("action_queries", "action_model", "world_adapter"),
+                    label="causal shared-query gate FT",
+                )
 
         if self.accelerator.is_main_process:
             logger.info(

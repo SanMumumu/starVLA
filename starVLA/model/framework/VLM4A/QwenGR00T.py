@@ -242,6 +242,24 @@ class Qwen_GR00T(baseframework):
         self._validate_joint_e2e_contract()
         self._validate_wam_two_stage_contract()
         self.qwen_vl_interface = get_vlm_model(config=self.config)
+        wam_recipe = str(
+            self.config.trainer.get("wam_two_stage_recipe", "legacy_v1")
+            if getattr(self.config, "trainer", None) is not None
+            else "legacy_v1"
+        ).lower()
+        if wam_recipe == "shared_qwen_queries_v5":
+            actual_attn = str(
+                getattr(
+                    self.qwen_vl_interface,
+                    "attn_implementation",
+                    self.config.framework.qwenvl.get("attn_implementation", ""),
+                )
+            ).lower()
+            if actual_attn != "flash_attention_2":
+                raise RuntimeError(
+                    "shared_qwen_queries_v5 requires an active FlashAttention-2 Qwen backbone; "
+                    f"loaded implementation={actual_attn!r}"
+                )
         # align dims --> we should put them to config or no?
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = (
             self.qwen_vl_interface.model.config.hidden_size
@@ -291,7 +309,11 @@ class Qwen_GR00T(baseframework):
                 if getattr(self.config, "trainer", None) is not None
                 else "legacy_v1"
             ).lower()
-            if recipe in {"baseline_preserving_v3", "isolated_queries_v4"}:
+            if recipe in {
+                "baseline_preserving_v3",
+                "isolated_queries_v4",
+                "shared_qwen_queries_v5",
+            }:
                 # Auxiliary token rows, predictor, conditioners and adapters
                 # need random initialization, but must not advance the policy
                 # RNG beyond native baseline model construction.  All modules
@@ -415,10 +437,11 @@ class Qwen_GR00T(baseframework):
             "policy_first_v2",
             "baseline_preserving_v3",
             "isolated_queries_v4",
+            "shared_qwen_queries_v5",
         }:
             raise ValueError(
                 "trainer.wam_two_stage_recipe must be legacy_v1, policy_first_v2, "
-                "baseline_preserving_v3, or isolated_queries_v4, "
+                "baseline_preserving_v3, isolated_queries_v4, or shared_qwen_queries_v5, "
                 f"got {recipe!r}"
             )
 
@@ -428,10 +451,25 @@ class Qwen_GR00T(baseframework):
         weights = framework.get("tasks", {}).get("weights", {})
         active = [str(name) for name, weight in weights.items() if float(weight) > 0.0]
         action_cfg = framework.get("action_model", {})
+        visual_cfg = framework.get("visual_model", {})
         datasets_cfg = getattr(self.config, "datasets", None)
         vla_cfg = datasets_cfg.get("vla_data", {}) if datasets_cfg is not None else {}
         world_val = trainer.get("world_validation", {})
         problems: list[str] = []
+
+        if recipe == "shared_qwen_queries_v5":
+            if str(guidance.get("prompt_mode", "")).lower() != "dual_query":
+                problems.append("shared_qwen_queries_v5 requires guidance.prompt_mode=dual_query")
+            if not bool(guidance.get("exclude_post_query_context", False)):
+                problems.append(
+                    "shared_qwen_queries_v5 requires guidance.exclude_post_query_context=true"
+                )
+            if int(action_cfg.get("action_horizon", 0)) != 32:
+                problems.append("shared_qwen_queries_v5 requires action_model.action_horizon=32")
+            if int(action_cfg.get("n_action_query", 0)) != 32:
+                problems.append("shared_qwen_queries_v5 requires action_model.n_action_query=32")
+            if int(visual_cfg.get("n_flow_query", 0)) != 64:
+                problems.append("shared_qwen_queries_v5 requires visual_model.n_flow_query=64")
 
         if bool(action_cfg.get("use_correlated_noise", False)):
             problems.append("action_model.use_correlated_noise must be false")
@@ -525,6 +563,83 @@ class Qwen_GR00T(baseframework):
                             problems.append(
                                 f"isolated_queries_v4 warmup requires positive learning_rate.{name}"
                             )
+            elif recipe == "shared_qwen_queries_v5":
+                if detach_action_backbone:
+                    problems.append(
+                        "shared_qwen_queries_v5 predictor_warmup requires "
+                        "guidance.detach_action_backbone=false"
+                    )
+                if detach_world_backbone:
+                    problems.append(
+                        "shared_qwen_queries_v5 predictor_warmup requires "
+                        "guidance.detach_world_backbone=false so world loss can shape Qwen"
+                    )
+                if int(trainer.get("num_warmup_steps", 0)) != 2000:
+                    problems.append(
+                        "shared_qwen_queries_v5 predictor_warmup requires "
+                        "num_warmup_steps=2000 to match the IID baseline"
+                    )
+                if not bool(guidance.get("pretraining_aligned_queries", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 requires guidance.pretraining_aligned_queries=true"
+                    )
+                if bool(guidance.get("baseline_action_context", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 requires baseline_action_context=false so ACT queries "
+                        "remain on the policy path"
+                    )
+                if not bool(guidance.get("future_query_through_qwen", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 requires guidance.future_query_through_qwen=true"
+                    )
+                if bool(guidance.get("separate_world_backbone_pass", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 is a one-forward recipe and forbids "
+                        "guidance.separate_world_backbone_pass"
+                    )
+                if bool(guidance.get("detach_action_query_in_world_pass", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 uses one causal ACT->FUTURE pass and forbids "
+                        "the obsolete guidance.detach_action_query_in_world_pass"
+                    )
+                if str(framework.get("qwenvl", {}).get("attn_implementation", "")).lower() != "flash_attention_2":
+                    problems.append(
+                        "shared_qwen_queries_v5 requires "
+                        "framework.qwenvl.attn_implementation=flash_attention_2"
+                    )
+                if not bool(framework.get("qwenvl", {}).get("require_attn_implementation", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 requires "
+                        "framework.qwenvl.require_attn_implementation=true"
+                    )
+                if not bool(guidance.get("freeze_world_to_action_in_warmup", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 predictor_warmup requires "
+                        "freeze_world_to_action_in_warmup=true"
+                    )
+                clipping_cfg = trainer.get("independent_gradient_clipping", {})
+                if hasattr(clipping_cfg, "get") and bool(clipping_cfg.get("enabled", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 shares Qwen between action/world losses and therefore "
+                        "forbids independent_gradient_clipping; use one positive global gradient_clipping"
+                    )
+                if float(trainer.get("gradient_clipping", 0.0) or 0.0) <= 0.0:
+                    problems.append(
+                        "shared_qwen_queries_v5 requires positive trainer.gradient_clipping"
+                    )
+                lr_cfg = trainer.get("learning_rate", {})
+                for name in (
+                    "qwen_vl_interface",
+                    "action_model",
+                    "action_queries",
+                    "wam_visual_head",
+                    "wam_state_ctx",
+                    "future_dino_queries",
+                ):
+                    if float(lr_cfg.get(name, 0.0)) <= 0.0:
+                        problems.append(
+                            f"shared_qwen_queries_v5 warmup requires positive learning_rate.{name}"
+                        )
             elif not detach_action_backbone:
                 # Preserve construction of already-trained strict Stage-1
                 # checkpoints whose saved config predates policy_first_v2.
@@ -588,6 +703,71 @@ class Qwen_GR00T(baseframework):
                             f"isolated_queries_v4 gate_ft requires learning_rate.{name}="
                             f"{expected:g}, got {actual:g}"
                         )
+            if recipe == "shared_qwen_queries_v5":
+                if bool(guidance.get("detach_action_backbone", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 gate_ft requires "
+                        "guidance.detach_action_backbone=false"
+                    )
+                if bool(guidance.get("detach_world_backbone", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 gate_ft must preserve its Stage-1 "
+                        "detach_world_backbone=false provenance"
+                    )
+                if not bool(guidance.get("pretraining_aligned_queries", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 requires guidance.pretraining_aligned_queries=true"
+                    )
+                if bool(guidance.get("baseline_action_context", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 gate_ft requires baseline_action_context=false"
+                    )
+                if not bool(guidance.get("future_query_through_qwen", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 requires guidance.future_query_through_qwen=true"
+                    )
+                if bool(guidance.get("separate_world_backbone_pass", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 is a one-forward recipe and forbids "
+                        "guidance.separate_world_backbone_pass"
+                    )
+                if bool(guidance.get("detach_action_query_in_world_pass", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 uses one causal ACT->FUTURE pass and forbids "
+                        "the obsolete guidance.detach_action_query_in_world_pass"
+                    )
+                if str(framework.get("qwenvl", {}).get("attn_implementation", "")).lower() != "flash_attention_2":
+                    problems.append(
+                        "shared_qwen_queries_v5 requires "
+                        "framework.qwenvl.attn_implementation=flash_attention_2"
+                    )
+                if not bool(framework.get("qwenvl", {}).get("require_attn_implementation", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 requires "
+                        "framework.qwenvl.require_attn_implementation=true"
+                    )
+                if bool(guidance.get("freeze_world_to_action_in_warmup", False)):
+                    problems.append(
+                        "shared_qwen_queries_v5 gate_ft must unfreeze the world-to-action path"
+                    )
+                if int(trainer.get("num_warmup_steps", 0)) != 500:
+                    problems.append(
+                        "shared_qwen_queries_v5 gate_ft requires num_warmup_steps=500"
+                    )
+                lr_cfg = trainer.get("learning_rate", {})
+                required_lrs = {
+                    "world_gates": 1.0e-4,
+                    "world_to_action_adapters": 1.0e-4,
+                    "action_model": 1.0e-5,
+                    "action_queries": 1.0e-5,
+                }
+                for name, expected in required_lrs.items():
+                    actual = float(lr_cfg.get(name, 0.0))
+                    if actual != expected:
+                        problems.append(
+                            f"shared_qwen_queries_v5 gate_ft requires learning_rate.{name}="
+                            f"{expected:g}, got {actual:g}"
+                        )
             frozen = {
                 item.strip()
                 for item in str(trainer.get("freeze_modules", "")).split(",")
@@ -599,7 +779,7 @@ class Qwen_GR00T(baseframework):
                 "wam_state_ctx",
                 "wam_act_ctx",
             }
-            if recipe == "isolated_queries_v4":
+            if recipe in {"isolated_queries_v4", "shared_qwen_queries_v5"}:
                 required_frozen.add("future_dino_queries")
             if not required_frozen.issubset(frozen):
                 problems.append(
@@ -1256,6 +1436,15 @@ class Qwen_GR00T(baseframework):
             # world loss can train it without touching Qwen. This keeps ACT
             # unable to see FUTURE while making both query families owned.
             "pretraining_aligned_queries": False,
+            # v5 alignment: one standard causal Qwen forward with ACT queries
+            # before FUTURE queries. ACT cannot read FUTURE; FUTURE reads the
+            # ACT latent intent. Both query banks replace placeholder inputs.
+            "future_query_through_qwen": False,
+            # Deprecated experimental two-pass switches. They remain in the
+            # defaults only so saved development configs can still be loaded;
+            # the v5 recipe below explicitly forbids them.
+            "separate_world_backbone_pass": False,
+            "detach_action_query_in_world_pass": False,
             # Stage-1 strict isolation freezes every parameter that exists
             # solely for world->action injection (adapter, cross-attention,
             # normalization and gates).  Stage 2 reconstructs the same model
@@ -1306,6 +1495,7 @@ class Qwen_GR00T(baseframework):
         self.wam_guidance_enabled = bool(g["enabled"])
         self.wam_state_ctx = None
         self.wam_pretraining_aligned_queries = False
+        self.wam_future_query_through_qwen = False
         wt = str(wam_cfg.get("world_target", "")).lower() if hasattr(wam_cfg, "get") else ""
         if wt in ("absolute", "delta"):
             self.wam_fdm_delta = wt == "delta"
@@ -1323,17 +1513,25 @@ class Qwen_GR00T(baseframework):
         self.wam_pretraining_aligned_queries = bool(
             g.get("pretraining_aligned_queries", False)
         )
+        self.wam_future_query_through_qwen = bool(
+            g.get("future_query_through_qwen", False)
+        )
+        if self.wam_future_query_through_qwen and not self.wam_pretraining_aligned_queries:
+            raise ValueError(
+                "guidance.future_query_through_qwen requires pretraining_aligned_queries=true"
+            )
         if self.wam_pretraining_aligned_queries:
             # Reuse the exact module classes and public parameter names from
-            # four-task pretraining. WAM injects ACT at its causal Qwen query
-            # positions and applies FUTURE to detached causal Qwen states, so
-            # old WAM checkpoints are untouched unless explicitly enabled.
+            # four-task pretraining. v4 injects ACT before Qwen and applies
+            # FUTURE after Qwen; v5 injects both before one causal Qwen forward.
+            # Old checkpoints retain the v4 path unless the flag is explicit.
             if not hasattr(self, "action_queries"):
                 self.action_queries = ActionQueryTokenBank(
                     action_horizon=self.wam_n_act,
                     hidden_size=d_model,
                 )
             if not hasattr(self, "future_dino_queries"):
+                visual_cfg = self.config.framework.visual_model
                 self.future_dino_queries = FutureDinoQueryTokenBank(
                     max_queries=max(
                         self.wam_n_flow,
@@ -1404,7 +1602,8 @@ class Qwen_GR00T(baseframework):
         logger.info(
             "WAM guidance ON: mode=%s signal=%s prompt=%s exclude_post_query_context=%s "
             "bridge=%s detach_world=%s detach_action_backbone=%s detach_world_backbone=%s "
-            "baseline_action_context=%s pretraining_queries=%s world_to_action=%s "
+            "baseline_action_context=%s pretraining_queries=%s future_query_through_qwen=%s "
+            "separate_world_pass=%s detach_act_query_in_world=%s world_to_action=%s "
             "detached_prediction_eval=%s "
             "action_context=%s world_context=%s world_state=%s "
             "(adapter=%s qformer=%s fusion=%s pooler=%s)",
@@ -1418,6 +1617,9 @@ class Qwen_GR00T(baseframework):
             bool(g["detach_world_backbone"]),
             bool(g["baseline_action_context"]),
             self.wam_pretraining_aligned_queries,
+            self.wam_future_query_through_qwen,
+            bool(g["separate_world_backbone_pass"]),
+            bool(g["detach_action_query_in_world_pass"]),
             world_to_action_enabled,
             bool(g["detached_prediction_eval_mode"]),
             bool(g["include_context_in_action_memory"]),
@@ -1471,6 +1673,11 @@ class Qwen_GR00T(baseframework):
         bank = getattr(self, "future_dino_queries", None)
         if not self.wam_pretraining_aligned_queries or bank is None:
             return h_future
+        if bool(getattr(self, "wam_future_query_through_qwen", False)):
+            # v5 already substituted FUTURE input embeddings before Qwen. A
+            # second post-Qwen addition would train/infer under different query
+            # semantics and count the same parameter twice.
+            return h_future
         query_dtype = self._jointflow_module_dtype(bank, fallback=h_future.dtype)
         query = bank(
             h_future.shape[0],
@@ -1489,15 +1696,18 @@ class Qwen_GR00T(baseframework):
         self,
         act_mask: torch.Tensor,
         future_mask: torch.Tensor,
+        *,
+        detach_action_query: bool = False,
     ):
-        """Replace ACT placeholder embeddings with the pretraining query bank.
+        """Replace selected placeholders with pretraining query-bank embeddings.
 
         Qwen still receives ``input_ids`` (required for Qwen-VL image-token
-        scattering), while a temporary embedding hook substitutes ACT
-        positions. FUTURE placeholder states remain causal context carriers;
-        their independent bank is added only after detach. In Stage 2,
-        gradients can therefore reach ``action_queries`` through a frozen
-        Qwen without making any Qwen weight trainable.
+        scattering), while a temporary embedding hook substitutes ACT and,
+        for v5, FUTURE positions. Standard causal attention makes the later
+        FUTURE states depend on ACT intent, but not vice versa. The detach
+        argument remains solely for loading the abandoned experimental
+        two-pass path. In Stage 2, gradients still reach ACT queries through
+        frozen Qwen.
         """
 
         if not self.wam_pretraining_aligned_queries:
@@ -1510,6 +1720,20 @@ class Qwen_GR00T(baseframework):
             )
         batch_size = int(act_mask.shape[0])
         action_query = action_bank(batch_size, device=act_mask.device)
+        if detach_action_query:
+            action_query = action_query.detach()
+        future_query = None
+        if bool(getattr(self, "wam_future_query_through_qwen", False)):
+            future_bank = getattr(self, "future_dino_queries", None)
+            if future_bank is None:
+                raise RuntimeError(
+                    "future_query_through_qwen requires future_dino_queries"
+                )
+            future_query = future_bank(
+                batch_size,
+                n_query=int(future_mask.sum(dim=1)[0].item()),
+                device=future_mask.device,
+            )
         embedding = self.qwen_vl_interface.model.get_input_embeddings()
         matched_calls = 0
 
@@ -1529,6 +1753,23 @@ class Qwen_GR00T(baseframework):
                 device=output.device,
                 dtype=output.dtype,
             ).reshape(-1, output.shape[-1])
+            if future_query is not None:
+                if int(output.shape[-1]) != int(future_query.shape[-1]):
+                    raise ValueError(
+                        "Qwen embedding/FUTURE-query hidden-size mismatch: "
+                        f"embedding={tuple(output.shape)}, FUTURE={tuple(future_query.shape)}"
+                    )
+                expected_future = int(future_query.shape[0] * future_query.shape[1])
+                actual_future = int(future_mask.sum().item())
+                if actual_future != expected_future:
+                    raise ValueError(
+                        "FUTURE query mask/query-bank count mismatch: "
+                        f"mask={actual_future}, bank={expected_future}"
+                    )
+                replaced[future_mask.to(device=output.device)] = future_query.to(
+                    device=output.device,
+                    dtype=output.dtype,
+                ).reshape(-1, output.shape[-1])
             matched_calls += 1
             return replaced
 
@@ -1537,9 +1778,11 @@ class Qwen_GR00T(baseframework):
             yield
         finally:
             handle.remove()
-        if matched_calls == 0:
+        if matched_calls != 1:
             raise RuntimeError(
-                "Qwen input embedding hook never observed the dual-query token sequence"
+                "Expected exactly one Qwen input-embedding call for causal ACT/FUTURE "
+                f"replacement, observed {matched_calls}. Refusing to train with an inactive "
+                "or multiply-applied query bank."
             )
 
     #######
@@ -2060,7 +2303,7 @@ class Qwen_GR00T(baseframework):
         expected_act: int,
         expected_future: int,
     ) -> None:
-        """Validate the token layout that gives ACT -> FUTURE causal direction."""
+        """Validate the causal latent-intent order: ACT before FUTURE."""
 
         if act_mask.ndim != 2 or future_mask.shape != act_mask.shape:
             raise ValueError(
@@ -2085,7 +2328,7 @@ class Qwen_GR00T(baseframework):
         if not bool((last_act < first_future).all()):
             raise ValueError(
                 "Dual-query prompt must place every ACT placeholder before every FUTURE placeholder "
-                "to preserve ACT->FUTURE causal conditioning without a direct FUTURE->ACT path"
+                "so causal attention implements ACT->FUTURE (intent->outcome)"
             )
 
     @staticmethod
@@ -2099,17 +2342,101 @@ class Qwen_GR00T(baseframework):
         query_mask = act_mask | future_mask
         return query_mask.to(dtype=torch.int64).cumsum(dim=1) > 0
 
-    def _build_wam_guided_inputs(self, examples: List[dict], task: str = "policy"):
-        """Build one causal prompt containing action and future query groups.
+    @staticmethod
+    def _wam_append_causal_query_suffix(
+        inputs,
+        *,
+        act_token_id: int,
+        future_token_id: int,
+        n_act: int,
+        n_future: int,
+    ):
+        """Physically append ``ACT`` then ``FUTURE`` after the complete chat context.
 
-        Every task receives both groups. Their native token order lets future
-        queries read action intent while action queries cannot read future
-        queries; the explicit gated path is the only future-to-action return.
-        The method also returns padding and raw-context exclusion masks.
+        Building placeholders inside the user-message text leaves chat-template
+        terminators after FUTURE.  That is causally harmless, but it weakens the
+        sequence ABI and makes it easier for a later memory builder to leak a
+        post-query token.  v5 therefore lets the processor finish all visual,
+        language, and chat framing first, then appends the two learned-query
+        blocks as the literal final suffix.  Only a standard 2D padding mask is
+        produced, which keeps the native FlashAttention-2 path available.
+        """
+
+        input_ids = inputs.get("input_ids", None)
+        if not torch.is_tensor(input_ids) or input_ids.ndim != 2:
+            raise ValueError(
+                "Causal query suffix requires processor input_ids shaped [B,T], got "
+                f"{None if input_ids is None else tuple(input_ids.shape)}"
+            )
+        if int(n_act) <= 0 or int(n_future) <= 0:
+            raise ValueError(
+                f"Causal query counts must be positive, got ACT={n_act}, FUTURE={n_future}"
+            )
+        if bool(
+            ((input_ids == int(act_token_id)) | (input_ids == int(future_token_id))).any()
+        ):
+            raise ValueError(
+                "Reserved ACT/FUTURE placeholder token appeared inside the chat context; "
+                "queries must be introduced only by the causal suffix builder"
+            )
+
+        batch, context_len = input_ids.shape
+        suffix = torch.cat(
+            [
+                input_ids.new_full((batch, int(n_act)), int(act_token_id)),
+                input_ids.new_full((batch, int(n_future)), int(future_token_id)),
+            ],
+            dim=1,
+        )
+        inputs["input_ids"] = torch.cat([input_ids, suffix], dim=1)
+
+        attention = inputs.get("attention_mask", None)
+        if attention is None:
+            attention = torch.ones_like(input_ids, dtype=torch.long)
+        if not torch.is_tensor(attention) or tuple(attention.shape) != tuple(input_ids.shape):
+            raise ValueError(
+                "FlashAttention-2 causal query suffix requires a 2D padding mask aligned "
+                f"with input_ids; ids={tuple(input_ids.shape)}, mask="
+                f"{None if attention is None else tuple(attention.shape)}"
+            )
+        suffix_valid = torch.ones(
+            (batch, int(n_act) + int(n_future)),
+            dtype=attention.dtype,
+            device=attention.device,
+        )
+        attention_2d = torch.cat([attention, suffix_valid], dim=1)
+        inputs["attention_mask"] = attention_2d
+
+        # Let Qwen recompute multimodal RoPE positions for the longer sequence.
+        # Qwen processors normally omit these keys, but stale precomputed values
+        # would otherwise retain the pre-suffix length.
+        inputs.pop("position_ids", None)
+        inputs.pop("cache_position", None)
+
+        total_len = context_len + int(n_act) + int(n_future)
+        act_mask = torch.zeros((batch, total_len), dtype=torch.bool, device=input_ids.device)
+        future_mask = torch.zeros_like(act_mask)
+        act_mask[:, context_len : context_len + int(n_act)] = True
+        future_mask[:, context_len + int(n_act) :] = True
+        return act_mask, future_mask, attention_2d.to(dtype=torch.bool)
+
+    def _build_wam_guided_inputs(self, examples: List[dict], task: str = "policy"):
+        """Build ``context -> ACT -> FUTURE`` for one native causal Qwen pass.
+
+        ACT states cannot read the later FUTURE block. FUTURE states read the
+        context and the ACT latent policy intent. The processor's 2D padding
+        mask is extended only with valid suffix positions, so Qwen stays on
+        its native FlashAttention-2 path.
         """
         task = str(task)
         is_action = task in ("policy", "idm", "joint_e2e", "joint_detached")
         include_future = task == "idm"
+        recipe = str(
+            self.config.trainer.get("wam_two_stage_recipe", "legacy_v1")
+            if getattr(self.config, "trainer", None) is not None
+            else "legacy_v1"
+        ).lower()
+        physical_causal_suffix = recipe == "shared_qwen_queries_v5"
         act_str = " ".join([self.wam_ph] * self.wam_n_act)
         fut_str = " ".join([self.wam_future_ph] * self.wam_n_flow)
         ph_str = f"{act_str} {fut_str}"
@@ -2124,7 +2451,8 @@ class Qwen_GR00T(baseframework):
             if include_future and future_main is not None:
                 imgs.append(future_main)
             content = [{"type": "image", "image": im} for im in imgs]
-            content.append({"type": "text", "text": f"{text}\n{ph_str}"})
+            prompt_text = text if physical_causal_suffix else f"{text}\n{ph_str}"
+            content.append({"type": "text", "text": prompt_text})
             messages.append([{"role": "user", "content": content}])
         old = proc.tokenizer.padding_side
         proc.tokenizer.padding_side = "left"
@@ -2140,36 +2468,60 @@ class Qwen_GR00T(baseframework):
         finally:
             proc.tokenizer.padding_side = old
         inputs = inputs.to(self.qwen_vl_interface.model.device)
-        act_mask = inputs["input_ids"] == self.wam_ph_id
-        fut_mask = inputs["input_ids"] == self.wam_future_ph_id
+        if physical_causal_suffix:
+            act_mask, fut_mask, attention_2d = self._wam_append_causal_query_suffix(
+                inputs,
+                act_token_id=self.wam_ph_id,
+                future_token_id=self.wam_future_ph_id,
+                n_act=self.wam_n_act,
+                n_future=self.wam_n_flow,
+            )
+        else:
+            # Preserve the exact prompt ABI of existing v1-v4 checkpoints.
+            act_mask = inputs["input_ids"] == self.wam_ph_id
+            fut_mask = inputs["input_ids"] == self.wam_future_ph_id
+            attention_2d = inputs.get("attention_mask", None)
+            if attention_2d is None:
+                attention_2d = torch.ones_like(inputs["input_ids"], dtype=torch.bool)
+            else:
+                attention_2d = attention_2d.to(dtype=torch.bool)
         self._wam_validate_dual_query_layout(
             act_mask,
             fut_mask,
             expected_act=self.wam_n_act,
             expected_future=self.wam_n_flow,
         )
-        attention_2d = inputs.get("attention_mask", None)
-        if attention_2d is None:
-            attention_2d = torch.ones_like(inputs["input_ids"], dtype=torch.bool)
-        else:
-            attention_2d = attention_2d.to(dtype=torch.bool)
+        if attention_2d.ndim != 2:
+            raise ValueError(
+                "WAM causal Qwen path requires a standard 2D padding mask for "
+                f"FlashAttention-2, got {tuple(attention_2d.shape)}"
+            )
 
         if bool(self.wam_guidance.get("exclude_post_query_context", False)):
-            # Tokens emitted by add_generation_prompt occur after both query
-            # groups and can attend to both.  They must not re-enter either the
-            # action memory or the gated world memory as an implicit bridge.
+            # For v5 this is exactly the two suffix blocks. For legacy prompts
+            # it also removes any chat-template tokens emitted after queries.
             context_exclusion_mask = self._wam_query_suffix_exclusion_mask(act_mask, fut_mask)
         else:
             # Historical behavior for old guided checkpoints/config snapshots.
             context_exclusion_mask = act_mask | fut_mask
         return inputs, act_mask, fut_mask, attention_2d, context_exclusion_mask
 
-    def _wam_guided_backbone(self, examples: List[dict], task: str = "policy"):
+    def _wam_guided_backbone(
+        self,
+        examples: List[dict],
+        task: str = "policy",
+        *,
+        detach_action_query: bool = False,
+    ):
         """Run Qwen and return both query groups plus raw-context validity/exclusion masks."""
         inputs, act_mask, fut_mask, attention_2d, context_exclusion_mask = self._build_wam_guided_inputs(
             examples, task=task
         )
-        with self._wam_query_embedding_override(act_mask, fut_mask):
+        with self._wam_query_embedding_override(
+            act_mask,
+            fut_mask,
+            detach_action_query=detach_action_query,
+        ):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 hidden = self._wam_qwen_hidden(inputs)
         bsz = len(examples)
@@ -2520,6 +2872,54 @@ class Qwen_GR00T(baseframework):
             world_global = self.world_pooler(world_tokens.to(pd)).to(h_act.dtype)
         return mem, mem_mask, world_embs, world_mask, world_global
 
+    def _wam_action_loss_from_guided_context(
+        self,
+        examples: List[dict],
+        *,
+        mode: str,
+        h_act: torch.Tensor,
+        h_future: torch.Tensor,
+        hidden: torch.Tensor,
+        attn: torch.Tensor | None,
+        context_exclusion_mask: torch.Tensor,
+        world_tokens: torch.Tensor | None,
+        detach_action_backbone: bool,
+    ) -> torch.Tensor:
+        """Compute the action objective from one dual-query Qwen pass.
+
+        Keeping this in one helper lets v5 evaluate the complete action graph
+        before entering the forked auxiliary world RNG domain. It also keeps
+        the legacy one-pass branch byte-for-byte on the same assembly/loss ABI.
+        """
+
+        action_h_act = h_act.detach() if detach_action_backbone else h_act
+        action_h_future = h_future.detach() if detach_action_backbone else h_future
+        action_hidden = hidden.detach() if detach_action_backbone else hidden
+        mem, mem_mask, world_embs, world_mask, world_global = self._assemble_guided_inputs(
+            mode,
+            action_h_act,
+            action_h_future,
+            action_hidden,
+            attn,
+            context_exclusion_mask,
+            world_tokens,
+        )
+        actions = self._stack_jointflow_field(examples, "action", required=True)
+        actions = actions[:, -self.action_horizon :, : self.action_dim].float()
+        state, action_is_pad = self._wam_action_state_and_mask(examples)
+        head_dtype = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
+        return self._wam_action_loss(
+            mem.to(head_dtype),
+            actions.to(head_dtype),
+            state.to(head_dtype) if state is not None else None,
+            mem_mask,
+            action_is_pad,
+            world_embs=(world_embs.to(head_dtype) if world_embs is not None else None),
+            world_attention_mask=world_mask,
+            world_global=(world_global.to(head_dtype) if world_global is not None else None),
+            guidance_mode=mode,
+        )
+
     def _wam_uses_native_action_context(self) -> bool:
         """Whether policy conditioning must be byte-for-byte baseline shaped."""
 
@@ -2666,6 +3066,7 @@ class Qwen_GR00T(baseframework):
             "joint_detached",
         }
         native_hidden, native_attn, native_joint_action_loss = None, None, None
+        query_joint_action_loss = None
         if use_native_action:
             native_hidden, native_attn = self._native_qwen_action_context(
                 examples,
@@ -2700,9 +3101,8 @@ class Qwen_GR00T(baseframework):
                     examples,
                     task=task,
                 )
-            # The learned ACT bank is action-owned.  FUTURE queries are added
-            # later inside _wam_visual_condition, after the Qwen tensor has
-            # been detached for the strict world-loss branch.
+            # The learned ACT bank is action-owned. v4 adds FUTURE after Qwen;
+            # v5 already injected it at the Qwen input embedding boundary.
             action_query_condition = getattr(
                 self,
                 "_wam_action_query_condition",
@@ -2712,9 +3112,6 @@ class Qwen_GR00T(baseframework):
                 h_act = action_query_condition(h_act)
 
             if task in ("joint_e2e", "joint_detached"):
-                # The baseline-preserving recipe intentionally uses two Qwen
-                # passes: native policy context plus a detached dual-query
-                # future condition.  Legacy recipes retain their one-pass ABI.
                 bridge = str(self.wam_guidance["bridge_source"]).lower()
                 detach_world = bool(self.wam_guidance["detach_world"])
                 expected_detach = task == "joint_detached"
@@ -2725,21 +3122,6 @@ class Qwen_GR00T(baseframework):
                         f"bridge_source={bridge!r}, detach_world={detach_world!r}."
                     )
 
-                z_gt = self._wam_world_target(examples)
-                world_cond = self._wam_world_training_condition(
-                    h_future,
-                    examples,
-                    task=task,
-                )
-                vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=h_future.dtype)
-                raw_world_loss, world_details = self._wam_visual_loss(
-                    world_cond.to(vh),
-                    z_gt,
-                    examples,
-                    return_details=True,
-                )
-                world_loss = self.wam_dino_loss_weight * raw_world_loss
-
                 predictor_grad_scale = (
                     0.0
                     if detach_world
@@ -2749,6 +3131,87 @@ class Qwen_GR00T(baseframework):
                 detach_action_backbone = bool(
                     self.wam_guidance.get("detach_action_backbone", False)
                 )
+                separate_world_pass = bool(
+                    self.wam_guidance.get("separate_world_backbone_pass", False)
+                )
+                causal_shared_query_pass = bool(
+                    self.wam_guidance.get("future_query_through_qwen", False)
+                ) and not separate_world_pass
+                if separate_world_pass:
+                    if use_native_action:
+                        raise RuntimeError(
+                            "separate_world_backbone_pass requires the explicit ACT-query action path"
+                        )
+                    if not action_world_bypass:
+                        raise RuntimeError(
+                            "separate_world_backbone_pass is a Stage-1 warmup contract and requires "
+                            "action_world_bypass=true"
+                        )
+                if causal_shared_query_pass and not action_world_bypass:
+                    raise RuntimeError(
+                        "Joint causal shared-query warmup requires action_world_bypass=true; gate FT uses "
+                        "the policy task and enables predicted-world injection there"
+                    )
+                if separate_world_pass or causal_shared_query_pass:
+                    # Finish stochastic action diffusion first. v5 reuses the
+                    # same causal Qwen hidden states for both losses: ACT is
+                    # upstream of FUTURE, while Action DiT is called only here.
+                    # The fork below isolates world-head flow noise and never
+                    # reruns Qwen.
+                    query_joint_action_loss = self._wam_action_loss_from_guided_context(
+                        examples,
+                        mode=mode,
+                        h_act=h_act,
+                        h_future=h_future,
+                        hidden=hidden,
+                        attn=attn,
+                        context_exclusion_mask=context_exclusion_mask,
+                        world_tokens=None,
+                        detach_action_backbone=detach_action_backbone,
+                    )
+
+                world_h_future = h_future
+                world_rng = (
+                    self._wam_auxiliary_rng_context(h_future)
+                    if separate_world_pass or causal_shared_query_pass
+                    else nullcontext()
+                )
+                with world_rng:
+                    if separate_world_pass:
+                        (
+                            _world_h_act,
+                            world_h_future,
+                            _world_hidden,
+                            _world_attn,
+                            _world_excluded,
+                        ) = self._wam_guided_backbone(
+                            examples,
+                            task=task,
+                            detach_action_query=bool(
+                                self.wam_guidance.get(
+                                    "detach_action_query_in_world_pass",
+                                    False,
+                                )
+                            ),
+                        )
+                    z_gt = self._wam_world_target(examples)
+                    world_cond = self._wam_world_training_condition(
+                        world_h_future,
+                        examples,
+                        task=task,
+                    )
+                    vh = self._jointflow_module_dtype(
+                        self.wam_visual_head,
+                        fallback=world_h_future.dtype,
+                    )
+                    raw_world_loss, world_details = self._wam_visual_loss(
+                        world_cond.to(vh),
+                        z_gt,
+                        examples,
+                        return_details=True,
+                    )
+                    world_loss = self.wam_dino_loss_weight * raw_world_loss
+
                 signal_grad_scale = 1.0 if detach_world else predictor_grad_scale
                 world_tokens = None
                 if not action_world_bypass:
@@ -2768,35 +3231,21 @@ class Qwen_GR00T(baseframework):
         if task in ("joint_e2e", "joint_detached"):
             if use_native_action:
                 action_loss = native_joint_action_loss
+            elif query_joint_action_loss is not None:
+                action_loss = query_joint_action_loss
             else:
                 # Historical guided action memory remains unchanged for every
                 # legacy checkpoint/config that does not opt into v3.
-                action_h_act = h_act.detach() if detach_action_backbone else h_act
-                action_h_future = h_future.detach() if detach_action_backbone else h_future
-                action_hidden = hidden.detach() if detach_action_backbone else hidden
-                mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
-                    mode,
-                    action_h_act,
-                    action_h_future,
-                    action_hidden,
-                    attn,
-                    context_exclusion_mask,
-                    world_tokens,
-                )
-                actions = self._stack_jointflow_field(examples, "action", required=True)
-                actions = actions[:, -self.action_horizon :, : self.action_dim].float()
-                state, action_is_pad = self._wam_action_state_and_mask(examples)
-                hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
-                action_loss = self._wam_action_loss(
-                    mem.to(hd),
-                    actions.to(hd),
-                    state.to(hd) if state is not None else None,
-                    mem_mask,
-                    action_is_pad,
-                    world_embs=(w_embs.to(hd) if w_embs is not None else None),
-                    world_attention_mask=w_mask,
-                    world_global=(w_global.to(hd) if w_global is not None else None),
-                    guidance_mode=mode,
+                action_loss = self._wam_action_loss_from_guided_context(
+                    examples,
+                    mode=mode,
+                    h_act=h_act,
+                    h_future=h_future,
+                    hidden=hidden,
+                    attn=attn,
+                    context_exclusion_mask=context_exclusion_mask,
+                    world_tokens=world_tokens,
+                    detach_action_backbone=detach_action_backbone,
                 )
             action_loss = (
                 action_loss

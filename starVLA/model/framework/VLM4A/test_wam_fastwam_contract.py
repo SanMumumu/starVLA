@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 from PIL import Image
@@ -394,6 +395,7 @@ def test_joint_detached_action_gradient_cannot_reach_world_predictor() -> None:
 
 class _JointE2EForwardHarness:
     _wam_action_world_grad_scale = Qwen_GR00T._wam_action_world_grad_scale
+    _wam_action_loss_from_guided_context = Qwen_GR00T._wam_action_loss_from_guided_context
     _wam_world_training_condition = Qwen_GR00T._wam_world_training_condition
     _wam_uses_native_action_context = Qwen_GR00T._wam_uses_native_action_context
     _wam_auxiliary_rng_context = staticmethod(Qwen_GR00T._wam_auxiliary_rng_context)
@@ -417,6 +419,7 @@ class _JointE2EForwardHarness:
         self.wam_visual_head = torch.nn.Linear(4, 4, bias=False)
         self.action_model = torch.nn.Linear(4, 4, bias=False)
         self.backbone_calls = 0
+        self.detach_action_query_calls = []
         self.world_signal_scales = []
         self.action_world_tokens = None
         self.expected_action_world_bypass = False
@@ -440,9 +443,10 @@ class _JointE2EForwardHarness:
         assert torch.equal(backbone_attention_mask, torch.ones(1, 4, dtype=torch.bool))
         return last_hidden.square().mean()
 
-    def _wam_guided_backbone(self, examples, task):
+    def _wam_guided_backbone(self, examples, task, *, detach_action_query=False):
         assert len(examples) == 1 and task == self.expected_task
         self.backbone_calls += 1
+        self.detach_action_query_calls.append(bool(detach_action_query))
         h_act = torch.ones(1, 2, 4, requires_grad=True)
         h_future = torch.full((1, 3, 4), 2.0, requires_grad=True)
         hidden = torch.ones(1, 5, 4, requires_grad=True)
@@ -563,6 +567,39 @@ def test_predictor_warmup_joint_batch_bypasses_world_only_for_action() -> None:
     torch.testing.assert_close(output["world_loss_raw"], torch.tensor(4.0))
     torch.testing.assert_close(output["action_world_bypassed"], torch.tensor(1.0))
     torch.testing.assert_close(output["action_backbone_detached"], torch.tensor(1.0))
+
+
+def test_shared_qwen_warmup_uses_one_causal_backbone_pass() -> None:
+    harness = _JointE2EForwardHarness()
+    harness.expected_task = "joint_detached"
+    harness.expected_action_world_bypass = True
+    harness.wam_guidance.update(
+        {
+            "detach_world": True,
+            "action_world_bypass": True,
+            "detach_action_backbone": False,
+            "detach_world_backbone": False,
+            "future_query_through_qwen": True,
+            "separate_world_backbone_pass": False,
+            "detach_action_query_in_world_pass": False,
+        }
+    )
+    output = Qwen_GR00T._wam_guided_forward(
+        harness,
+        examples=[{}],
+        task="joint_detached",
+        global_step=20,
+    )
+    assert harness.backbone_calls == 1
+    assert harness.detach_action_query_calls == [False]
+    assert harness.world_signal_scales == []
+    torch.testing.assert_close(output["world_loss_raw"], torch.tensor(4.0))
+    torch.testing.assert_close(output["action_world_grad_scale"], torch.tensor(0.0))
+    assert harness.action_world_tokens is None
+    assert set(key for key in output if key.endswith("_loss")) == {"action_loss", "world_loss"}
+    torch.testing.assert_close(output["action_world_bypassed"], torch.tensor(1.0))
+    torch.testing.assert_close(output["action_backbone_detached"], torch.tensor(0.0))
+    torch.testing.assert_close(output["world_backbone_detached"], torch.tensor(0.0))
 
 
 def test_policy_first_warmup_routes_qwen_gradient_only_from_action() -> None:
@@ -1231,6 +1268,44 @@ def test_joint_world_optimizer_contract_accepts_scheduler_warmup_zero_lr() -> No
     VLATrainer._validate_joint_world_optimizer_contract(trainer)
 
 
+def test_causal_shared_query_optimizer_contract_proves_action_dit_is_updated() -> None:
+    """v5 must fail before launch if even one live Action-DiT parameter is omitted."""
+
+    from starVLA.training.train_starvla import VLATrainer
+
+    class _Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.qwen_vl_interface = torch.nn.Linear(3, 3)
+            self.action_queries = torch.nn.Embedding(2, 3)
+            self.action_model = torch.nn.Linear(3, 3)
+            self.future_dino_queries = torch.nn.Embedding(2, 3)
+            self.wam_visual_head = torch.nn.Linear(3, 3)
+            self.wam_state_ctx = torch.nn.Linear(3, 3)
+
+    model = _Model()
+    trainer = VLATrainer.__new__(VLATrainer)
+    trainer._jointflow_tasks = ["joint_detached"]
+    trainer.model = model
+    trainer.config = OmegaConf.create(
+        {"trainer": {"wam_two_stage_recipe": "shared_qwen_queries_v5"}}
+    )
+    trainer.accelerator = SimpleNamespace(is_main_process=False)
+    trainer.optimizer = torch.optim.AdamW(
+        [{"params": list(model.parameters()), "lr": 1.0e-4, "name": "all_v5"}]
+    )
+    VLATrainer._validate_joint_world_optimizer_contract(trainer)
+
+    omitted = next(model.action_model.parameters())
+    trainer.optimizer.param_groups[0]["params"] = [
+        parameter
+        for parameter in trainer.optimizer.param_groups[0]["params"]
+        if parameter is not omitted
+    ]
+    with pytest.raises(RuntimeError, match="causal action-path parameters are absent"):
+        VLATrainer._validate_joint_world_optimizer_contract(trainer)
+
+
 def test_robotwin_two_stage_budget_is_80k_warmup_plus_20k_gate() -> None:
     config_dir = REPO_ROOT / "examples/Robotwin/train_files"
     job_dir = REPO_ROOT / "\u6267\u884c\u811a\u672c/RBT"
@@ -1537,6 +1612,259 @@ def test_pretraining_query_banks_have_disjoint_gradient_ownership() -> None:
         for parameter in harness.qwen_vl_interface.model.parameters()
     )
     assert harness.action_queries.action_query.weight.grad is not None
+
+
+def test_shared_qwen_query_two_stage_yaml_contract() -> None:
+    """v5 uses one native causal FlashAttention-2 pass in train/inference."""
+
+    config_dir = REPO_ROOT / "examples/Robotwin/train_files"
+    warmup = OmegaConf.load(config_dir / "robotwin_wam_sharedqwen_warmup_rand.yaml")
+    gate = OmegaConf.load(config_dir / "robotwin_wam_sharedqwen_gate_ft_rand.yaml")
+    baseline = OmegaConf.load(config_dir / "starvla_qwengroot_robotwin_fastwam.yaml")
+    for cfg in (warmup, gate):
+        merged = merge_framework_config(QwenGR00TDefaultConfig, cfg)
+        harness = SimpleNamespace(config=merged)
+        Qwen_GR00T._validate_joint_e2e_contract(harness)
+        Qwen_GR00T._validate_wam_two_stage_contract(harness)
+        guidance = cfg.framework.wam.guidance
+        assert str(cfg.trainer.wam_two_stage_recipe) == "shared_qwen_queries_v5"
+        assert bool(guidance.pretraining_aligned_queries)
+        assert bool(guidance.future_query_through_qwen)
+        assert "blockwise_query_attention" not in guidance
+        assert not bool(guidance.separate_world_backbone_pass)
+        assert not bool(guidance.detach_action_query_in_world_pass)
+        assert str(cfg.framework.qwenvl.attn_implementation) == "flash_attention_2"
+        assert bool(cfg.framework.qwenvl.require_attn_implementation)
+        assert not bool(guidance.detach_action_backbone)
+        assert not bool(guidance.detach_world_backbone)
+        assert not bool(guidance.baseline_action_context)
+        assert bool(cfg.datasets.vla_data.include_state)
+        assert not bool(cfg.framework.action_model.use_correlated_noise)
+        assert int(cfg.datasets.vla_data.per_device_batch_size) == 12
+        assert int(cfg.trainer.expected_global_batch_size) == 768
+        assert int(cfg.framework.action_model.n_action_query) == 32
+        assert int(cfg.framework.visual_model.n_flow_query) == 64
+
+    # The auxiliary world branch must not shrink or retune the policy.  Apart
+    # from the explicit ACT-query count, the complete Action-DiT definition is
+    # byte-for-byte equivalent to the 93%-class IID baseline recipe.
+    baseline_action = OmegaConf.to_container(
+        baseline.framework.action_model, resolve=True
+    )
+    warmup_action = OmegaConf.to_container(
+        warmup.framework.action_model, resolve=True
+    )
+    assert isinstance(warmup_action, dict)
+    warmup_action.pop("n_action_query")
+    assert warmup_action == baseline_action
+
+    baseline_qwen = OmegaConf.to_container(baseline.framework.qwenvl, resolve=True)
+    warmup_qwen = OmegaConf.to_container(warmup.framework.qwenvl, resolve=True)
+    assert isinstance(warmup_qwen, dict)
+    warmup_qwen.pop("require_attn_implementation")
+    assert warmup_qwen == baseline_qwen
+
+    def resolved(value):
+        return OmegaConf.to_container(value, resolve=True) if OmegaConf.is_config(value) else value
+
+    for key in (
+        "max_train_steps",
+        "num_warmup_steps",
+        "lr_scheduler_type",
+        "scheduler_specific_kwargs",
+        "gradient_clipping",
+        "gradient_accumulation_steps",
+        "optimizer",
+    ):
+        assert resolved(warmup.trainer.get(key)) == resolved(baseline.trainer.get(key))
+    assert float(warmup.trainer.learning_rate.qwen_vl_interface) == float(
+        baseline.trainer.learning_rate.qwen_vl_interface
+    )
+    assert float(warmup.trainer.learning_rate.action_model) == float(
+        baseline.trainer.learning_rate.action_model
+    )
+    for key in (
+        "data_root_dir",
+        "data_mix",
+        "fastwam_dataset_stats_path",
+        "fastwam_expected_fps",
+        "fastwam_val_fraction",
+        "fastwam_split_seed",
+        "fastwam_direct_frame_sampling",
+        "include_state",
+        "action_type",
+        "action_mode",
+        "sequential_step_sampling",
+        "balance_dataset_weights",
+        "balance_trajectory_weights",
+        "per_device_batch_size",
+        "obs_image_size",
+        "video_backend",
+        "num_workers",
+        "prefetch_factor",
+        "pin_memory",
+        "persistent_workers",
+    ):
+        assert resolved(warmup.datasets.vla_data.get(key)) == resolved(
+            baseline.datasets.vla_data.get(key)
+        )
+
+    assert bool(warmup.framework.wam.guidance.action_world_bypass)
+    assert bool(warmup.framework.wam.guidance.freeze_world_to_action_in_warmup)
+    assert float(warmup.framework.wam.dino_loss_weight) == 0.1
+    assert float(warmup.trainer.gradient_clipping) == 1.0
+    assert not bool(warmup.trainer.get("independent_gradient_clipping", {}).get("enabled", False))
+
+    assert not bool(gate.framework.wam.guidance.action_world_bypass)
+    assert not bool(gate.framework.wam.guidance.freeze_world_to_action_in_warmup)
+    frozen = {item.strip() for item in str(gate.trainer.freeze_modules).split(",")}
+    assert {
+        "qwen_vl_interface",
+        "wam_visual_head",
+        "wam_state_ctx",
+        "wam_act_ctx",
+        "future_dino_queries",
+    }.issubset(frozen)
+    assert "action_queries" not in frozen
+    assert float(gate.trainer.learning_rate.world_gates) == 1.0e-4
+    assert float(gate.trainer.learning_rate.world_to_action_adapters) == 1.0e-4
+    assert float(gate.trainer.learning_rate.action_model) == 1.0e-5
+    assert float(gate.trainer.learning_rate.action_queries) == 1.0e-5
+    assert int(gate.trainer.num_warmup_steps) == 500
+    assert str(gate.trainer.pretrained_checkpoint) == (
+        f"{warmup.run_root_dir}/{warmup.run_id}/final_model/pytorch_model.pt"
+    )
+
+    job_dir = REPO_ROOT / "执行脚本/RBT"
+    for name in (
+        "robotwin_wam_sharedqwen_warmup_rand.yaml",
+        "robotwin_wam_sharedqwen_gate_ft_rand.yaml",
+    ):
+        job = OmegaConf.load(job_dir / name)
+        assert int(job.REQUIRED.WORKER_MIN_NUM) == 8
+        assert int(job.REQUIRED.WORKER_MAX_NUM) == 8
+        assert int(job.REQUIRED.GPU_PER_WORKER) == 8
+        assert int(job.REQUIRED.environment.EXPECTED_NUM_MACHINES) == 8
+        assert int(job.REQUIRED.environment.GPUS_PER_NODE) == 8
+        raw_job = OmegaConf.to_container(job, resolve=False)
+        assert raw_job["REQUIRED"]["RUN_SCRIPTS"] == (
+            "EXPECTED_NUM_MACHINES=8 ${WORKING_PATH}/run_aidi_rbtw.sh "
+            f"examples/Robotwin/train_files/{name}"
+        )
+    runbook = (job_dir / "run.sh").read_text(encoding="utf-8")
+    assert "-f robotwin_wam_sharedqwen_warmup_rand.yaml" in runbook
+    assert "-f robotwin_wam_sharedqwen_gate_ft_rand.yaml" in runbook
+
+
+def test_causal_dual_query_layout_rejects_future_before_action() -> None:
+    act = torch.tensor([[False, True, True, False, False]])
+    future = torch.tensor([[False, False, False, True, True]])
+    Qwen_GR00T._wam_validate_dual_query_layout(act, future, 2, 2)
+    with pytest.raises(ValueError, match="ACT placeholder before every FUTURE"):
+        Qwen_GR00T._wam_validate_dual_query_layout(future, act, 2, 2)
+
+
+def test_v5_physically_appends_act_then_future_as_final_2d_mask_suffix() -> None:
+    inputs = {
+        "input_ids": torch.tensor([[0, 0, 11, 12], [0, 21, 22, 23]]),
+        "attention_mask": torch.tensor([[0, 0, 1, 1], [0, 1, 1, 1]]),
+        "position_ids": torch.arange(4).repeat(2, 1),
+    }
+    original_context = inputs["input_ids"].clone()
+    act, future, attention = Qwen_GR00T._wam_append_causal_query_suffix(
+        inputs,
+        act_token_id=90,
+        future_token_id=91,
+        n_act=3,
+        n_future=2,
+    )
+
+    assert inputs["input_ids"][:, :4].equal(original_context)
+    assert inputs["input_ids"][:, 4:7].equal(torch.full((2, 3), 90))
+    assert inputs["input_ids"][:, 7:].equal(torch.full((2, 2), 91))
+    assert act[:, 4:7].all() and not act[:, :4].any() and not act[:, 7:].any()
+    assert future[:, 7:].all() and not future[:, :7].any()
+    assert attention.ndim == 2 and tuple(attention.shape) == (2, 9)
+    assert attention[:, -5:].all()
+    assert "position_ids" not in inputs
+    Qwen_GR00T._wam_validate_dual_query_layout(act, future, 3, 2)
+
+
+def test_shared_qwen_one_causal_pass_has_required_gradient_routes() -> None:
+    """World learns ACT intent but cannot update Action DiT; action is symmetric."""
+
+    from starVLA.model.framework.VLM4A.jointflow.joint_modules import (
+        ActionQueryTokenBank,
+        FutureDinoQueryTokenBank,
+    )
+
+    class QueryHarness:
+        wam_pretraining_aligned_queries = True
+        wam_future_query_through_qwen = True
+        _wam_query_embedding_override = Qwen_GR00T._wam_query_embedding_override
+        _wam_future_query_condition = Qwen_GR00T._wam_future_query_condition
+
+        def __init__(self) -> None:
+            self.action_queries = ActionQueryTokenBank(3, 4)
+            self.future_dino_queries = FutureDinoQueryTokenBank(2, 4)
+
+            class TinyCausalQwen(torch.nn.Module):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.embedding = torch.nn.Embedding(12, 4)
+                    self.projection = torch.nn.Linear(4, 4, bias=False)
+
+                def get_input_embeddings(self):
+                    return self.embedding
+
+                def forward(self, input_ids):
+                    # Exact dependency structure of a causal stack for this
+                    # test: position i is a function only of positions <= i.
+                    return self.projection(self.embedding(input_ids)).cumsum(dim=1)
+
+            self.qwen_vl_interface = SimpleNamespace(model=TinyCausalQwen())
+            self.action_head = torch.nn.Linear(4, 4, bias=False)
+            self.world_head = torch.nn.Linear(4, 4, bias=False)
+
+    harness = QueryHarness()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7]])
+    act_mask = torch.tensor([[False, False, True, True, True, False, False]])
+    future_mask = torch.tensor([[False, False, False, False, False, True, True]])
+
+    with harness._wam_query_embedding_override(act_mask, future_mask):
+        hidden = harness.qwen_vl_interface.model(input_ids)
+    action_loss = harness.action_head(hidden[act_mask]).square().mean()
+    world_condition = harness._wam_future_query_condition(
+        hidden[future_mask].view(1, 2, 4)
+    )
+    world_loss = harness.world_head(world_condition).square().mean()
+    tracked = (
+        harness.qwen_vl_interface.model.projection.weight,
+        harness.action_queries.action_query.weight,
+        harness.future_dino_queries.future_dino_query.weight,
+        harness.action_head.weight,
+        harness.world_head.weight,
+    )
+    action_grads = torch.autograd.grad(
+        action_loss,
+        tracked,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    world_grads = torch.autograd.grad(world_loss, tracked, allow_unused=True)
+
+    assert action_grads[0] is not None and action_grads[0].abs().sum() > 0
+    assert action_grads[1] is not None and action_grads[1].abs().sum() > 0
+    assert action_grads[2] is None or float(action_grads[2].abs().sum()) == 0.0
+    assert action_grads[3] is not None and action_grads[3].abs().sum() > 0
+    assert action_grads[4] is None or float(action_grads[4].abs().sum()) == 0.0
+    assert world_grads[0] is not None and world_grads[0].abs().sum() > 0
+    # FUTURE reads the preceding ACT latent policy intent.
+    assert world_grads[1] is not None and world_grads[1].abs().sum() > 0
+    assert world_grads[2] is not None and world_grads[2].abs().sum() > 0
+    # The world objective never executes the action head/Action DiT.
+    assert world_grads[3] is None or float(world_grads[3].abs().sum()) == 0.0
+    assert world_grads[4] is not None and world_grads[4].abs().sum() > 0
 
 
 def test_ft_optimizer_groups_separate_gate_adapter_action_and_query_lrs() -> None:

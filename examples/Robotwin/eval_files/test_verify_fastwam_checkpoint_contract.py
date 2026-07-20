@@ -115,3 +115,65 @@ def test_verifier_distinguishes_gate_ft_from_warmup(tmp_path) -> None:
             replan_steps=24,
             expected_wam_phase="predictor_warmup",
         )
+
+
+@pytest.mark.parametrize(
+    ("config_name", "phase", "step"),
+    [
+        ("robotwin_wam_sharedqwen_warmup_rand.yaml", "predictor_warmup", 80000),
+        ("robotwin_wam_sharedqwen_gate_ft_rand.yaml", "gate_ft", 20000),
+    ],
+)
+def test_verifier_accepts_shared_qwen_two_stage_contract(
+    tmp_path,
+    config_name: str,
+    phase: str,
+    step: int,
+) -> None:
+    spec = importlib.util.spec_from_file_location(
+        f"_fastwam_shared_qwen_{phase}", VERIFIER_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+
+    run_dir = tmp_path / phase
+    checkpoint = run_dir / "checkpoints" / f"steps_{step}_pytorch_model.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+    config = (
+        REPO_ROOT / "examples/Robotwin/train_files" / config_name
+    ).read_text(encoding="utf-8")
+    (run_dir / "config.yaml").write_text(config, encoding="utf-8")
+    (run_dir / "config.full.yaml").write_text(config, encoding="utf-8")
+
+    zeros = [0.0] * 14
+    modality = {
+        "min": zeros,
+        "max": zeros,
+        "mean": zeros,
+        "std": [1.0] * 14,
+        "q01": zeros,
+        "q99": zeros,
+        "mask": [True] * 14,
+    }
+    (run_dir / "dataset_statistics.json").write_text(
+        json.dumps({"new_embodiment": {"state": modality, "action": modality}}),
+        encoding="utf-8",
+    )
+
+    summary = verifier.verify(
+        checkpoint,
+        replan_steps=24,
+        expected_wam_phase=phase,
+    )
+    assert summary["wam_two_stage_recipe"] == "shared_qwen_queries_v5"
+    assert summary["wam_future_query_through_qwen"] is True
+    assert summary["qwen_attn_implementation"] == "flash_attention_2"
+    assert summary["wam_query_attention_pattern"] == "causal_act_then_future"
+    assert summary["wam_single_qwen_forward"] is True
+    assert summary["wam_queries_are_final_suffix"] is True
+    assert summary["wam_action_query_count"] == 32
+    assert summary["wam_future_query_count"] == 64
+    assert summary["wam_separate_world_backbone_pass"] is False
+    assert summary["wam_detach_action_query_in_world_pass"] is False
