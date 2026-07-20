@@ -120,8 +120,81 @@ def build_param_lr_groups(model, cfg):
             print(f"⚠️ freeze module path does not exist: {freeze_path}")
             continue
 
+    named_parameters = list(model.named_parameters())
+
+    def is_world_to_action(name: str) -> bool:
+        if name.startswith(
+            ("world_adapter.", "world_fusion.", "world_qformer.", "world_pooler.")
+        ):
+            return True
+        return any(
+            marker in name
+            for marker in (
+                ".world_attn.",
+                ".world_norm.",
+                ".world_to_temb.",
+            )
+        ) or name.endswith(".world_gate")
+
+    def gradient_partition_for_names(names: list[str]) -> str:
+        partitions = {
+            "world"
+            if name.startswith(
+                (
+                    "wam_visual_head.",
+                    "wam_state_ctx.",
+                    "wam_act_ctx.",
+                    "future_dino_queries.",
+                )
+            )
+            else "action"
+            for name in names
+        }
+        return next(iter(partitions)) if len(partitions) == 1 else "mixed"
+
+    def append_group(group_name: str, lr, selected: list[tuple[str, torch.nn.Parameter]]) -> None:
+        selected = [
+            (name, parameter)
+            for name, parameter in selected
+            if parameter.requires_grad
+            and id(parameter) not in frozen_params
+            and id(parameter) not in used_params
+        ]
+        if not selected:
+            return
+        names = [name for name, _ in selected]
+        params = [parameter for _, parameter in selected]
+        param_groups.append(
+            {
+                "params": params,
+                "lr": lr,
+                "name": group_name,
+                # Used only by the opt-in strict branch clipper. AdamW and
+                # DeepSpeed preserve unknown per-group metadata.
+                "gradient_partition": gradient_partition_for_names(names),
+            }
+        )
+        used_params.update(id(parameter) for parameter in params)
+
+    # Synthetic selectors must claim nested Action-DiT parameters before the
+    # broad ``action_model`` module group, regardless of YAML key order.
+    synthetic_selectors = {
+        "world_gates": lambda name: name.endswith(".world_gate"),
+        "world_to_action_adapters": lambda name: is_world_to_action(name)
+        and not name.endswith(".world_gate"),
+    }
+    for group_name, selector in synthetic_selectors.items():
+        if group_name in lr_cfg:
+            append_group(
+                group_name,
+                lr_cfg[group_name],
+                [(name, parameter) for name, parameter in named_parameters if selector(name)],
+            )
+
     for module_name, lr in lr_cfg.items():
         if module_name == "base":
+            continue
+        if module_name in synthetic_selectors:
             continue
         # try to find the module under vla by module_name (support nested paths)
         module = model
@@ -132,21 +205,28 @@ def build_param_lr_groups(model, cfg):
             # Internally frozen teachers (for example Co-Flow's Qwen vision
             # encoder) must not occupy Adam/ZeRO optimizer state even when
             # they are frozen by the model rather than trainer.freeze_modules.
-            params = [p for p in module.parameters() if p.requires_grad and id(p) not in frozen_params]
-            if params:  # only add param group if there are trainable parameters
-                param_groups.append({"params": params, "lr": lr, "name": module_name})
-                used_params.update(id(p) for p in params)
+            module_param_ids = {id(parameter) for parameter in module.parameters()}
+            append_group(
+                module_name,
+                lr,
+                [
+                    (name, parameter)
+                    for name, parameter in named_parameters
+                    if id(parameter) in module_param_ids
+                ],
+            )
         except AttributeError:
-            ReferenceError(f"⚠️ module path `{module_name}` not found in vla")
+            logger.warning("⚠️ module path `%s` not found in model", module_name)
 
     # assign base learning rate to the remaining unused parameters (exclude frozen ones)
-    other_params = [
-        p
-        for p in model.parameters()
-        if p.requires_grad and id(p) not in used_params and id(p) not in frozen_params
+    other_named = [
+        (name, parameter)
+        for name, parameter in named_parameters
+        if parameter.requires_grad
+        and id(parameter) not in used_params
+        and id(parameter) not in frozen_params
     ]
-    if other_params:
-        param_groups.append({"params": other_params, "lr": base_lr, "name": "base"})
+    append_group("base", base_lr, other_named)
 
     return param_groups
 

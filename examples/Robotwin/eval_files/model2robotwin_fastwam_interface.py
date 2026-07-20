@@ -61,6 +61,28 @@ class FastWAMRobotWinModelClient(StandardModelClient):
                 f"server_meta={self.server_meta}"
             )
         self.expects_state = expects_state
+        actual_wam_recipe = self.server_meta.get("wam_two_stage_recipe")
+        if actual_wam_recipe == "isolated_queries_v4":
+            if self.server_meta.get("wam_pretraining_aligned_queries") is not True:
+                raise RuntimeError(
+                    "isolated_queries_v4 server did not activate its pretraining-aligned ACT query path"
+                )
+            if self.server_meta.get("wam_baseline_action_context") is not False:
+                raise RuntimeError(
+                    "isolated_queries_v4 must condition the policy with ACT queries, not the query-free "
+                    "native action context"
+                )
+            if self.server_meta.get("wam_action_query_count") != self.action_chunk_size:
+                raise RuntimeError(
+                    "isolated_queries_v4 ACT query count does not match the action chunk: "
+                    f"queries={self.server_meta.get('wam_action_query_count')}, "
+                    f"chunk={self.action_chunk_size}"
+                )
+            future_capacity = self.server_meta.get("wam_future_query_capacity")
+            if isinstance(future_capacity, bool) or not isinstance(future_capacity, int) or future_capacity <= 0:
+                raise RuntimeError(
+                    "isolated_queries_v4 server did not expose a valid FUTURE query bank capacity"
+                )
         self.wam_expected_phase = (
             None if wam_expected_phase is None else str(wam_expected_phase).lower()
         )

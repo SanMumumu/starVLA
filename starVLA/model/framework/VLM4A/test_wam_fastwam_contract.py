@@ -1398,6 +1398,314 @@ def test_robotwin_two_stage_budget_is_80k_warmup_plus_20k_gate() -> None:
     assert bool(clean.datasets.vla_data.include_state)
 
 
+def test_isolated_query_two_stage_yaml_contract() -> None:
+    """The new rand pair keeps both pretraining query families and strict ownership."""
+
+    config_dir = REPO_ROOT / "examples/Robotwin/train_files"
+    warmup = OmegaConf.load(config_dir / "robotwin_wam_isolated_warmup_rand.yaml")
+    gate = OmegaConf.load(config_dir / "robotwin_wam_isolated_gate_ft_rand.yaml")
+    for cfg in (warmup, gate):
+        merged = merge_framework_config(QwenGR00TDefaultConfig, cfg)
+        harness = SimpleNamespace(config=merged)
+        Qwen_GR00T._validate_joint_e2e_contract(harness)
+        Qwen_GR00T._validate_wam_two_stage_contract(harness)
+        assert str(cfg.trainer.wam_two_stage_recipe) == "isolated_queries_v4"
+        assert bool(cfg.framework.wam.guidance.pretraining_aligned_queries)
+        assert not bool(cfg.framework.wam.guidance.baseline_action_context)
+        assert bool(cfg.datasets.vla_data.include_state)
+        assert not bool(cfg.framework.action_model.use_correlated_noise)
+        assert int(cfg.datasets.vla_data.per_device_batch_size) == 12
+        assert int(cfg.trainer.expected_global_batch_size) == 768
+
+    assert bool(warmup.framework.wam.guidance.action_world_bypass)
+    assert bool(warmup.framework.wam.guidance.freeze_world_to_action_in_warmup)
+    assert bool(warmup.trainer.independent_gradient_clipping.enabled)
+    assert float(warmup.trainer.independent_gradient_clipping.action) == 1.0
+    assert float(warmup.trainer.independent_gradient_clipping.world) == 1.0
+    assert warmup.trainer.gradient_clipping is None
+    assert str(warmup.trainer.freeze_modules) == "wam_act_ctx"
+
+    assert not bool(gate.framework.wam.guidance.action_world_bypass)
+    assert not bool(gate.framework.wam.guidance.freeze_world_to_action_in_warmup)
+    frozen = {item.strip() for item in str(gate.trainer.freeze_modules).split(",")}
+    assert {
+        "qwen_vl_interface",
+        "wam_visual_head",
+        "wam_state_ctx",
+        "wam_act_ctx",
+        "future_dino_queries",
+    }.issubset(frozen)
+    assert "action_queries" not in frozen
+    assert float(gate.trainer.learning_rate.world_gates) == 1.0e-4
+    assert float(gate.trainer.learning_rate.world_to_action_adapters) == 1.0e-4
+    assert float(gate.trainer.learning_rate.action_model) == 1.0e-5
+    assert float(gate.trainer.learning_rate.action_queries) == 1.0e-5
+    assert int(gate.trainer.num_warmup_steps) == 500
+    assert str(gate.trainer.pretrained_checkpoint) == (
+        f"{warmup.run_root_dir}/{warmup.run_id}/final_model/pytorch_model.pt"
+    )
+    job_dir = REPO_ROOT / "执行脚本/RBT"
+    for name in (
+        "robotwin_wam_isolated_warmup_rand.yaml",
+        "robotwin_wam_isolated_gate_ft_rand.yaml",
+    ):
+        job = OmegaConf.load(job_dir / name)
+        assert int(job.REQUIRED.WORKER_MIN_NUM) == 8
+        assert int(job.REQUIRED.WORKER_MAX_NUM) == 8
+        assert int(job.REQUIRED.GPU_PER_WORKER) == 8
+        assert int(job.REQUIRED.environment.EXPECTED_NUM_MACHINES) == 8
+        assert int(job.REQUIRED.environment.GPUS_PER_NODE) == 8
+        raw_job = OmegaConf.to_container(job, resolve=False)
+        assert raw_job["REQUIRED"]["RUN_SCRIPTS"] == (
+            "EXPECTED_NUM_MACHINES=8 ${WORKING_PATH}/run_aidi_rbtw.sh "
+            f"examples/Robotwin/train_files/{name}"
+        )
+    runbook = (job_dir / "run.sh").read_text(encoding="utf-8")
+    assert "-f robotwin_wam_isolated_warmup_rand.yaml" in runbook
+    assert "-f robotwin_wam_isolated_gate_ft_rand.yaml" in runbook
+
+
+def test_pretraining_query_banks_have_disjoint_gradient_ownership() -> None:
+    """World loss updates FUTURE query but cannot update the Qwen tensor."""
+
+    from starVLA.model.framework.VLM4A.jointflow.joint_modules import (
+        ActionQueryTokenBank,
+        FutureDinoQueryTokenBank,
+    )
+
+    class QueryHarness:
+        wam_pretraining_aligned_queries = True
+        wam_n_flow = 2
+        _jointflow_module_dtype = staticmethod(Qwen_GR00T._jointflow_module_dtype)
+        _wam_future_query_condition = Qwen_GR00T._wam_future_query_condition
+        _wam_query_embedding_override = Qwen_GR00T._wam_query_embedding_override
+
+        def __init__(self) -> None:
+            self.action_queries = ActionQueryTokenBank(3, 4)
+            self.future_dino_queries = FutureDinoQueryTokenBank(2, 4)
+
+            class TinyQwen(torch.nn.Module):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.embedding = torch.nn.Embedding(12, 4)
+                    self.projection = torch.nn.Linear(4, 4, bias=False)
+
+                def get_input_embeddings(self):
+                    return self.embedding
+
+                def forward(self, input_ids):
+                    return self.projection(self.embedding(input_ids))
+
+            self.qwen_vl_interface = SimpleNamespace(model=TinyQwen())
+
+    harness = QueryHarness()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    act_mask = torch.tensor([[False, True, True, True, False, False]])
+    world_mask = torch.tensor([[False, False, False, False, True, True]])
+    with harness._wam_query_embedding_override(act_mask, world_mask):
+        hidden = harness.qwen_vl_interface.model(input_ids)
+    action_condition = hidden[act_mask].view(1, 3, 4)
+    qwen_world = hidden[world_mask].view(1, 2, 4)
+
+    action_condition.square().mean().backward(retain_graph=True)
+    assert harness.qwen_vl_interface.model.projection.weight.grad is not None
+    assert harness.action_queries.action_query.weight.grad is not None
+    future_grad = harness.future_dino_queries.future_dino_query.weight.grad
+    assert future_grad is None or float(future_grad.abs().sum()) == 0.0
+
+    for parameter in harness.qwen_vl_interface.model.parameters():
+        parameter.grad = None
+    harness.action_queries.action_query.weight.grad = None
+    harness.future_dino_queries.future_dino_query.weight.grad = None
+    world_condition = harness._wam_future_query_condition(qwen_world.detach())
+    world_condition.square().mean().backward()
+    assert harness.qwen_vl_interface.model.projection.weight.grad is None
+    assert harness.action_queries.action_query.weight.grad is None
+    assert harness.future_dino_queries.future_dino_query.weight.grad is not None
+
+    # Stage 2 freezes Qwen weights, but ACT queries remain differentiable
+    # through that frozen backbone and are still optimized by action loss.
+    for parameter in harness.qwen_vl_interface.model.parameters():
+        parameter.requires_grad_(False)
+        parameter.grad = None
+    harness.action_queries.action_query.weight.grad = None
+    with harness._wam_query_embedding_override(act_mask, world_mask):
+        frozen_hidden = harness.qwen_vl_interface.model(input_ids)
+    frozen_hidden[act_mask].square().mean().backward()
+    assert all(
+        parameter.grad is None
+        for parameter in harness.qwen_vl_interface.model.parameters()
+    )
+    assert harness.action_queries.action_query.weight.grad is not None
+
+
+def test_ft_optimizer_groups_separate_gate_adapter_action_and_query_lrs() -> None:
+    from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
+
+    class Block(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.core = torch.nn.Linear(4, 4)
+            self.world_norm = torch.nn.LayerNorm(4)
+            self.world_attn = torch.nn.Linear(4, 4)
+            self.world_gate = torch.nn.Parameter(torch.zeros(1))
+
+    class ActionModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.transformer_blocks = torch.nn.ModuleList([Block()])
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.action_model = ActionModel()
+            self.action_queries = torch.nn.Embedding(3, 4)
+            self.world_adapter = torch.nn.Linear(4, 4)
+            self.qwen_vl_interface = torch.nn.Linear(4, 4)
+            self.wam_visual_head = torch.nn.Linear(4, 4)
+            self.wam_state_ctx = torch.nn.Linear(4, 4)
+            self.wam_act_ctx = torch.nn.Linear(4, 4)
+            self.future_dino_queries = torch.nn.Embedding(2, 4)
+
+    model = Model()
+    cfg = OmegaConf.create(
+        {
+            "trainer": {
+                "freeze_modules": (
+                    "qwen_vl_interface,wam_visual_head,wam_state_ctx,"
+                    "wam_act_ctx,future_dino_queries"
+                ),
+                "learning_rate": {
+                    "base": 1.0e-5,
+                    "world_gates": 1.0e-4,
+                    "world_to_action_adapters": 1.0e-4,
+                    "action_queries": 1.0e-5,
+                    "action_model": 1.0e-5,
+                },
+            }
+        }
+    )
+    groups = build_param_lr_groups(model, cfg)
+    by_name = {group["name"]: group for group in groups}
+    assert set(by_name) == {
+        "world_gates",
+        "world_to_action_adapters",
+        "action_queries",
+        "action_model",
+    }
+    assert float(by_name["world_gates"]["lr"]) == 1.0e-4
+    assert float(by_name["world_to_action_adapters"]["lr"]) == 1.0e-4
+    assert float(by_name["action_model"]["lr"]) == 1.0e-5
+    assert float(by_name["action_queries"]["lr"]) == 1.0e-5
+    all_ids = [id(parameter) for group in groups for parameter in group["params"]]
+    assert len(all_ids) == len(set(all_ids))
+    assert {group["gradient_partition"] for group in groups} == {"action"}
+
+
+def test_warmup_optimizer_groups_are_disjoint_action_and_world_partitions() -> None:
+    """Strict warmup cannot hide a mixed branch in the base LR group."""
+
+    from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
+
+    class Block(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.core = torch.nn.Linear(4, 4)
+            self.world_norm = torch.nn.LayerNorm(4)
+            self.world_attn = torch.nn.Linear(4, 4)
+            self.world_gate = torch.nn.Parameter(torch.zeros(1))
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.qwen_vl_interface = torch.nn.Linear(4, 4)
+            self.action_queries = torch.nn.Embedding(3, 4)
+            self.action_model = torch.nn.Module()
+            self.action_model.model = torch.nn.Module()
+            self.action_model.model.transformer_blocks = torch.nn.ModuleList([Block()])
+            self.future_dino_queries = torch.nn.Embedding(2, 4)
+            self.wam_visual_head = torch.nn.Linear(4, 4)
+            self.wam_state_ctx = torch.nn.Linear(4, 4)
+            self.wam_act_ctx = torch.nn.Linear(4, 4)
+            self.world_adapter = torch.nn.Linear(4, 4)
+            for name, parameter in self.named_parameters():
+                if (
+                    name.startswith("world_adapter.")
+                    or ".world_attn." in name
+                    or ".world_norm." in name
+                    or name.endswith(".world_gate")
+                ):
+                    parameter.requires_grad_(False)
+
+    model = Model()
+    cfg = OmegaConf.create(
+        {
+            "trainer": {
+                "freeze_modules": "wam_act_ctx",
+                "learning_rate": {
+                    "base": 1.0e-5,
+                    "qwen_vl_interface": 1.0e-5,
+                    "action_queries": 1.0e-4,
+                    "action_model": 1.0e-4,
+                    "future_dino_queries": 1.0e-4,
+                    "wam_visual_head": 1.0e-4,
+                    "wam_state_ctx": 1.0e-4,
+                },
+            }
+        }
+    )
+    groups = build_param_lr_groups(model, cfg)
+    assert {group["gradient_partition"] for group in groups} == {
+        "action",
+        "world",
+    }
+    assert all(group["gradient_partition"] != "mixed" for group in groups)
+    assert {group["name"] for group in groups} == {
+        "qwen_vl_interface",
+        "action_queries",
+        "action_model",
+        "future_dino_queries",
+        "wam_visual_head",
+        "wam_state_ctx",
+    }
+    all_ids = [id(parameter) for group in groups for parameter in group["params"]]
+    assert len(all_ids) == len(set(all_ids))
+
+
+def test_zero2_branch_clipper_scales_action_and_world_independently() -> None:
+    from starVLA.training.train_starvla import VLATrainer
+
+    action_grad = torch.tensor([3.0, 4.0])
+    world_grad = torch.tensor([0.0, 10.0])
+
+    class Inner:
+        param_groups = [
+            {"gradient_partition": "action"},
+            {"gradient_partition": "world"},
+        ]
+
+    class Zero:
+        optimizer = Inner()
+        averaged_gradients = {0: [action_grad], 1: [world_grad]}
+        params_in_partition = {0: [torch.nn.Parameter(torch.zeros(2))], 1: [torch.nn.Parameter(torch.zeros(2))]}
+        loss_scale = 1.0
+
+        @staticmethod
+        def get_grad_norm_direct(gradients, _params):
+            return torch.linalg.vector_norm(torch.cat([gradient.flatten() for gradient in gradients]))
+
+    trainer = VLATrainer.__new__(VLATrainer)
+    trainer.model = SimpleNamespace(optimizer=Zero())
+    trainer.accelerator = SimpleNamespace(device=torch.device("cpu"))
+    trainer._independent_clip_limits = {"action": 1.0, "world": 2.0}
+    metrics = VLATrainer._clip_independent_zero2_partitions(trainer)
+    torch.testing.assert_close(action_grad, torch.tensor([0.6, 0.8]), atol=2.0e-6, rtol=0)
+    torch.testing.assert_close(world_grad, torch.tensor([0.0, 2.0]), atol=2.0e-6, rtol=0)
+    torch.testing.assert_close(metrics["train/grad_norm_preclip/action"], torch.tensor(5.0))
+    torch.testing.assert_close(metrics["train/grad_norm_preclip/world"], torch.tensor(10.0))
+
+
 def test_wam_two_stage_contract_rejects_corrnoise_and_unfrozen_gate_ft() -> None:
     path = REPO_ROOT / "examples/Robotwin/train_files/robotwin_wam_gate_rand2clean.yaml"
     for mutation, expected in (

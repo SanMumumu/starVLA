@@ -122,10 +122,11 @@ def verify(
         "legacy_v1",
         "policy_first_v2",
         "baseline_preserving_v3",
+        "isolated_queries_v4",
     }:
         errors.append(
             "trainer.wam_two_stage_recipe must be legacy_v1, policy_first_v2, "
-            "or baseline_preserving_v3, got "
+            "baseline_preserving_v3, or isolated_queries_v4, got "
             f"{actual_wam_recipe!r}"
         )
     if expected_wam_phase is not None:
@@ -171,7 +172,11 @@ def verify(
                 errors.append("gate_ft checkpoint is missing its Stage-1 pretrained_checkpoint provenance")
             if not bool(trainer_cfg.get("reset_world_gates_after_pretrained_load", False)):
                 errors.append("gate_ft checkpoint must record reset_world_gates_after_pretrained_load=true")
-            if actual_wam_recipe in {"policy_first_v2", "baseline_preserving_v3"}:
+            if actual_wam_recipe in {
+                "policy_first_v2",
+                "baseline_preserving_v3",
+                "isolated_queries_v4",
+            }:
                 if bool(guidance_cfg.get("detach_action_backbone", False)):
                     errors.append(f"{actual_wam_recipe} gate_ft must keep detach_action_backbone=false")
                 if not bool(guidance_cfg.get("detach_world_backbone", False)):
@@ -182,10 +187,23 @@ def verify(
                     errors.append(
                         "baseline_preserving_v3 gate_ft must use the native baseline action context"
                     )
+                if actual_wam_recipe == "isolated_queries_v4":
+                    if bool(guidance_cfg.get("baseline_action_context", False)):
+                        errors.append(
+                            "isolated_queries_v4 gate_ft must use the explicit ACT query path"
+                        )
+                    if not bool(guidance_cfg.get("pretraining_aligned_queries", False)):
+                        errors.append(
+                            "isolated_queries_v4 gate_ft is missing pretraining-aligned queries"
+                        )
         elif expected_wam_phase == "predictor_warmup":
             if not bool(guidance_cfg.get("action_world_bypass", False)):
                 errors.append("predictor_warmup checkpoint must have guidance.action_world_bypass=true")
-            if actual_wam_recipe in {"policy_first_v2", "baseline_preserving_v3"}:
+            if actual_wam_recipe in {
+                "policy_first_v2",
+                "baseline_preserving_v3",
+                "isolated_queries_v4",
+            }:
                 if bool(guidance_cfg.get("detach_action_backbone", False)):
                     errors.append(
                         f"{actual_wam_recipe} predictor_warmup must let action loss update Qwen"
@@ -204,6 +222,15 @@ def verify(
                     errors.append(
                         "baseline_preserving_v3 predictor_warmup must use the native baseline action context"
                     )
+                if actual_wam_recipe == "isolated_queries_v4":
+                    if bool(guidance_cfg.get("baseline_action_context", False)):
+                        errors.append(
+                            "isolated_queries_v4 predictor_warmup must use the explicit ACT query path"
+                        )
+                    if not bool(guidance_cfg.get("pretraining_aligned_queries", False)):
+                        errors.append(
+                            "isolated_queries_v4 predictor_warmup is missing pretraining-aligned queries"
+                        )
             elif not bool(guidance_cfg.get("detach_action_backbone", False)):
                 errors.append("legacy predictor_warmup checkpoint must detach the action backbone")
             if active_tasks != ["joint_detached"]:
@@ -289,6 +316,19 @@ def verify(
         "wam_world_to_action_enabled": actual_world_to_action,
         "wam_baseline_action_context": bool(
             guidance_cfg.get("baseline_action_context", False)
+        ),
+        "wam_pretraining_aligned_queries": bool(
+            guidance_cfg.get("pretraining_aligned_queries", False)
+        ),
+        "wam_action_query_count": (
+            int(action_cfg.get("n_action_query", action_cfg.get("action_horizon", 32)))
+            if bool(guidance_cfg.get("pretraining_aligned_queries", False))
+            else None
+        ),
+        "wam_future_query_capacity": (
+            int(framework_cfg.get("visual_model", {}).get("max_image_queries", 0))
+            if bool(guidance_cfg.get("pretraining_aligned_queries", False))
+            else None
         ),
         "wam_bridge_source": guidance_cfg.get("bridge_source"),
         "wam_world_eval_mode": guidance_cfg.get("world_eval_mode"),

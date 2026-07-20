@@ -221,6 +221,40 @@ class PolicyServerWrapper:
         recipe = str(
             trainer_cfg.get("wam_two_stage_recipe", "legacy_v1") or "legacy_v1"
         ).lower()
+        pretraining_aligned_queries = bool(
+            getattr(
+                framework,
+                "wam_pretraining_aligned_queries",
+                runtime_guidance.get("pretraining_aligned_queries", False),
+            )
+        )
+        action_query_bank = getattr(framework, "action_queries", None)
+        action_query_count = (
+            int(getattr(action_query_bank, "action_horizon"))
+            if action_query_bank is not None
+            and getattr(action_query_bank, "action_horizon", None) is not None
+            else None
+        )
+        future_query_bank = getattr(framework, "future_dino_queries", None)
+        future_query_capacity = (
+            int(getattr(future_query_bank, "max_queries"))
+            if future_query_bank is not None
+            and getattr(future_query_bank, "max_queries", None) is not None
+            else None
+        )
+        if phase is not None and recipe == "isolated_queries_v4":
+            expected_action_queries = int(getattr(framework, "action_horizon", 0))
+            if not pretraining_aligned_queries or action_query_count != expected_action_queries:
+                raise RuntimeError(
+                    "isolated_queries_v4 checkpoint did not restore its pretraining-aligned "
+                    "ACT query bank: "
+                    f"enabled={pretraining_aligned_queries}, count={action_query_count}, "
+                    f"expected={expected_action_queries}"
+                )
+            if future_query_capacity is None:
+                raise RuntimeError(
+                    "isolated_queries_v4 checkpoint did not restore its FUTURE query bank"
+                )
         metadata: Dict[str, Any] = {
             "wam_enabled": wam_enabled,
             "wam_two_stage_phase": phase,
@@ -260,6 +294,15 @@ class PolicyServerWrapper:
                 bool(runtime_guidance.get("baseline_action_context", False))
                 if guidance_enabled
                 else None
+            ),
+            "wam_pretraining_aligned_queries": (
+                pretraining_aligned_queries if guidance_enabled else None
+            ),
+            "wam_action_query_count": (
+                action_query_count if guidance_enabled else None
+            ),
+            "wam_future_query_capacity": (
+                future_query_capacity if guidance_enabled else None
             ),
             "wam_gate_openness": None,
             "wam_gate_signed_mean": None,

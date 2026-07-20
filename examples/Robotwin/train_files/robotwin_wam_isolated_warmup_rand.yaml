@@ -1,0 +1,240 @@
+#######
+# Stage 1/2 (rand/full): query-aligned, strictly isolated joint warmup.
+#
+# Every batch optimizes L_action + 0.1 * L_world. ACT and FUTURE query banks
+# reuse the four-task pretraining module ABI, but gradient ownership is
+# disjoint:
+#   action -> Qwen + action_queries + baseline Action-DiT core
+#   world  -> future_dino_queries + state conditioner + visual World-DiT
+# Adapter/gate/world-attention parameters are physically frozen in Stage 1.
+# ZeRO-2 reduced gradients are independently clipped per branch before one
+# AdamW step; disjoint parameter groups are numerically equivalent to two
+# AdamW optimizers while remaining supported by Accelerate/DeepSpeed.
+#######
+
+run_id: robotwin_wam_m5_fastwam_isolatedqueries_warmup_rand_state_h32_dinojitx_iid_80k
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin_isolated
+seed: 42
+wandb_entity: axi-the-cat
+wandb_project: starVLA_Robotwin
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenGR00T
+
+  qwenvl:
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B-Instruct/
+    attn_implementation: flash_attention_2
+    enable_gradient_checkpointing: true
+    vl_hidden_dim: 2048
+
+  wam:
+    enabled: true
+    action_gradient_checkpointing: false
+    visual_gradient_checkpointing: true
+    placeholder_token: "<ACT_PH>"
+    dino_loss_weight: 0.1
+    world_target: absolute
+    guidance:
+      enabled: true
+      mode: dual_xattn
+      signal: z_pred
+      prompt_mode: dual_query
+      exclude_post_query_context: true
+      bridge_source: predicted
+      detach_world: true
+      detached_prediction_eval_mode: true
+      action_world_bypass: true
+      world_to_action_enabled: true
+      detach_action_backbone: false
+      detach_world_backbone: true
+      # Use the dual-query action path, not the query-free native baseline path.
+      baseline_action_context: false
+      pretraining_aligned_queries: true
+      freeze_world_to_action_in_warmup: true
+      oracle_ratio: 0.0
+      n_world_tokens: 64
+      qformer_layers: 2
+      fusion_layers: 2
+      gate_init: 0.0
+      log_gate_openness: true
+      world_dropout: 0.0
+      world_condition_on_state: true
+      include_context_in_action_memory: true
+      include_context_in_world_memory: true
+      action_world_gradient_ramp:
+        enabled: false
+        start_step: 0
+        end_step: 0
+        start_scale: 0.0
+        end_scale: 0.0
+      world_eval_mode: correct
+
+  tasks:
+    weights:
+      policy: 0.0
+      passive: 0.0
+      joint_detached: 1.0
+
+  dino:
+    name: dinov3_vitl16
+    model_size: large
+    hf_model_id: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO/
+    weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO/
+    loader: hf
+    image_size: [384, 320]
+    patch_size: 16
+    embed_dim: 1024
+    future_view_keys: ["video.robotwin_composite"]
+    stats_path: null
+    load_live_backbone: false
+    dino_pool: 1
+
+  action_model:
+    action_model_type: DiT-LAWAM
+    action_hidden_dim: 1024
+    hidden_size: 1024
+    add_pos_embed: true
+    max_seq_len: 1024
+    action_dim: 14
+    state_dim: 14
+    action_horizon: 32
+    n_action_query: 32
+    repeated_diffusion_steps: 2
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 10
+    prediction_type: jit_x
+    jit_t_eps: 0.05
+    flow_time_sampling: gr00t
+    use_correlated_noise: false
+    num_target_vision_tokens: 32
+    diffusion_model_cfg:
+      cross_attention_dim: 2048
+      dropout: 0.2
+      final_dropout: true
+      interleave_self_attention: true
+      norm_type: ada_norm
+      num_layers: 16
+      output_dim: 1024
+      positional_embeddings: null
+
+  visual_model:
+    d_dino: 1024
+    n_flow_query: 64
+    max_image_queries: 64
+    max_target_tokens: 480
+    hidden_size: 1024
+    cross_attention_dim: 2048
+    num_attention_heads: 16
+    attention_head_dim: 64
+    num_layers: 12
+    dropout: 0.1
+    add_pos_embed: true
+    max_seq_len: 480
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 10
+    prediction_type: jit_x
+    jit_t_eps: 0.05
+    flow_time_sampling: gr00t
+    clean_target_loss_weight: 1.0
+    cosine_loss_weight: 0.1
+    patch_weighting: change_balanced
+    change_weight_strength: 1.0
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/robotwin2.0-fastwam
+    data_mix: robotwin_fastwam
+    lerobot_version: v2.0
+    fastwam_dataset_stats_path: /horizon-bucket/robot_lab/users/haoyi.jiang/repos/fastwam/robotwin2.0-fastwam/dataset_stats.json
+    fastwam_expected_fps: 50
+    fastwam_val_fraction: 0.01
+    fastwam_split: train
+    fastwam_split_seed: 42
+    fastwam_direct_frame_sampling: true
+    fastwam_wam_targets: true
+    fastwam_wam_target: composite
+    fastwam_future_stride: 32
+    include_state: true
+    action_type: abs_qpos
+    action_mode: abs
+    sequential_step_sampling: false
+    balance_dataset_weights: false
+    balance_trajectory_weights: false
+    per_device_batch_size: 12
+    load_all_data_for_training: true
+    obs_image_size: [320, 384]
+    video_backend: pyav
+    num_workers: 4
+    prefetch_factor: 2
+    pin_memory: true
+    persistent_workers: false
+
+trainer:
+  seed_before_model_init: true
+  expected_global_batch_size: 768
+  wam_two_stage_phase: predictor_warmup
+  wam_two_stage_recipe: isolated_queries_v4
+  max_train_steps: 80000
+  num_warmup_steps: 2000
+  save_interval: 10000
+  action_eval_enabled: true
+  eval_interval: 1000
+  world_validation:
+    enabled: true
+    interval: 5000
+    task: joint_detached
+    per_device_batch_size: 2
+    num_workers: 2
+    num_batches: 4
+    num_samples: 1
+    num_inference_timesteps: 10
+    seed: 2027
+  pretrained_checkpoint: null
+  is_resume: false
+  save_full_training_state: true
+
+  learning_rate:
+    base: 1.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_queries: 1.0e-04
+    action_model: 1.0e-04
+    future_dino_queries: 1.0e-04
+    wam_visual_head: 1.0e-04
+    wam_state_ctx: 1.0e-04
+
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+
+  # The action-conditioned FDM encoder is unused by this passive world branch.
+  freeze_modules: 'wam_act_ctx'
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 200
+  log_grad_norms: false
+  log_global_grad_norm: true
+  deepspeed_skip_unused_param_anchors: true
+  # Must stay null: the branch clipper disables DeepSpeed's global clip.
+  gradient_clipping: null
+  independent_gradient_clipping:
+    enabled: true
+    action: 1.0
+    world: 1.0
+  gradient_accumulation_steps: 1
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

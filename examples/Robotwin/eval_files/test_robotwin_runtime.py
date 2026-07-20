@@ -189,3 +189,38 @@ def test_fastwam_client_rejects_wrong_world_to_action_architecture() -> None:
                 wam_expected_phase="predictor_warmup",
                 wam_expected_world_to_action=True,
             )
+
+
+def test_fastwam_client_verifies_isolated_recipe_action_query_abi() -> None:
+    sys.path.insert(0, str(EVAL_DIR))
+    try:
+        import model2robotwin_fastwam_interface as adapter
+    finally:
+        sys.path.pop(0)
+
+    requested = "/models/isolated/checkpoints/steps_20000_pytorch_model.pt"
+
+    def fake_standard_init(self, *args, **kwargs):
+        self.action_chunk_size = 32
+        self.replan_steps = 24
+        self.server_meta = {
+            "ckpt_path": kwargs.get("policy_ckpt_path"),
+            "expects_state": True,
+            "wam_two_stage_recipe": "isolated_queries_v4",
+            "wam_pretraining_aligned_queries": True,
+            "wam_baseline_action_context": False,
+            "wam_action_query_count": 32,
+            "wam_future_query_capacity": 64,
+        }
+
+    with patch.object(adapter.StandardModelClient, "__init__", fake_standard_init):
+        client = adapter.FastWAMRobotWinModelClient(policy_ckpt_path=requested)
+        assert client.action_chunk_size == 32
+
+    def fake_missing_action_query(self, *args, **kwargs):
+        fake_standard_init(self, *args, **kwargs)
+        self.server_meta["wam_action_query_count"] = None
+
+    with patch.object(adapter.StandardModelClient, "__init__", fake_missing_action_query):
+        with pytest.raises(RuntimeError, match="ACT query count"):
+            adapter.FastWAMRobotWinModelClient(policy_ckpt_path=requested)

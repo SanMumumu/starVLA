@@ -92,7 +92,20 @@ def build_training_accelerator(cfg) -> Accelerator:
             "trainer.gradient_accumulation_steps must be positive, "
             f"got {accumulation_steps}."
         )
-    clipping = cfg.trainer.get("gradient_clipping", None)
+    independent_clipping = cfg.trainer.get("independent_gradient_clipping", {})
+    independent_clipping_enabled = bool(
+        hasattr(independent_clipping, "get")
+        and independent_clipping.get("enabled", False)
+    )
+    # Accelerate otherwise resolves DeepSpeed's ``gradient_clipping=auto`` to
+    # 1.0 inside _prepare_deepspeed.  The strict branch clipper operates on
+    # ZeRO-2's reduced partitions immediately before engine.step(), so global
+    # clipping must be explicitly disabled rather than left as ``None``.
+    clipping = (
+        0.0
+        if independent_clipping_enabled
+        else cfg.trainer.get("gradient_clipping", None)
+    )
     plugin = DeepSpeedPlugin(
         gradient_accumulation_steps=accumulation_steps,
         gradient_clipping=float(clipping) if clipping is not None else None,
@@ -133,7 +146,8 @@ def build_training_accelerator(cfg) -> Accelerator:
     result.print(
         f"[train] gradient_accumulation_steps={result.gradient_accumulation_steps} "
         f"deepspeed={deepspeed_accumulation} "
-        f"zero_no_sync_guard={str(zero_no_sync_guard).lower()}"
+        f"zero_no_sync_guard={str(zero_no_sync_guard).lower()} "
+        f"independent_gradient_clipping={str(independent_clipping_enabled).lower()}"
     )
     return result
 
@@ -260,6 +274,17 @@ class VLATrainer(TrainerUtils):
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
 
+        independent_clip_cfg = cfg.trainer.get("independent_gradient_clipping", {})
+        self._independent_gradient_clipping = bool(
+            hasattr(independent_clip_cfg, "get")
+            and independent_clip_cfg.get("enabled", False)
+        )
+        self._independent_clip_limits = {
+            branch: float(independent_clip_cfg.get(branch, 0.0))
+            for branch in ("action", "world")
+        } if self._independent_gradient_clipping else {}
+        self._last_independent_clip_metrics: dict[str, float] = {}
+
         self.completed_steps = 0
         self._pending_full_state_path: str | None = None
         self.total_batch_size = self._calculate_total_batch_size()
@@ -359,8 +384,10 @@ class VLATrainer(TrainerUtils):
         self.print_trainable_parameters(self.model)
         self._validate_joint_world_optimizer_contract()
         self._validate_wam_two_stage_runtime_contract()
+        self._validate_independent_gradient_clipping_contract(distributed=False)
 
         self._prepare_distributed_components()
+        self._validate_independent_gradient_clipping_contract(distributed=True)
 
         # The historical loop intentionally steps the raw Transformers
         # scheduler itself instead of wrapping it with Accelerator.  Register
@@ -443,6 +470,29 @@ class VLATrainer(TrainerUtils):
                     "world_condition_on_state is enabled but wam_state_ctx has no trainable parameters"
                 )
             world_params.extend(state_params)
+        config = getattr(self, "config", None)
+        trainer_cfg = getattr(config, "trainer", None) if config is not None else None
+        recipe = str(
+            trainer_cfg.get("wam_two_stage_recipe", "legacy_v1")
+            if trainer_cfg is not None
+            else "legacy_v1"
+        ).lower()
+        if recipe == "isolated_queries_v4":
+            world_queries = getattr(self.model, "future_dino_queries", None)
+            if not isinstance(world_queries, torch.nn.Module):
+                raise RuntimeError(
+                    "isolated_queries_v4 requires an explicit future_dino_queries module"
+                )
+            query_params = [
+                parameter
+                for parameter in world_queries.parameters()
+                if parameter.requires_grad
+            ]
+            if not query_params:
+                raise RuntimeError(
+                    "isolated_queries_v4 warmup requires trainable world-query parameters"
+                )
+            world_params.extend(query_params)
 
         # Transformers schedulers set the *current* optimizer LR to zero at
         # scheduler construction when linear/cosine warmup starts at step 0.
@@ -512,6 +562,7 @@ class VLATrainer(TrainerUtils):
             for block in blocks
             for module in (
                 getattr(block, "world_attn", None),
+                getattr(block, "world_norm", None),
                 getattr(block, "world_to_temb", None),
             )
             if isinstance(module, torch.nn.Module)
@@ -551,7 +602,7 @@ class VLATrainer(TrainerUtils):
         if phase == "predictor_warmup":
             if not trainable("wam_visual_head") or not trainable("wam_state_ctx"):
                 raise RuntimeError("predictor_warmup requires trainable visual head and state conditioner")
-            if recipe in {"policy_first_v2", "baseline_preserving_v3"}:
+            if recipe in {"policy_first_v2", "baseline_preserving_v3", "isolated_queries_v4"}:
                 if not trainable("qwen_vl_interface"):
                     raise RuntimeError(
                         f"{recipe} predictor_warmup requires trainable Qwen so action loss can update it"
@@ -560,10 +611,37 @@ class VLATrainer(TrainerUtils):
                     raise RuntimeError(
                         f"{recipe} predictor_warmup requires a trainable action model"
                     )
+            if recipe == "isolated_queries_v4":
+                if not trainable("action_queries"):
+                    raise RuntimeError(
+                        "isolated_queries_v4 warmup requires a trainable action query bank"
+                    )
+                if not trainable("future_dino_queries"):
+                    raise RuntimeError(
+                        "isolated_queries_v4 warmup requires a trainable world query bank"
+                    )
+                leaking_world_to_action = sum(
+                    parameter.numel()
+                    for module in world_action_modules
+                    for parameter in module.parameters()
+                    if parameter.requires_grad
+                ) + sum(parameter.numel() for parameter in gates if parameter.requires_grad)
+                if leaking_world_to_action:
+                    raise RuntimeError(
+                        "isolated_queries_v4 warmup must physically freeze adapter/gate/"
+                        f"world-attention parameters; trainable={leaking_world_to_action}"
+                    )
         elif phase == "gate_ft":
             unexpectedly_trainable = {
                 name: len(trainable(name))
-                for name in ("qwen_vl_interface", "wam_visual_head", "wam_state_ctx", "wam_act_ctx")
+                for name in (
+                    "qwen_vl_interface",
+                    "wam_visual_head",
+                    "wam_state_ctx",
+                    "wam_act_ctx",
+                    "future_dino_queries" if recipe == "isolated_queries_v4" else "",
+                )
+                if name
                 if trainable(name)
             }
             if unexpectedly_trainable:
@@ -572,6 +650,10 @@ class VLATrainer(TrainerUtils):
                 )
             if not trainable("action_model") or not trainable("world_adapter"):
                 raise RuntimeError("gate_ft requires trainable action_model and world_adapter")
+            if recipe == "isolated_queries_v4" and not trainable("action_queries"):
+                raise RuntimeError(
+                    "isolated_queries_v4 gate_ft requires a trainable action query bank"
+                )
         else:
             raise RuntimeError(f"Unsupported wam_two_stage_phase={phase!r}")
 
@@ -584,6 +666,96 @@ class VLATrainer(TrainerUtils):
                 world_to_action_enabled,
                 len(gates),
                 max_gate,
+            )
+
+    def _validate_independent_gradient_clipping_contract(
+        self,
+        *,
+        distributed: bool,
+    ) -> None:
+        """Validate strict action/world ownership and the ZeRO-2 clip ABI."""
+
+        if not self._independent_gradient_clipping:
+            return
+        bad_limits = {
+            branch: limit
+            for branch, limit in self._independent_clip_limits.items()
+            if limit <= 0.0
+        }
+        if bad_limits:
+            raise RuntimeError(
+                "independent_gradient_clipping limits must be positive: "
+                f"{bad_limits}"
+            )
+        global_clip = self.config.trainer.get("gradient_clipping", None)
+        if global_clip is not None and float(global_clip) != 0.0:
+            raise RuntimeError(
+                "independent_gradient_clipping requires trainer.gradient_clipping "
+                "to be null/0 so DeepSpeed cannot apply a second global clip"
+            )
+
+        groups = list(self.optimizer.param_groups)
+        partitions = {str(group.get("gradient_partition", "")) for group in groups}
+        invalid = sorted(partitions - {"action", "world"})
+        if invalid:
+            raise RuntimeError(
+                "Every strict optimizer group must belong exclusively to action or world; "
+                f"invalid gradient_partition values={invalid}"
+            )
+        missing = {"action", "world"} - partitions
+        if missing:
+            raise RuntimeError(
+                "Strict warmup optimizer is missing gradient partitions: "
+                f"{sorted(missing)}"
+            )
+        if not distributed:
+            return
+
+        if not self._using_deepspeed:
+            if self.accelerator.is_main_process:
+                logger.info(
+                    "Verified independent clipping without DeepSpeed: groups=%s limits=%s",
+                    {branch: sum(g.get("gradient_partition") == branch for g in groups) for branch in partitions},
+                    self._independent_clip_limits,
+                )
+            return
+
+        stage_fn = getattr(self.model, "zero_optimization_stage", None)
+        zero_stage = int(stage_fn()) if callable(stage_fn) else -1
+        if zero_stage != 2:
+            raise RuntimeError(
+                "independent_gradient_clipping currently requires DeepSpeed ZeRO-2, "
+                f"got stage={zero_stage}"
+            )
+        zero_optimizer = getattr(self.model, "optimizer", None)
+        if zero_optimizer is None or not hasattr(zero_optimizer, "averaged_gradients"):
+            raise RuntimeError(
+                "DeepSpeed optimizer does not expose ZeRO-2 averaged_gradients; "
+                "cannot clip action/world partitions independently"
+            )
+        if bool(getattr(zero_optimizer, "cpu_offload", False)):
+            raise RuntimeError(
+                "independent_gradient_clipping does not support optimizer CPU offload"
+            )
+        if float(getattr(zero_optimizer, "clip_grad", -1.0)) != 0.0:
+            raise RuntimeError(
+                "DeepSpeed global gradient clipping must resolve to 0 for strict branch clipping; "
+                f"active={getattr(zero_optimizer, 'clip_grad', None)}"
+            )
+        inner_groups = list(getattr(zero_optimizer.optimizer, "param_groups", ()))
+        inner_partitions = {
+            str(group.get("gradient_partition", "")) for group in inner_groups
+        }
+        if inner_partitions != partitions:
+            raise RuntimeError(
+                "DeepSpeed did not preserve optimizer gradient_partition metadata: "
+                f"before={sorted(partitions)}, after={sorted(inner_partitions)}"
+            )
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Verified ZeRO-2 independent clipping: groups=%s limits=%s global_clip=0",
+                {branch: sum(g.get("gradient_partition") == branch for g in inner_groups) for branch in partitions},
+                self._independent_clip_limits,
             )
 
     @staticmethod
@@ -1209,6 +1381,8 @@ class VLATrainer(TrainerUtils):
 
     def _global_grad_norm(self):
         """Read the unscaled, globally reduced, pre-clipping gradient norm."""
+        if getattr(self, "_independent_gradient_clipping", False) and self._last_clip_norm is not None:
+            return self._last_clip_norm
         try:
             m = self.model
             if hasattr(m, "get_global_grad_norm"):
@@ -1223,6 +1397,107 @@ class VLATrainer(TrainerUtils):
         except Exception:
             pass
         return self._last_clip_norm
+
+    def _backward_for_current_step(self, loss: torch.Tensor, *, sync: bool) -> None:
+        """Backward without letting Accelerate step before strict clipping.
+
+        Accelerate's DeepSpeed wrapper calls ``engine.step()`` inside
+        ``accelerator.backward`` at an accumulation boundary.  Independent
+        action/world clipping must run after ZeRO reduce-scatter but before
+        that step, so the opt-in path calls the engine primitives explicitly.
+        Every legacy run continues through ``accelerator.backward`` unchanged.
+        """
+
+        if not (
+            getattr(self, "_independent_gradient_clipping", False)
+            and self._using_deepspeed
+        ):
+            self.accelerator.backward(loss)
+            return
+        engine = self.model
+        engine.set_gradient_accumulation_boundary(is_boundary=bool(sync))
+        engine.backward(loss)
+
+    @torch.no_grad()
+    def _clip_independent_gradient_partitions(self) -> dict[str, torch.Tensor]:
+        """Clip disjoint action/world gradients and return pre-clip metrics."""
+
+        if not self._independent_gradient_clipping:
+            return {}
+        if self._using_deepspeed:
+            return self._clip_independent_zero2_partitions()
+
+        metrics: dict[str, torch.Tensor] = {}
+        for branch, max_norm in self._independent_clip_limits.items():
+            parameters = []
+            seen: set[int] = set()
+            for group in self.optimizer.param_groups:
+                if str(group.get("gradient_partition", "")) != branch:
+                    continue
+                for parameter in group["params"]:
+                    if id(parameter) not in seen:
+                        seen.add(id(parameter))
+                        parameters.append(parameter)
+            norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm=float(max_norm))
+            norm = torch.as_tensor(norm).detach()
+            metrics[f"train/grad_norm_preclip/{branch}"] = norm
+            metrics[f"train/grad_clip_scale/{branch}"] = torch.clamp(
+                norm.new_tensor(float(max_norm)) / (norm + 1.0e-6),
+                max=1.0,
+            )
+        return metrics
+
+    @torch.no_grad()
+    def _clip_independent_zero2_partitions(self) -> dict[str, torch.Tensor]:
+        """Scale ZeRO-2 reduced shards independently before engine.step()."""
+
+        zero_optimizer = self.model.optimizer
+        inner_groups = list(zero_optimizer.optimizer.param_groups)
+        scaled_sq = {
+            branch: torch.zeros((), device=self.accelerator.device, dtype=torch.float32)
+            for branch in self._independent_clip_limits
+        }
+        group_branches: dict[int, str] = {}
+        for index, group in enumerate(inner_groups):
+            branch = str(group.get("gradient_partition", ""))
+            if branch not in scaled_sq:
+                raise RuntimeError(
+                    f"ZeRO optimizer group {index} has invalid gradient_partition={branch!r}"
+                )
+            gradients = zero_optimizer.averaged_gradients.get(index)
+            if gradients is None:
+                continue
+            params = zero_optimizer.params_in_partition[index]
+            group_norm = zero_optimizer.get_grad_norm_direct(gradients, params)
+            scaled_sq[branch] = scaled_sq[branch] + group_norm.float().square()
+            group_branches[index] = branch
+
+        loss_scale = float(zero_optimizer.loss_scale)
+        if loss_scale <= 0.0:
+            raise RuntimeError(f"DeepSpeed loss_scale must be positive, got {loss_scale}")
+        scales: dict[str, torch.Tensor] = {}
+        metrics: dict[str, torch.Tensor] = {}
+        for branch, norm_sq in scaled_sq.items():
+            norm = norm_sq.sqrt() / loss_scale
+            limit = float(self._independent_clip_limits[branch])
+            finite_scale = torch.clamp(
+                norm.new_tensor(limit) / (norm + 1.0e-6),
+                max=1.0,
+            )
+            # DeepSpeed's get_grad_norm_direct replaces NaN/Inf norms with a
+            # negative sentinel. Preserve those gradients unchanged so its
+            # overflow detector can skip the step and update the loss scale.
+            valid_norm = torch.isfinite(norm) & (norm >= 0.0)
+            scale = torch.where(valid_norm, finite_scale, norm.new_ones(()))
+            scales[branch] = scale
+            metrics[f"train/grad_norm_preclip/{branch}"] = norm.detach()
+            metrics[f"train/grad_clip_scale/{branch}"] = scale.detach()
+
+        for index, branch in group_branches.items():
+            scale = scales[branch]
+            for gradient in zero_optimizer.averaged_gradients[index]:
+                gradient.mul_(scale.to(device=gradient.device, dtype=gradient.dtype))
+        return metrics
 
     def _compute_head_sqnorms(self, task):
         """Return the active head's local sharded squared gradient norm.
@@ -1520,12 +1795,18 @@ class VLATrainer(TrainerUtils):
                     total_loss = action_loss
                 #######
 
-            self.accelerator.backward(total_loss)
+            sync = bool(self.accelerator.sync_gradients)
+            self._backward_for_current_step(total_loss, sync=sync)
 
             #######
-            sync = bool(self.accelerator.sync_gradients)
+            independent_clipping = bool(
+                getattr(self, "_independent_gradient_clipping", False)
+            )
             self._last_clip_norm = None
-            if sync and self.config.trainer.gradient_clipping is not None:
+            independent_clip_metrics: dict[str, torch.Tensor] = {}
+            if sync and independent_clipping:
+                independent_clip_metrics = self._clip_independent_gradient_partitions()
+            elif sync and self.config.trainer.gradient_clipping is not None:
                 clipped = self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
                 if clipped is not None:
                     try:
@@ -1534,10 +1815,28 @@ class VLATrainer(TrainerUtils):
                         self._last_clip_norm = None
 
             will_log = self._is_log_step(sync)
+            if will_log and independent_clip_metrics:
+                action_norm = independent_clip_metrics[
+                    "train/grad_norm_preclip/action"
+                ].float()
+                world_norm = independent_clip_metrics[
+                    "train/grad_norm_preclip/world"
+                ].float()
+                self._last_clip_norm = float(
+                    torch.linalg.vector_norm(torch.stack((action_norm, world_norm)))
+                )
             want_global_grad = will_log and bool(
                 getattr(self, "_log_global_grad_norm", False)
             )
-            want_grad = will_log and self._log_grad_norms and self._grad_groups is not None
+            # Independent clipping already reports exact pre-clip action/world
+            # norms.  The legacy head decomposition is post-clip and would mix
+            # incompatible quantities in this opt-in path.
+            want_grad = (
+                will_log
+                and not independent_clipping
+                and self._log_grad_norms
+                and self._grad_groups is not None
+            )
 
             head_logname, head_local_sq = None, None
             if want_grad:
@@ -1550,7 +1849,11 @@ class VLATrainer(TrainerUtils):
                     head_logname, head_local_sq = None, None
             #######
 
-            self.optimizer.step()
+            if independent_clipping and self._using_deepspeed:
+                if sync:
+                    self.model.step()
+            else:
+                self.optimizer.step()
             # Only step the LR scheduler when gradients are actually synced
             # (i.e., not mid-accumulation). Without this guard the scheduler
             # runs gradient_accumulation_steps times faster than intended,
@@ -1564,6 +1867,13 @@ class VLATrainer(TrainerUtils):
 
             #######
             grad_metrics = {}
+            if will_log and independent_clip_metrics:
+                grad_metrics.update(
+                    {
+                        key: float(value)
+                        for key, value in independent_clip_metrics.items()
+                    }
+                )
             if want_global_grad:
                 try:
                     total_grad_norm = self._global_grad_norm()
