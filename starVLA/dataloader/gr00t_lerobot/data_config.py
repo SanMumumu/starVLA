@@ -997,10 +997,6 @@ class AgilexData50Config:
 
 ###########################################################################################
 #######
-# 中文注释：RoboTwin 双臂 Agilex —— horizon=32 变体（与 AgilexData50Config 仅 action_indices 不同，
-# video/state/action keys 与 transforms 全部复用）。OFT 走 lerobot_datasets 时 horizon 由
-# DataConfig.action_indices 决定（非 config），故需独立类；WAM 走 jointflow 会用 config.action_horizon
-# 覆盖，但仍复用本类的 keys/transforms，从而 OFT baseline 与 WAM 在 horizon=32 下完全对齐。
 class AgilexData32Config(AgilexData50Config):
     action_indices = list(range(32))
 #######
@@ -1104,4 +1100,3 @@ ROBOT_TYPE_CONFIG_MAP = {
 
     "custom_robot_config": SingleFrankaRobotiqDeltaEefDataConfig(),
 }
-

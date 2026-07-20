@@ -15,8 +15,8 @@ import argparse
 import json
 import os
 #######
-# 中文注释：JointFlow 多任务训练需要在原生 trainer 内按 framework.tasks.weights 采样任务。
 import random
+import re
 #######
 import time
 from pathlib import Path
@@ -154,14 +154,47 @@ def setup_directories(cfg) -> Path:
     return output_dir
 
 
-def prepare_data(cfg, accelerator, output_dir) -> DataLoader:
-    """Prepare VLA training data."""
+def prepare_data(cfg, accelerator, output_dir) -> tuple[DataLoader, DataLoader | None]:
+    """Prepare training data and an optional fixed FastWAM validation split."""
     logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
 
+    world_validation = cfg.trainer.get("world_validation", {})
+    vla_val_dataloader = None
+    if hasattr(world_validation, "get") and bool(world_validation.get("enabled", False)):
+        val_fraction = float(cfg.datasets.vla_data.get("fastwam_val_fraction", 0.0))
+        if val_fraction <= 0.0:
+            raise ValueError(
+                "trainer.world_validation.enabled=true requires "
+                "datasets.vla_data.fastwam_val_fraction > 0"
+            )
+        raw_cfg = cfg.to_dict(resolve=True) if isinstance(cfg, AccessTrackedConfig) else OmegaConf.to_container(
+            cfg, resolve=True
+        )
+        val_cfg = OmegaConf.create(raw_cfg)
+        val_cfg.datasets.vla_data.fastwam_split = "val"
+        val_cfg.datasets.vla_data.per_device_batch_size = int(
+            world_validation.get("per_device_batch_size", 2)
+        )
+        if val_cfg.datasets.vla_data.per_device_batch_size <= 0:
+            raise ValueError("world_validation.per_device_batch_size must be positive")
+        if world_validation.get("num_workers", None) is not None:
+            val_cfg.datasets.vla_data.num_workers = int(world_validation.get("num_workers"))
+        logger.info(
+            "Creating fixed FastWAM world-validation split: fraction=%s seed=%s batch/device=%s",
+            val_fraction,
+            val_cfg.datasets.vla_data.fastwam_split_seed,
+            val_cfg.datasets.vla_data.per_device_batch_size,
+        )
+        vla_val_dataloader = build_dataloader(
+            cfg=val_cfg,
+            dataset_py=val_cfg.datasets.vla_data.dataset_py,
+            save_statistics=False,
+        )
+
     accelerator.dataloader_config.dispatch_batches = False
     dist.barrier()
-    return vla_train_dataloader
+    return vla_train_dataloader, vla_val_dataloader
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
@@ -194,30 +227,52 @@ def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, to
 
 
 class VLATrainer(TrainerUtils):
-    def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator):
+    _COFLOW_DASHBOARD_KEYS = frozenset(
+        {
+            "train/task",
+            "train/action_loss_raw",
+            "train/z16_loss_raw",
+            "train/world_loss_raw",
+            "train/action_loss_weighted",
+            "train/world_loss_weighted",
+            "train/world_loss_weight",
+            "train/loss_total",
+            "train/learning_rate",
+            "train/grad_norm",
+        }
+    )
+
+    def __init__(
+        self,
+        cfg,
+        model,
+        vla_train_dataloader,
+        optimizer,
+        lr_scheduler,
+        accelerator,
+        vla_val_dataloader=None,
+    ):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
+        self.vla_val_dataloader = vla_val_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.accelerator = accelerator
 
         self.completed_steps = 0
+        self._pending_full_state_path: str | None = None
         self.total_batch_size = self._calculate_total_batch_size()
         #######
-        # 中文注释：JointFlow 任务采样器只在配置含 framework.tasks.weights 时启用。
-        # 一任务/优化步（累积窗口内同 task）+ rank0 采样后 dist.broadcast 任务索引到各 rank，
-        # 彻底避免"靠同种子保持一致"的脆弱性（步数不齐/跳步会失同步 → DDP 参数 ready 不一致挂死）。
         self._jointflow_rng = random.Random(int(getattr(cfg, "seed", 42)))
         self._jointflow_tasks = None
         self._jointflow_weights = None
         self._jointflow_cur_task = None
-        self._jointflow_resample = True  # 新优化步起点置 True，窗口内复用已广播的 task
+        self._jointflow_resample = True
         framework_cfg = getattr(cfg, "framework", None)
         jointflow_cfg = getattr(framework_cfg, "jointflow", None) if framework_cfg is not None else None
         tasks_cfg = getattr(framework_cfg, "tasks", None) if framework_cfg is not None else None
         #######
-        # 中文注释：多任务采样既服务 jointflow，也服务 wam（四范式 policy/passive/fdm/idm）；任一开关开 + tasks.weights 即生效。
         wam_cfg = getattr(framework_cfg, "wam", None) if framework_cfg is not None else None
         _multitask_on = (jointflow_cfg is not None and bool(jointflow_cfg.get("enabled", False))) or (
             wam_cfg is not None and bool(wam_cfg.get("enabled", False))
@@ -234,15 +289,18 @@ class VLATrainer(TrainerUtils):
                 self._jointflow_weights = [float(weights[k]) for k in self._jointflow_tasks]
                 if not self._jointflow_tasks:
                     raise ValueError("framework.tasks.weights must contain at least one positive task weight.")
-                # ``joint_e2e`` already computes action + world losses in the
+                # Joint tasks already compute action + world losses in the
                 # same forward pass.  Sampling it together with policy/passive
                 # would silently reintroduce alternating single-objective
                 # updates and bypass the configured action->world ramp on the
                 # policy-only steps.  Treat this as a startup-time invariant,
                 # so a bad merge/config can never run for hours unnoticed.
-                if "joint_e2e" in self._jointflow_tasks and len(self._jointflow_tasks) != 1:
+                joint_tasks = {
+                    task for task in self._jointflow_tasks if task in {"joint_e2e", "joint_detached"}
+                }
+                if joint_tasks and len(self._jointflow_tasks) != 1:
                     raise ValueError(
-                        "framework.tasks.weights: joint_e2e is exclusive because it already optimizes "
+                        "framework.tasks.weights: joint_e2e/joint_detached is exclusive because it optimizes "
                         "action_loss + world_loss in every batch; positive companion tasks are not allowed. "
                         f"Active tasks: {self._jointflow_tasks}."
                     )
@@ -252,28 +310,30 @@ class VLATrainer(TrainerUtils):
                         self._jointflow_tasks,
                         self._jointflow_weights,
                     )
-                    if self._jointflow_tasks == ["joint_e2e"]:
+                    if self._jointflow_tasks in (["joint_e2e"], ["joint_detached"]):
                         logger.info(
-                            "Verified joint E2E objective: every optimizer step uses one batch for "
-                            "action_loss + weighted world_loss; no policy/passive alternation."
+                            "Verified %s objective: every optimizer step uses one batch for "
+                            "action_loss + weighted world_loss; no policy/passive alternation.",
+                            self._jointflow_tasks[0],
                         )
         #######
 
         #######
-        # 中文注释：per-task loss + 梯度范数日志状态。一任务/优化步 → 在线 grad_norm 都是**单任务**梯度。
-        # **梯度记录总开关** `trainer.log_grad_norms`（别名 log_grad_norm_per_head 兼容旧名）。
-        #   true  → 记全部 per-task 梯度（grad_norm_total/<task> + shared/<task> + head/<task>）；
-        #   false → **一概不算**（连 grad_norm_total 都不取）→ 训练零梯度开销。loss 不受影响、始终记（很便宜）。
-        # 需要看梯度时置 true、不需要时 false。默认 false（最快）。
         _gflag = getattr(cfg.trainer, "log_grad_norms", None)
         if _gflag is None:
             _gflag = getattr(cfg.trainer, "log_grad_norm_per_head", False)
         self._log_grad_norms = bool(_gflag)
-        self._grad_groups = None          # {shared, policy_head, world_model_head} -> [param,...]（prepare 后构建）
-        self._task_head = {}              # task -> 该任务非零梯度的 head 组名
-        self._task_logname = {}           # task -> 日志名（idm→inverse）
+        # Cheap scalar norm for the main experiment panel.  Under DeepSpeed
+        # this reads the engine's already-reduced norm and adds no collective;
+        # per-head decomposition remains controlled separately above.
+        self._log_global_grad_norm = bool(
+            getattr(cfg.trainer, "log_global_grad_norm", False)
+        )
+        self._grad_groups = None
+        self._task_head = {}
+        self._task_logname = {}
         self._using_deepspeed = "DEEPSPEED" in str(getattr(accelerator, "distributed_type", "")).upper()
-        self._last_clip_norm = None       # 非 DeepSpeed 时 clip_grad_norm_ 的返回（总范数）兜底
+        self._last_clip_norm = None
         self._grad_warned = False
         #######
 
@@ -297,19 +357,26 @@ class VLATrainer(TrainerUtils):
         )
         self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
         self.print_trainable_parameters(self.model)
+        self._validate_joint_world_optimizer_contract()
+        self._validate_wam_two_stage_runtime_contract()
 
-        self.model, self.optimizer, self.vla_train_dataloader = self.setup_distributed_training(
-            self.accelerator,
-            self.model,
-            self.optimizer,
-            self.vla_train_dataloader,
-        )
+        self._prepare_distributed_components()
+
+        # The historical loop intentionally steps the raw Transformers
+        # scheduler itself instead of wrapping it with Accelerator.  Register
+        # that scheduler as a checkpointable object so save_state/load_state
+        # also preserves its exact step and per-group LR without changing the
+        # established stepping semantics.
+        self.accelerator.register_for_checkpointing(self.lr_scheduler)
+
+        # Full optimizer/scheduler state can only be restored after Accelerate
+        # has registered and wrapped every training object.
+        self._restore_pending_full_training_state()
 
         self._validate_runtime_batch_contract()
         self._configure_unused_param_anchors()
 
         #######
-        # 中文注释：在 accelerator 包装后，从**未包装**模型构建梯度分组（shared/policy_head/world_model_head）。
         if self._log_grad_norms:
             try:
                 base_model = self.accelerator.unwrap_model(self.model)
@@ -320,13 +387,204 @@ class VLATrainer(TrainerUtils):
                         {k: len(v) for k, v in self._grad_groups.items()},
                         self._using_deepspeed,
                     )
-            except Exception as e:  # 构建失败 → 关闭 per-head 梯度日志，训练照常
+            except Exception as e:
                 logger.warning("build_task_grad_groups failed (%s); disabling per-head grad logging.", e)
                 self._log_grad_norms = False
                 self._grad_groups = None
         #######
 
         self._init_wandb()
+
+    def _prepare_distributed_components(self) -> None:
+        """Initialize DeepSpeed from the train loader, then shard validation.
+
+        Accelerate resolves DeepSpeed's ``train_micro_batch_size_per_gpu=auto``
+        from every dataloader passed to one ``prepare`` call.  Its default
+        ``is_train_batch_min=True`` therefore chose the 2-sample world-val
+        loader instead of the 12-sample train loader.  Prepare the engine with
+        the train loader alone; validation still needs distributed sharding,
+        but must not participate in the engine's training-batch ABI.
+        """
+
+        prepared = self.setup_distributed_training(
+            self.accelerator,
+            self.model,
+            self.optimizer,
+            self.vla_train_dataloader,
+        )
+        self.model, self.optimizer, self.vla_train_dataloader = prepared
+        if self.vla_val_dataloader is not None:
+            self.vla_val_dataloader = self.accelerator.prepare_data_loader(
+                self.vla_val_dataloader
+            )
+
+    def _validate_joint_world_optimizer_contract(self) -> None:
+        """Fail before distributed launch if the joint world head cannot update."""
+
+        if self._jointflow_tasks not in (["joint_e2e"], ["joint_detached"]):
+            return
+        visual_head = getattr(self.model, "wam_visual_head", None)
+        if not isinstance(visual_head, torch.nn.Module):
+            raise RuntimeError(
+                f"{self._jointflow_tasks[0]} requires a trainable wam_visual_head"
+            )
+        visual_params = [parameter for parameter in visual_head.parameters() if parameter.requires_grad]
+        if not visual_params:
+            raise RuntimeError(
+                f"{self._jointflow_tasks[0]} has no trainable wam_visual_head parameters; "
+                "check trainer.freeze_modules"
+            )
+        world_params = list(visual_params)
+        state_context = getattr(self.model, "wam_state_ctx", None)
+        if isinstance(state_context, torch.nn.Module):
+            state_params = [parameter for parameter in state_context.parameters() if parameter.requires_grad]
+            if not state_params:
+                raise RuntimeError(
+                    "world_condition_on_state is enabled but wam_state_ctx has no trainable parameters"
+                )
+            world_params.extend(state_params)
+
+        # Transformers schedulers set the *current* optimizer LR to zero at
+        # scheduler construction when linear/cosine warmup starts at step 0.
+        # The configured, update-capable LR is retained in ``initial_lr``.
+        # Validate that base LR here; checking only ``lr`` rejects every valid
+        # warmup run before its first optimizer step.
+        optimizer_lrs: dict[int, tuple[str, float, float]] = {}
+        for index, group in enumerate(self.optimizer.param_groups):
+            name = str(group.get("name", index))
+            current_lr = float(group.get("lr", 0.0))
+            initial_lr = float(group.get("initial_lr", current_lr))
+            for parameter in group["params"]:
+                optimizer_lrs[id(parameter)] = (name, initial_lr, current_lr)
+        missing = [parameter for parameter in world_params if id(parameter) not in optimizer_lrs]
+        if missing:
+            raise RuntimeError(
+                f"{len(missing)} trainable world-predictor parameters are absent from the optimizer"
+            )
+        groups = {optimizer_lrs[id(parameter)] for parameter in world_params}
+        bad_groups = sorted(
+            (name, initial_lr)
+            for name, initial_lr, _current_lr in groups
+            if initial_lr <= 0.0
+        )
+        if bad_groups:
+            raise RuntimeError(
+                "World-predictor optimizer LR must be positive "
+                f"(scheduler initial/base LR), got {bad_groups}"
+            )
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Verified joint world optimizer: task=%s params=%d "
+                "groups=(name, initial_lr, current_lr)=%s",
+                self._jointflow_tasks[0],
+                sum(parameter.numel() for parameter in world_params),
+                sorted(groups),
+            )
+
+    def _validate_wam_two_stage_runtime_contract(self) -> None:
+        """Verify actual requires-grad state after checkpoint load and freezing."""
+
+        phase = str(self.config.trainer.get("wam_two_stage_phase", "")).lower()
+        if not phase:
+            return
+        recipe = str(
+            self.config.trainer.get("wam_two_stage_recipe", "legacy_v1")
+            or "legacy_v1"
+        ).lower()
+        guidance = self.config.framework.get("wam", {}).get("guidance", {})
+        world_to_action_enabled = bool(guidance.get("world_to_action_enabled", True))
+
+        def trainable(module_name: str) -> list[torch.nn.Parameter]:
+            module = getattr(self.model, module_name, None)
+            if not isinstance(module, torch.nn.Module):
+                return []
+            return [parameter for parameter in module.parameters() if parameter.requires_grad]
+
+        gates = [
+            parameter
+            for name, parameter in self.model.named_parameters()
+            if name.rsplit(".", 1)[-1] == "world_gate"
+        ]
+        action_dit = getattr(getattr(self.model, "action_model", None), "model", None)
+        blocks = getattr(action_dit, "transformer_blocks", ())
+        world_action_modules = [
+            module
+            for block in blocks
+            for module in (
+                getattr(block, "world_attn", None),
+                getattr(block, "world_to_temb", None),
+            )
+            if isinstance(module, torch.nn.Module)
+        ]
+        if isinstance(getattr(action_dit, "world_to_temb", None), torch.nn.Module):
+            world_action_modules.append(action_dit.world_to_temb)
+        world_action_modules.extend(
+            module
+            for module_name in (
+                "world_adapter",
+                "world_fusion",
+                "world_qformer",
+                "world_pooler",
+            )
+            if isinstance((module := getattr(self.model, module_name, None)), torch.nn.Module)
+        )
+        if world_to_action_enabled:
+            if not gates:
+                raise RuntimeError(f"WAM two-stage {phase} exposes no world_gate parameters")
+            max_gate = max(float(torch.tanh(gate.detach().float()).abs().max()) for gate in gates)
+            if max_gate > 1.0e-7:
+                raise RuntimeError(
+                    f"WAM two-stage {phase} must start with closed world gates, max openness={max_gate:.6g}"
+                )
+        else:
+            if phase != "predictor_warmup":
+                raise RuntimeError(
+                    "world_to_action_enabled=false is only valid for predictor_warmup"
+                )
+            if gates or world_action_modules:
+                raise RuntimeError(
+                    "No-world-to-action baseline instantiated forbidden gate/adapter/attention modules: "
+                    f"gates={len(gates)} modules={len(world_action_modules)}"
+                )
+            max_gate = 0.0
+
+        if phase == "predictor_warmup":
+            if not trainable("wam_visual_head") or not trainable("wam_state_ctx"):
+                raise RuntimeError("predictor_warmup requires trainable visual head and state conditioner")
+            if recipe in {"policy_first_v2", "baseline_preserving_v3"}:
+                if not trainable("qwen_vl_interface"):
+                    raise RuntimeError(
+                        f"{recipe} predictor_warmup requires trainable Qwen so action loss can update it"
+                    )
+                if not trainable("action_model"):
+                    raise RuntimeError(
+                        f"{recipe} predictor_warmup requires a trainable action model"
+                    )
+        elif phase == "gate_ft":
+            unexpectedly_trainable = {
+                name: len(trainable(name))
+                for name in ("qwen_vl_interface", "wam_visual_head", "wam_state_ctx", "wam_act_ctx")
+                if trainable(name)
+            }
+            if unexpectedly_trainable:
+                raise RuntimeError(
+                    "gate_ft world/Qwen modules were not frozen: " + str(unexpectedly_trainable)
+                )
+            if not trainable("action_model") or not trainable("world_adapter"):
+                raise RuntimeError("gate_ft requires trainable action_model and world_adapter")
+        else:
+            raise RuntimeError(f"Unsupported wam_two_stage_phase={phase!r}")
+
+        if self.accelerator.is_main_process:
+            logger.info(
+                "Verified WAM two-stage runtime: phase=%s recipe=%s "
+                "world_to_action=%s gates=%d max_initial_openness=%.3g",
+                phase,
+                recipe,
+                world_to_action_enabled,
+                len(gates),
+                max_gate,
+            )
 
     @staticmethod
     def _runtime_int(obj, name: str):
@@ -349,6 +607,14 @@ class VLATrainer(TrainerUtils):
 
         expected_micro_batch = int(self.config.datasets.vla_data.per_device_batch_size)
         expected_global_batch = expected_micro_batch * int(self.accelerator.num_processes) * expected_accumulation
+        declared_global_batch = self.config.trainer.get("expected_global_batch_size", None)
+        if declared_global_batch is not None and expected_global_batch != int(declared_global_batch):
+            raise RuntimeError(
+                "Runtime topology violates trainer.expected_global_batch_size: "
+                f"micro={expected_micro_batch} x world={self.accelerator.num_processes} x "
+                f"accumulation={expected_accumulation} = {expected_global_batch}, "
+                f"declared={int(declared_global_batch)}."
+            )
         engine_values = {}
         if self._using_deepspeed:
             for name, expected in (
@@ -454,17 +720,51 @@ class VLATrainer(TrainerUtils):
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         pretrained_checkpoint = getattr(self.config.trainer, "pretrained_checkpoint", None)
-        is_resume = getattr(self.config.trainer, "is_resume", False)
+        is_resume = bool(getattr(self.config.trainer, "is_resume", False))
+        reset_world_gates = bool(
+            getattr(self.config.trainer, "reset_world_gates_after_pretrained_load", False)
+        )
         self.resume_from_checkpoint = pretrained_checkpoint
 
         if is_resume:
+            explicit_state = getattr(self.config.trainer, "resume_state_path", None)
+            if explicit_state:
+                state_path, state_step = self._validate_full_state_checkpoint(explicit_state)
+            else:
+                state_path, state_step = self._get_latest_full_state_checkpoint(self.checkpoint_dir)
+            if state_path:
+                self._pending_full_state_path = state_path
+                self.resume_from_checkpoint = state_path
+                self.completed_steps = state_step
+                logger.info(
+                    "Preparing full optimizer/scheduler resume from %s at step %d",
+                    state_path,
+                    state_step,
+                )
+                if reset_world_gates:
+                    logger.info(
+                        "Ignoring reset_world_gates_after_pretrained_load during exact full-state resume; "
+                        "the restored gate values are preserved"
+                    )
+                return
+
+            # Backward-compatible fallback for historical weight-only runs.
+            # This cannot restore Adam moments; the scheduler is reconstructed
+            # deterministically below and the limitation is made explicit.
             resume_from_checkpoint, self.completed_steps = self._get_latest_checkpoint(self.checkpoint_dir)
             if resume_from_checkpoint:
                 self.resume_from_checkpoint = resume_from_checkpoint
                 self.model = self.load_pretrained_backbones(self.model, self.resume_from_checkpoint, reload_modules=None)
                 logger.info(
-                    f"Resuming training from checkpoint: {self.resume_from_checkpoint}, steps: {self.completed_steps}"
+                    "Legacy weight-only resume from %s at step %d; optimizer moments are unavailable",
+                    self.resume_from_checkpoint,
+                    self.completed_steps,
                 )
+                if reset_world_gates:
+                    logger.info(
+                        "Ignoring reset_world_gates_after_pretrained_load during legacy in-run resume; "
+                        "the saved Stage-2 gate values are preserved"
+                    )
                 return
 
             logger.warning(f"No valid checkpoint found in {self.checkpoint_dir}. Starting training from scratch.")
@@ -473,15 +773,36 @@ class VLATrainer(TrainerUtils):
         if pretrained_checkpoint:
             reload_modules = getattr(self.config.trainer, "reload_modules", None)
             self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
+            if reset_world_gates:
+                if reload_modules:
+                    raise ValueError(
+                        "reset_world_gates_after_pretrained_load requires a full pretrained load; "
+                        "trainer.reload_modules must be empty"
+                    )
+                gate_summary = self._reset_world_gate_parameters(self.model, value=0.0)
+                logger.info(
+                    "Reset %d oracle-trained world gates after loading %s "
+                    "(mean openness %.6f -> %.6f)",
+                    gate_summary["count"],
+                    pretrained_checkpoint,
+                    gate_summary["before_openness"],
+                    gate_summary["after_openness"],
+                )
             self.completed_steps = 0
             self.resume_from_checkpoint = pretrained_checkpoint
             logger.info(f"Loaded pretrained checkpoint: {pretrained_checkpoint}, steps: {self.completed_steps}")
         else:
+            if reset_world_gates:
+                raise ValueError(
+                    "reset_world_gates_after_pretrained_load=true requires trainer.pretrained_checkpoint"
+                )
             logger.info("No pretrained checkpoint provided. Starting training from scratch.")
             self.completed_steps = 0
 
     def _adjust_lr_scheduler_for_resume(self):
         """Adjust LR scheduler state after resuming from non-zero steps."""
+        if self._pending_full_state_path is not None:
+            return
         if self.completed_steps > 0:
             logger.info(f"Adjusting LR scheduler for resume from step {self.completed_steps}")
             for _ in range(self.completed_steps):
@@ -490,16 +811,120 @@ class VLATrainer(TrainerUtils):
                 f"LR scheduler adjusted to step {self.completed_steps}, current LR: {self.lr_scheduler.get_last_lr()}"
             )
 
-    def _load_checkpoint(self, checkpoint_path):
-        """Load checkpoint."""
-        self.accelerator.load_state(checkpoint_path)
-        self.accelerator.print(f"Resumed from checkpoint: {checkpoint_path}")
+    @staticmethod
+    def _reset_world_gate_parameters(model, value: float = 0.0) -> dict[str, float | int]:
+        """Reset only M5/M6 world residual gates after a weight-only load."""
+
+        gates = [
+            (name, parameter)
+            for name, parameter in model.named_parameters()
+            if name.rsplit(".", 1)[-1] == "world_gate"
+        ]
+        if not gates:
+            raise RuntimeError(
+                "reset_world_gates_after_pretrained_load=true but the model exposes no world_gate parameters"
+            )
+        before = torch.cat(
+            [torch.tanh(parameter.detach().float()).abs().reshape(-1) for _, parameter in gates]
+        ).mean()
+        with torch.no_grad():
+            for _, parameter in gates:
+                parameter.fill_(float(value))
+        after = torch.cat(
+            [torch.tanh(parameter.detach().float()).abs().reshape(-1) for _, parameter in gates]
+        ).mean()
+        return {
+            "count": len(gates),
+            "before_openness": float(before),
+            "after_openness": float(after),
+        }
+
+    @staticmethod
+    def _full_state_metadata_path(state_path: str | Path) -> Path:
+        return Path(state_path) / "trainer_state.json"
+
+    @classmethod
+    def _validate_full_state_checkpoint(cls, state_path: str | Path) -> tuple[str | None, int]:
+        state_path = Path(state_path)
+        success_path = state_path / "_SUCCESS"
+        metadata_path = cls._full_state_metadata_path(state_path)
+        if not state_path.is_dir() or not success_path.is_file() or not metadata_path.is_file():
+            raise FileNotFoundError(
+                f"Incomplete full training-state checkpoint: {state_path}; "
+                "expected trainer_state.json and _SUCCESS"
+            )
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        step = int(metadata["steps"])
+        match = re.fullmatch(r"steps_(\d+)_state", state_path.name)
+        if match is not None and int(match.group(1)) != step:
+            raise ValueError(
+                f"Full-state checkpoint step mismatch: directory={state_path.name}, metadata={step}"
+            )
+        return str(state_path), step
+
+    @classmethod
+    def _get_latest_full_state_checkpoint(cls, checkpoint_dir: str | Path) -> tuple[str | None, int]:
+        checkpoint_dir = Path(checkpoint_dir)
+        if not checkpoint_dir.is_dir():
+            return None, 0
+        candidates: list[tuple[int, str]] = []
+        for state_path in checkpoint_dir.iterdir():
+            if not state_path.is_dir() or re.fullmatch(r"steps_(\d+)_state", state_path.name) is None:
+                continue
+            try:
+                validated_path, step = cls._validate_full_state_checkpoint(state_path)
+            except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            candidates.append((step, validated_path))
+        if not candidates:
+            return None, 0
+        step, state_path = max(candidates, key=lambda item: item[0])
+        return state_path, step
+
+    def _restore_pending_full_training_state(self) -> None:
+        state_path = self._pending_full_state_path
+        if state_path is None:
+            return
+        metadata_path = self._full_state_metadata_path(state_path)
+        with metadata_path.open("r", encoding="utf-8") as handle:
+            metadata = json.load(handle)
+        saved_world_size = int(metadata.get("world_size", self.accelerator.num_processes))
+        if saved_world_size != int(self.accelerator.num_processes):
+            raise RuntimeError(
+                "DeepSpeed full-state resume requires the saved data-parallel world size: "
+                f"saved={saved_world_size}, current={self.accelerator.num_processes}"
+            )
+        saved_accumulation = int(
+            metadata.get(
+                "gradient_accumulation_steps",
+                self.accelerator.gradient_accumulation_steps,
+            )
+        )
+        if saved_accumulation != int(self.accelerator.gradient_accumulation_steps):
+            raise RuntimeError(
+                "Full-state resume requires the saved gradient accumulation setting: "
+                f"saved={saved_accumulation}, current={self.accelerator.gradient_accumulation_steps}"
+            )
+        self.accelerator.load_state(input_dir=state_path)
+        extras_path = Path(state_path) / "trainer_extras.pt"
+        if extras_path.is_file():
+            extras = torch.load(extras_path, map_location="cpu", weights_only=False)
+            rng_state = extras.get("jointflow_rng_state")
+            if rng_state is not None:
+                self._jointflow_rng.setstate(rng_state)
+        logger.info(
+            "Restored full training state from %s at step %d; current LR=%s",
+            state_path,
+            self.completed_steps,
+            self.lr_scheduler.get_last_lr(),
+        )
 
     def _save_checkpoint(self):
         """Save current training state."""
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
         if self.accelerator.is_main_process:
             save_format = getattr(self.config.trainer, "save_format", "pt")
-            checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
 
             state_dict = self.accelerator.get_state_dict(self.model)
             if save_format == "safetensors":
@@ -522,18 +947,84 @@ class VLATrainer(TrainerUtils):
                 self.config.save_accessed_config(output_dir / "config.yaml", use_original_values=False)
                 logger.info("✅ Configuration files saved")
 
+        # Do not let non-main ranks enter DeepSpeed's collective state save
+        # while rank 0 is still materializing the portable weight checkpoint.
+        self.accelerator.wait_for_everyone()
+        if bool(getattr(self.config.trainer, "save_full_training_state", False)):
+            full_state_path = checkpoint_path + "_state"
+            # `_SUCCESS` is the commit marker.  Remove it before rewriting an
+            # existing step so a preemption during save can never make a
+            # partial optimizer shard look resumable.
+            if self.accelerator.is_main_process:
+                (Path(full_state_path) / "_SUCCESS").unlink(missing_ok=True)
+            self.accelerator.wait_for_everyone()
+            self.accelerator.save_state(output_dir=full_state_path)
+            self.accelerator.wait_for_everyone()
+            if self.accelerator.is_main_process:
+                metadata = {
+                    "steps": int(self.completed_steps),
+                    "world_size": int(self.accelerator.num_processes),
+                    "gradient_accumulation_steps": int(self.accelerator.gradient_accumulation_steps),
+                }
+                with self._full_state_metadata_path(full_state_path).open("w", encoding="utf-8") as handle:
+                    json.dump(metadata, handle, ensure_ascii=True, indent=2)
+                torch.save(
+                    {"jointflow_rng_state": self._jointflow_rng.getstate()},
+                    Path(full_state_path) / "trainer_extras.pt",
+                )
+                (Path(full_state_path) / "_SUCCESS").touch()
+                logger.info("Saved resumable optimizer/scheduler state at %s", full_state_path)
+
         self.accelerator.wait_for_everyone()
 
     def _log_metrics(self, metrics):
         """Record training metrics."""
-        if self.completed_steps % self.config.trainer.logging_frequency == 0 and dist.get_rank() == 0:
+        has_validation = any(str(key).startswith("val/") for key in metrics)
+        if (
+            (self.completed_steps % self.config.trainer.logging_frequency == 0 or has_validation)
+            and dist.get_rank() == 0
+        ):
             last_lrs = self.lr_scheduler.get_last_lr()
-            for i, group in enumerate(self.optimizer.param_groups):
-                group_name = group.get("name", str(i))
-                metrics[f"learning_rate/{group_name}"] = last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
-            metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+            if metrics.get("train/task") == "action_world_coflow":
+                # Keep the permanent Co-Flow dashboard intentionally small.
+                # Audit ratios remain model outputs covered by regressions but
+                # aren't experiment-result time series.
+                metrics = self._filter_coflow_dashboard_metrics(metrics)
+                # The joint co-flow transformer lives under action_model; its
+                # LR is the single policy-primary curve requested for the main
+                # dashboard.  Qwen/base group details remain in saved config.
+                primary_index = next(
+                    (
+                        index
+                        for index, group in enumerate(self.optimizer.param_groups)
+                        if group.get("name") == "action_model"
+                    ),
+                    0,
+                )
+                metrics["train/learning_rate"] = (
+                    last_lrs[primary_index]
+                    if primary_index < len(last_lrs)
+                    else last_lrs[-1]
+                )
+            else:
+                for i, group in enumerate(self.optimizer.param_groups):
+                    group_name = group.get("name", str(i))
+                    metrics[f"learning_rate/{group_name}"] = (
+                        last_lrs[i] if i < len(last_lrs) else last_lrs[-1]
+                    )
+                metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
             wandb.log(metrics, step=self.completed_steps)
             logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+
+    @classmethod
+    def _filter_coflow_dashboard_metrics(cls, metrics: dict) -> dict:
+        """Pure helper used by contract tests and external dashboard tooling."""
+
+        return {
+            key: value
+            for key, value in metrics.items()
+            if key in cls._COFLOW_DASHBOARD_KEYS
+        }
 
     def _create_data_iterators(self):
         """Create data iterators."""
@@ -554,9 +1045,6 @@ class VLATrainer(TrainerUtils):
         return batch_vla
 
     #######
-    # 中文注释：JointFlow 任务采样：未配置 tasks.weights 时返回 None（回落旧 action_loss）。
-    # 一任务/优化步——仅在 _jointflow_resample=True（新优化步起点）时由 rank0 采样并 dist.broadcast
-    # 任务索引到各 rank，累积窗口内复用同一 task；保证 DDP 各 rank 每步选同一任务、参数 ready 集合一致。
     def _sample_jointflow_task(self) -> str | None:
         if not self._jointflow_tasks:
             return None
@@ -565,19 +1053,19 @@ class VLATrainer(TrainerUtils):
         idx = self._jointflow_rng.choices(range(len(self._jointflow_tasks)), weights=self._jointflow_weights, k=1)[0]
         if dist.is_available() and dist.is_initialized():
             idx_t = torch.tensor([idx], device=self.accelerator.device, dtype=torch.long)
-            dist.broadcast(idx_t, src=0)  # 以 rank0 选择为准
+            dist.broadcast(idx_t, src=0)
             idx = int(idx_t.item())
         self._jointflow_cur_task = self._jointflow_tasks[idx]
         self._jointflow_resample = False
         return self._jointflow_cur_task
 
-    # 中文注释：模型每个 task 返回的 loss key 名 / 日志名（idm→inverse，对齐需求）。
     _TASK_LOSS_KEY = {
         "policy": "action_loss",
         "idm": "idm_loss",
         "fdm": "fdm_loss",
         "passive": "passive_loss",
         "joint_e2e": "action_loss",
+        "joint_detached": "action_loss",
     }
     _TASK_LOGNAME = {
         "policy": "policy",
@@ -585,19 +1073,23 @@ class VLATrainer(TrainerUtils):
         "fdm": "fdm",
         "passive": "passive",
         "joint_e2e": "joint_e2e",
+        "joint_detached": "joint_detached",
     }
 
     @classmethod
     def _build_loss_metrics(cls, output_dict: dict, task: str, total_loss: torch.Tensor) -> dict:
-        """per-task 原始/加权/total loss（train/ 前缀）。一任务/优化步 → 每步只记当前 task，
-        **不为未启用任务写零值**。区分 raw（视觉头原始 MSE，模型返回的 *_loss_raw）与 weighted（× 权重，实际反传）。
-        policy/idm 无内部权重 → raw == weighted。"""
-        if task == "joint_e2e":
+        """Build raw, weighted, and total metrics for the sampled task only.
+
+        Inactive tasks do not receive synthetic zero-valued metrics. Raw values
+        are pre-weight visual losses; weighted values are the actual backward
+        objectives. Policy and inverse losses have no internal multiplier.
+        """
+        if task in {"joint_e2e", "joint_detached"}:
             action = output_dict["action_loss"]
             world = output_dict["world_loss"]
             world_raw = output_dict.get("world_loss_raw", world)
             ratio = world.detach().abs() / action.detach().abs().clamp_min(1.0e-12)
-            return {
+            metrics = {
                 "train/task": task,
                 "train/loss_total": float(total_loss.detach()),
                 "train/loss_policy": float(action.detach()),
@@ -608,6 +1100,18 @@ class VLATrainer(TrainerUtils):
                 "train/loss_world_raw": float(world_raw.detach()),
                 "train/world_to_policy_loss_ratio": float(ratio),
                 "train/action_world_grad_scale": float(output_dict["action_world_grad_scale"].detach()),
+                "train/action_world_bypassed": float(
+                    output_dict.get("action_world_bypassed", action.new_zeros(())).detach()
+                ),
+                "train/action_backbone_detached": float(
+                    output_dict.get("action_backbone_detached", action.new_zeros(())).detach()
+                ),
+                "train/world_backbone_detached": float(
+                    output_dict.get("world_backbone_detached", action.new_zeros(())).detach()
+                ),
+                "train/baseline_action_context": float(
+                    output_dict.get("baseline_action_context", action.new_zeros(())).detach()
+                ),
                 # Effective residual multiplier is tanh(raw_gate): 0=closed,
                 # 1=full-magnitude world cross-attention.  Mean absolute value
                 # is the clearest single "open degree"; signed/max expose
@@ -616,10 +1120,19 @@ class VLATrainer(TrainerUtils):
                 "train/world_gate_signed_mean": float(output_dict["world_gate_signed_mean"].detach()),
                 "train/world_gate_max_openness": float(output_dict["world_gate_max_openness"].detach()),
             }
+            for source_key, log_key in (
+                ("world_flow_loss_raw", "train/world_flow_loss_raw"),
+                ("world_clean_loss_raw", "train/world_clean_loss_raw"),
+                ("world_cosine_loss_raw", "train/world_cosine_loss_raw"),
+            ):
+                value = output_dict.get(source_key)
+                if value is not None:
+                    metrics[log_key] = float(value.detach())
+            return metrics
         logname = cls._TASK_LOGNAME.get(task, task)
         loss_key = cls._TASK_LOSS_KEY.get(task, f"{task}_loss")
         weighted = output_dict.get(loss_key)
-        if weighted is None:  # 兜底：取任一以 _loss 结尾的张量
+        if weighted is None:
             for k, v in output_dict.items():
                 if torch.is_tensor(v) and k.endswith("_loss"):
                     weighted = v
@@ -658,28 +1171,44 @@ class VLATrainer(TrainerUtils):
         # ``action_loss`` remains the trainer's single optimization ABI and is
         # the weighted action+world total for Co-Flow.  Do not label that total
         # as policy loss in W&B.
-        return {
+        metrics = {
             "train/task": "action_world_coflow",
             "train/loss_total": float(total_loss.detach()),
-            "train/loss_action": float(output_dict["coflow_action_loss_raw"].detach()),
-            "train/loss_action_raw": float(output_dict["coflow_action_loss_raw"].detach()),
-            "train/loss_action_weighted": float(
+            "train/action_loss_raw": float(output_dict["coflow_action_loss_raw"].detach()),
+            "train/z16_loss_raw": float(output_dict["coflow_z16_loss_raw"].detach()),
+            "train/world_loss_raw": float(output_dict["coflow_world_loss_raw"].detach()),
+            "train/action_loss_weighted": float(
                 output_dict["coflow_action_loss_weighted"].detach()
             ),
-            "train/loss_world": float(output_dict["coflow_world_loss_raw"].detach()),
-            "train/loss_world_raw": float(output_dict["coflow_world_loss_raw"].detach()),
-            "train/loss_world_weighted": float(
+            "train/world_loss_weighted": float(
                 output_dict["coflow_world_loss_weighted"].detach()
             ),
         }
+        if "coflow_world_loss_weight" in output_dict:
+            metrics["train/world_loss_weight"] = float(
+                output_dict["coflow_world_loss_weight"].detach()
+            )
+        return metrics
 
-    # ---- 梯度范数日志（全部单任务梯度；ZeRO-2 下从 DeepSpeed 取全局范数 + 仅 gather 小 head）----
+    def _current_display_task_name(self) -> str:
+        """Return the progress/timing label without affecting task sampling."""
+
+        if self._jointflow_cur_task is not None:
+            return str(self._jointflow_cur_task)
+        framework_cfg = getattr(self.config, "framework", None)
+        if bool(
+            framework_cfg is not None
+            and framework_cfg.get("enable_action_world_coflow", False)
+        ):
+            return "action_world_coflow"
+        return "action"
+
     def _is_log_step(self, sync_gradients: bool) -> bool:
-        """与 _log_metrics 对齐：仅 sync 步、且本步完成后 completed_steps(+1) 命中 logging_frequency 才记。"""
+        """Return whether this synchronized optimizer step should be logged."""
         return bool(sync_gradients) and (self.completed_steps + 1) % self.config.trainer.logging_frequency == 0
 
     def _global_grad_norm(self):
-        """DeepSpeed 全局梯度范数（已 unscale、已跨 rank 规约、已 clip 前）；拿不到回退非-DS 的 clip 返回值。"""
+        """Read the unscaled, globally reduced, pre-clipping gradient norm."""
         try:
             m = self.model
             if hasattr(m, "get_global_grad_norm"):
@@ -696,36 +1225,47 @@ class VLATrainer(TrainerUtils):
         return self._last_clip_norm
 
     def _compute_head_sqnorms(self, task):
-        """当前任务那个 head 的梯度**本地分片**平方和（GPU 标量，**零 collective**）。backward 后、step 前调用。
-        一任务/优化步 → 非活跃 head 梯度精确=0（anchor，已验证）→ 只需活跃 head；shared=√(total²−active²) 仍精确。
-        返回 (head_logname, local_sq_tensor)；local 平方和由调用方做 **1 次** all_reduce 汇成全局（失同步面=1 次匹配标量规约）。"""
+        """Return the active head's local sharded squared gradient norm.
+
+        This runs after backward and before step with no collective. Inactive
+        heads are zero-anchored, so one later scalar all-reduce is sufficient
+        to recover the exact global head norm.
+        """
         active = self._task_head.get(task) if task is not None else None
         if active is None or active not in self._grad_groups:
             return None, None
-        local_sq = group_grad_local_sqnorm(self._grad_groups[active])   # 零通信；始终返回张量
+        local_sq = group_grad_local_sqnorm(self._grad_groups[active])
         logname = self._task_logname.get(task, task)
         return logname, local_sq
 
     def _finalize_grad_metrics(self, task, head_logname, head_local_sq) -> dict:
-        """step 后汇总。**一任务/优化步 → 全部按采样到的任务分曲线**（`.../<task>`），4 任务 1:1:1:1 时
-        wandb 每个机制各一条线，可直接叠加对比"每个任务对梯度的影响"。
+        """Finalize task-scoped total, shared-backbone, and head grad norms.
 
-        全部受总开关 log_grad_norms 控（off 时本函数根本不会被调到，零开销）。on 时：
-        - `train/grad_norm_total/<task>`：该任务整步总梯度范数（取自 DeepSpeed 全局，无 collective）；
-        - `train/grad_norm_shared/<task>`：该任务对**共享 Qwen 骨干**的梯度（= sqrt(total²−head²)，参数集互不相交 Pythagoras）；
-        - `train/grad_norm_head/<task>`：该任务**自己 head** 的梯度（本地分片平方和 + 1 次 all_reduce 汇全局）。"""
+        Each optimizer step samples one task, so every curve is attributed to
+        that task directly. ``log_grad_norms=false`` bypasses this path. The
+        head norm requires one scalar all-reduce; the disjoint shared norm is
+        recovered with ``sqrt(total^2 - head^2)``.
+        """
         m = {}
         logname = head_logname or (self._task_logname.get(task, task) if task is not None else "action")
         total = self._global_grad_norm()
         if total is not None:
             m[f"train/grad_norm_total/{logname}"] = total
         if head_local_sq is not None:
-            # 中文注释：唯一的在线 collective——1 次标量 all_reduce(SUM)，把本地分片平方和汇成全局。各 rank 由 will_log 一致触发 → 匹配、不失同步。
             if self._using_deepspeed and dist.is_available() and dist.is_initialized():
                 dist.all_reduce(head_local_sq, op=dist.ReduceOp.SUM)
             head_sq = float(head_local_sq.item())
-            m[f"train/grad_norm_head/{logname}"] = head_sq ** 0.5
-            if total is not None:
+            head_norm = head_sq ** 0.5
+            if task in {"joint_e2e", "joint_detached"}:
+                m["train/world_head_grad_norm"] = head_norm
+                if total is not None:
+                    m["train/policy_grad_norm"] = max(
+                        total * total - head_sq,
+                        0.0,
+                    ) ** 0.5
+            else:
+                m[f"train/grad_norm_head/{logname}"] = head_norm
+            if total is not None and task not in {"joint_e2e", "joint_detached"}:
                 m[f"train/grad_norm_shared/{logname}"] = max(total * total - head_sq, 0.0) ** 0.5
         return m
     #######
@@ -750,7 +1290,7 @@ class VLATrainer(TrainerUtils):
             t_end_model = time.perf_counter()
             data_elapsed = t_end_data - t_start_data
             model_elapsed = t_end_model - t_start_model
-            task_name = str(self._jointflow_cur_task or "action")
+            task_name = self._current_display_task_name()
             did_optimizer_step = bool(self.accelerator.sync_gradients)
 
             if did_optimizer_step:
@@ -770,8 +1310,30 @@ class VLATrainer(TrainerUtils):
                     }
                 )
 
-            if did_optimizer_step and self.completed_steps % self.config.trainer.eval_interval == 0:
+            action_eval_enabled = bool(self.config.trainer.get("action_eval_enabled", True))
+            action_eval_interval = int(self.config.trainer.get("eval_interval", 0))
+            if (
+                did_optimizer_step
+                and action_eval_enabled
+                and action_eval_interval > 0
+                and self.completed_steps % action_eval_interval == 0
+            ):
                 step_metrics = self.eval_action_model(step_metrics)
+
+            world_validation = self.config.trainer.get("world_validation", {})
+            world_val_enabled = (
+                self.vla_val_dataloader is not None
+                and hasattr(world_validation, "get")
+                and bool(world_validation.get("enabled", False))
+            )
+            world_val_interval = int(world_validation.get("interval", 0)) if world_val_enabled else 0
+            if (
+                did_optimizer_step
+                and world_val_enabled
+                and world_val_interval > 0
+                and self.completed_steps % world_val_interval == 0
+            ):
+                step_metrics.update(self.eval_world_model())
 
             # Eval/log/save are optimizer-step events.  An accumulation
             # micro-batch keeps ``completed_steps`` unchanged; running these
@@ -794,13 +1356,110 @@ class VLATrainer(TrainerUtils):
 
         self._finalize_training()
 
+    def eval_world_model(self) -> dict[str, float]:
+        """Evaluate sampled future-DINO MSE on the fixed held-out split."""
+
+        if self.vla_val_dataloader is None:
+            return {}
+        cfg = self.config.trainer.get("world_validation", {})
+        num_batches = int(cfg.get("num_batches", 4))
+        num_samples = int(cfg.get("num_samples", 1))
+        num_steps = int(cfg.get("num_inference_timesteps", 10))
+        seed = int(cfg.get("seed", 2027))
+        task = str(cfg.get("task", "joint_detached"))
+        if num_batches <= 0 or num_samples <= 0 or num_steps <= 0:
+            raise ValueError(
+                "world_validation num_batches/num_samples/num_inference_timesteps must be positive"
+            )
+
+        base_model = self.accelerator.unwrap_model(self.model)
+        evaluator = getattr(base_model, "evaluate_wam_world_prediction", None)
+        if not callable(evaluator):
+            raise RuntimeError(
+                "trainer.world_validation requires a WAM model exposing "
+                "evaluate_wam_world_prediction"
+            )
+        was_training = bool(base_model.training)
+        base_model.eval()
+        totals = torch.zeros(6, device=self.accelerator.device, dtype=torch.float64)
+        try:
+            for batch_index, examples in enumerate(self.vla_val_dataloader):
+                if batch_index >= num_batches:
+                    break
+                device_type = self.accelerator.device.type
+                with torch.autocast(
+                    device_type=device_type,
+                    dtype=torch.bfloat16,
+                    enabled=device_type in {"cuda", "cpu"},
+                ):
+                    values = evaluator(
+                        examples,
+                        task=task,
+                        seed=seed + batch_index * 1_000_003,
+                        num_samples=num_samples,
+                        num_inference_timesteps=num_steps,
+                    )
+                totals += torch.stack(
+                    [
+                        values["squared_error_sum"],
+                        values["element_count"],
+                        values["cosine_sum"],
+                        values["token_count"],
+                        values["copy_squared_error_sum"],
+                        values["valid_sample_count"],
+                    ]
+                ).to(device=totals.device, dtype=totals.dtype)
+        finally:
+            if was_training:
+                base_model.train()
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+        if totals[1].item() <= 0 or totals[3].item() <= 0:
+            raise RuntimeError(
+                "World validation found no valid t+stride targets. Check the held-out split and future_valid contract."
+            )
+        mse = totals[0] / totals[1]
+        cosine = totals[2] / totals[3]
+        copy_mse = totals[4] / totals[1]
+        metrics = {
+            "val/world_mse": float(mse),
+            "val/world_cosine": float(cosine),
+            "val/world_copy_mse": float(copy_mse),
+            "val/world_mse_vs_copy_ratio": float(mse / copy_mse.clamp_min(1.0e-12)),
+            "val/world_valid_samples": float(totals[5]),
+        }
+        if self.accelerator.is_main_process:
+            logger.info(
+                "World validation step=%d task=%s batches/rank=%d samples=%d steps=%d "
+                "mse=%.6f cosine=%.6f copy_mse=%.6f ratio=%.4f valid=%d",
+                self.completed_steps,
+                task,
+                num_batches,
+                num_samples,
+                num_steps,
+                metrics["val/world_mse"],
+                metrics["val/world_cosine"],
+                metrics["val/world_copy_mse"],
+                metrics["val/world_mse_vs_copy_ratio"],
+                int(metrics["val/world_valid_samples"]),
+            )
+        return metrics
+
     def eval_action_model(self, step_metrics: dict = None) -> float:
         """Run simple action-eval on current batch and attach score to metrics."""
         examples = self._get_next_batch()
         actions = [example["action"] for example in examples]
-        output_dict = self.accelerator.unwrap_model(self.model).predict_action(
-            examples=examples, use_ddim=True, num_ddim_steps=20
-        )
+        base_model = self.accelerator.unwrap_model(self.model)
+        was_training = bool(base_model.training)
+        base_model.eval()
+        try:
+            output_dict = base_model.predict_action(
+                examples=examples, use_ddim=True, num_ddim_steps=20
+            )
+        finally:
+            if was_training:
+                base_model.train()
 
         if self.accelerator.is_main_process:
             normalized_actions = output_dict["normalized_actions"]
@@ -827,8 +1486,6 @@ class VLATrainer(TrainerUtils):
         with self.accelerator.accumulate(self.model):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 #######
-                # 中文注释：JointFlow-style 训练复用原生 trainer；配置 tasks.weights 时每步采样一个任务，
-                # 模型返回 *_loss / loss_* 指标。没有配置时保持旧 QwenGR00T action_loss 路径。
                 jointflow_task = self._sample_jointflow_task()
                 if jointflow_task is not None:
                     output_dict = self.model.forward(
@@ -866,10 +1523,7 @@ class VLATrainer(TrainerUtils):
             self.accelerator.backward(total_loss)
 
             #######
-            # 中文注释：梯度统计时序——必须 backward 之后、step/zero_grad 之前。
-            # ① 先做 clip（DeepSpeed 下 accelerate clip 实为 no-op/返回 None，真正 clip 在 engine.step 内；
-            #    非-DS 时返回总范数，留作 grad_norm_total 兜底）。
-            sync = bool(self.accelerator.sync_gradients)        # 在 accumulate 块内捕获，块外可能失效
+            sync = bool(self.accelerator.sync_gradients)
             self._last_clip_norm = None
             if sync and self.config.trainer.gradient_clipping is not None:
                 clipped = self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
@@ -880,11 +1534,11 @@ class VLATrainer(TrainerUtils):
                         self._last_clip_norm = None
 
             will_log = self._is_log_step(sync)
-            # 中文注释：**梯度记录总开关**——log_grad_norms=false 时 want_grad 恒 False → 既不取 grad_norm_total、
-            # 也不算 per-head，训练**零梯度开销**；true 时才在 logging 步算全部 per-task 梯度。
+            want_global_grad = will_log and bool(
+                getattr(self, "_log_global_grad_norm", False)
+            )
             want_grad = will_log and self._log_grad_norms and self._grad_groups is not None
 
-            # ② step 前：取当前任务 head 的梯度**本地分片**平方和（零 collective）；汇成全局留到 step 后做 1 次 all_reduce。
             head_logname, head_local_sq = None, None
             if want_grad:
                 try:
@@ -905,16 +1559,25 @@ class VLATrainer(TrainerUtils):
             if sync:
                 self.lr_scheduler.step()
                 #######
-                # 中文注释：优化步完成 → 标记下一步起点重新采样 JointFlow 任务（一任务/优化步，累积窗口内同 task）。
                 self._jointflow_resample = True
                 #######
 
             #######
-            # 中文注释：step 后（grad_norm_total 此时可从 DeepSpeed 取）汇总梯度指标。仍在 accumulate 块内以保证 engine 状态有效。
             grad_metrics = {}
-            if want_grad:  # 受总开关控制：off 时连 grad_norm_total 都不取（零开销）
+            if want_global_grad:
                 try:
-                    grad_metrics = self._finalize_grad_metrics(jointflow_task, head_logname, head_local_sq)
+                    total_grad_norm = self._global_grad_norm()
+                    if total_grad_norm is not None:
+                        grad_metrics["train/grad_norm"] = total_grad_norm
+                except Exception as e:
+                    if not self._grad_warned and self.accelerator.is_main_process:
+                        logger.warning("global grad-norm logging failed (%s); skipping.", e)
+                    self._grad_warned = True
+            if want_grad:  # Optional detailed shared/head decomposition.
+                try:
+                    grad_metrics.update(
+                        self._finalize_grad_metrics(jointflow_task, head_logname, head_local_sq)
+                    )
                 except Exception as e:
                     if not self._grad_warned and self.accelerator.is_main_process:
                         logger.warning("grad-norm finalize failed (%s); skipping.", e)
@@ -928,20 +1591,12 @@ class VLATrainer(TrainerUtils):
             #######
 
         #######
-        # 中文注释：只在「即将记录」的步做 .item()/.cpu()（减少 GPU→CPU 同步）；其余步返回 {}。
         if not will_log:
             return {}
         if jointflow_task is not None:
             metrics = self._build_loss_metrics(output_dict, jointflow_task, total_loss)
-        else:  # 原生（非多任务）路径
+        else:
             metrics = self._build_native_loss_metrics(output_dict, total_loss)
-            # The isolated Co-Flow model exposes detached audit scalars without
-            # changing the trainer's single ``action_loss`` optimization ABI.
-            # Old models return no ``coflow_*`` keys and are byte-for-byte on
-            # the pre-existing metrics path.
-            for key, value in output_dict.items():
-                if key.startswith("coflow_") and torch.is_tensor(value) and value.numel() == 1:
-                    metrics[f"train/{key}"] = float(value.detach())
         metrics.update(grad_metrics)
         return metrics
         #######
@@ -979,11 +1634,19 @@ def main(cfg) -> None:
     logger.info("✅ Configuration wrapped for access tracking")
 
     output_dir = setup_directories(cfg=cfg)
+    if bool(cfg.trainer.get("seed_before_model_init", False)):
+        # Opt-in for controlled ablations.  Use one common construction seed
+        # on every rank so optional zero-gated modules can be proven not to
+        # perturb the baseline policy initialization.  prepare_training later
+        # restores the historical rank-offset runtime seed for data/noise.
+        construction_seed = int(getattr(cfg, "seed", 42))
+        set_seed(construction_seed)
+        logger.info("Deterministic model construction seed=%d", construction_seed)
     vla = build_framework(cfg)
-    vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+    vla_train_dataloader, vla_val_dataloader = prepare_data(
+        cfg=cfg, accelerator=accelerator, output_dir=output_dir
+    )
     #######
-    # 中文注释：E1.3 correlated noise——若 action_model.use_correlated_noise=true，启动时从 dataloader 估计动作 correlation
-    # 的 Cholesky 并注入 action head（启动时算好注入，免离线脚本）。开关关时此段不执行，不影响其它实验。
     action_cfg = getattr(getattr(cfg, "framework", None), "action_model", None)
     if (
         action_cfg is not None
@@ -999,10 +1662,6 @@ def main(cfg) -> None:
         import numpy as _np
 
         #######
-        # 中文注释：⚠️多机必须只在 rank0 估一次。估计要逐样本 __getitem__（解码视频 + 读 latent），
-        # 64 卡各扫 20000 条 = 把 bucket I/O 打爆、启动卡死 30min+。改成：rank0 算(num_samples 可调，默认 4096)
-        # → 落盘 → barrier → 所有 rank 从盘读。已有缓存直接加载，免重算（resume/重跑秒过）。
-        # 落盘文件供评测 server 读，保证推理初始噪声分布与训练一致（buffer persistent=False 不进 ckpt）。
         cache_path = os.path.join(output_dir, "action_correlation_cholesky.npy")
         cache_metadata_path = os.path.join(output_dir, "action_correlation_metadata.json")
         _exp = int(action_cfg.get("action_horizon", 0)) * int(action_cfg.get("action_dim", 0))
@@ -1071,8 +1730,6 @@ def main(cfg) -> None:
 
         if accelerator.is_main_process:
             #######
-            # 中文注释：严格消融可通过 correlation_cholesky_path 固定使用已完成 baseline 的矩阵。
-            # 指定后必须存在、维度正确且数值有限；失败时直接退出，禁止静默重算引入额外变量。
             if _source_path:
                 _np.save(cache_path, _np.asarray(_source_chol))
                 _write_correlation_metadata()
@@ -1084,12 +1741,9 @@ def main(cfg) -> None:
                     cache_path,
                 )
             else:
-                # 中文注释：未固定外部矩阵时，只有 dataset/mix/horizon/估计参数全部一致且
-                # 数组通过严格 Cholesky 校验才复用。这样 clean/full 即使误用同一输出目录，
-                # 也不会因为形状相同而静默共享 correlation。
                 _reuse = _reusable_local_correlation()
                 if _reuse:
-                    logger.info(f"correlated-noise: 复用已缓存 Cholesky({_exp}x{_exp}) → {cache_path}")
+                    logger.info(f"correlated-noise: reusing cached Cholesky ({_exp}x{_exp}) at {cache_path}")
                 else:
                     chol = compute_action_correlation_cholesky(
                         vla_train_dataloader.dataset,
@@ -1108,7 +1762,7 @@ def main(cfg) -> None:
                         cache_path,
                     )
         if dist.is_initialized():
-            dist.barrier()  # 等 rank0 算好/存好,其余 rank 再读
+            dist.barrier()
         try:
             _loaded_chol = validate_action_correlation_cholesky(
                 _np.load(cache_path, allow_pickle=False),
@@ -1130,6 +1784,7 @@ def main(cfg) -> None:
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,
+        vla_val_dataloader=vla_val_dataloader,
     )
 
     trainer.prepare_training()
@@ -1157,7 +1812,6 @@ if __name__ == "__main__":
 
     # Normalise legacy YAML keys into the current `version_id == "0.21"` schema.
     # This is idempotent and does not modify framework class signatures.
-    # See bar/config_收紧.md for the rationale.
     cfg = apply_config_compat(cfg)
 
     # Store source config path for later copying to output dir

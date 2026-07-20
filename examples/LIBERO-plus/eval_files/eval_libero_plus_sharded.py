@@ -8,10 +8,6 @@ os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
-# Shell 中 CUDA_VISIBLE_DEVICES=i 后，当前进程内部只有一张逻辑 GPU，编号为 0。
-# 新 mujoco 必须用逻辑 EGL 0 初始化。
-# 旧 robosuite 却要求 MUJOCO_EGL_DEVICE_ID 与 CUDA_VISIBLE_DEVICES 的物理编号一致。
-# 因此先用 0 初始化 mujoco，再恢复物理编号供 robosuite 的旧检查使用。
 _physical_gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0].strip()
 
 os.environ["MUJOCO_EGL_DEVICE_ID"] = "0"

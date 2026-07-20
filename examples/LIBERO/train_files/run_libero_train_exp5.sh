@@ -9,9 +9,6 @@ export NCCL_TIMEOUT=10000  # timeout set to 1 hour (unit: seconds)
 export NCCL_SOCKET_TIMEOUT_MS=360000
 export WANDB_MODE=offline
 ###########################################################################################
-# exp5 = WAM policy + tricks，换 Qwen3-VL-2B + 大 batch（per_device=16）。
-# 与官方 run_libero_train.sh(exp1) 同结构，只换 config_yaml / base_vlm(2B) / batch / steps。
-# CLI override 与 yaml 一致：per_device=16、max_train_steps=60000、save_interval=5000（大 batch 略少步 + 留饱和测试）。
 Framework_name=QwenGR00T
 freeze_module_list=''
 base_vlm=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B-Instruct/

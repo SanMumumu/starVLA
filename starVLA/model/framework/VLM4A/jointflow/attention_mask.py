@@ -8,9 +8,6 @@ import torch
 
 
 ######### // code // ##########
-# 中文注释：构造 block-causal 4D additive mask。
-# 输入 block_sizes 为同一 batch 的块长度列表，text_valid_lens [B] 只作用于第 0 个 text block。
-# 输出 mask [B,1,T,T]：可见位置为 0，不可见位置为稳定有限负数。
 def build_block_causal_mask(
     block_sizes: list[int],
     text_valid_lens: torch.Tensor,
@@ -51,7 +48,6 @@ def build_block_causal_mask(
     return mask
 
 
-# 中文注释：把 mask 渲染成 PNG，用于核对块内双向、块间 causal、text padding key 全暗。
 def visualize_mask(mask4d: torch.Tensor, block_names: list[str], save_path: str | Path) -> None:
     import matplotlib.pyplot as plt
 

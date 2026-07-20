@@ -1,14 +1,10 @@
-"""PR1: Frozen DINOv3 wrapper（在线版）.
+"""Frozen online DINOv3 feature extractor for dual-query training.
 
-复用:
-- torchvision transforms
-- torch.hub / transformers AutoModel fallback
-
-说明:
-JointFlow 已从“离线预计算 DINO 特征”切换为“在线提特征”。本模块在
-训练 / predict_action 时都直接在模型内对原始图像跑 frozen DINOv3，
-省掉离线预处理与读盘环节（见 framework/qwen_joint_flow.py）。
-模型尺寸由 dino.model_size 一处指定，离线权重由 dino.weights 指定本地路径。
+Training and policy inference extract features directly from source images,
+eliminating an offline preprocessing and I/O dependency. ``dino.model_size``
+selects the architecture, while ``dino.weights`` may point to local weights.
+Both torchvision preprocessing and torch.hub/Transformers loaders are
+supported.
 """
 
 from __future__ import annotations
@@ -26,9 +22,6 @@ from torch import nn
 from torchvision import transforms
 
 ######### // code // ##########
-# 中文注释：DINOv3 尺寸预设。用户只需在 config 里写 dino.model_size，
-# 这里据此自动填好 torch.hub 名称 / HF model id / embed_dim / patch_size，
-# 避免“改了尺寸却忘了同步 embed_dim”导致 visual head 维度对不上。
 DINOV3_PRESETS = {
     "vits16": {
         "name": "dinov3_vits16",
@@ -67,7 +60,6 @@ DINOV3_PRESETS = {
         "patch_size": 16,
     },
 }
-# 中文注释：尺寸别名，方便写 s/b/l 等简写。
 _SIZE_ALIASES = {
     "s": "vits16",
     "small": "vits16",
@@ -134,11 +126,11 @@ def dino_num_patches(image_size: int | Sequence[int], patch_size: int) -> int:
 
 
 def resolve_dino_spec(dino_cfg) -> dict:
-    """把 framework.dino 配置解析成 DINOv3Backbone 的构造参数。
+    """Resolve ``framework.dino`` into ``DINOv3Backbone`` arguments.
 
-    - 若指定 model_size：用预设覆盖 name/hf_model_id/embed_dim/patch_size（“一处改尺寸”）。
-    - weights：本地离线 ckpt（torch.hub 的 .pth 文件，或 HF 快照目录）。
-    - 其余字段（repo_or_dir/loader/image_size/weights）保留用户值。
+    ``model_size`` atomically selects name, model ID, embedding dimension, and
+    patch size. ``weights`` accepts a local torch.hub checkpoint or HuggingFace
+    snapshot; other explicitly configured loader and image fields are retained.
     """
     spec = {
         "name": _cfg_get(dino_cfg, "name", "dinov3_vits16"),
@@ -178,9 +170,6 @@ def _apply_transform(image: Image.Image, transform):
 
 
 ######### // code // ##########
-# 中文注释：冻结 DINOv3 ViT，输出 patch tokens。
-# 输入：imgs [B*V,3,H,W]，已经按 ImageNet mean/std 标准化。
-# 输出：patch_tokens [B*V,N_v,embed_dim]；384x320+patch16 时 N_v=24*20=480。
 class DINOv3Backbone(nn.Module):
     def __init__(
         self,
@@ -222,7 +211,6 @@ class DINOv3Backbone(nn.Module):
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
         )
-        # 中文注释：在线 batch 预处理用到的 ImageNet 常量（注册成 buffer 随模型搬到对应 device）。
         self.register_buffer("_imagenet_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("_imagenet_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
 
@@ -234,7 +222,6 @@ class DINOv3Backbone(nn.Module):
     def _load_body(self, trust_repo: bool):
         errors: list[str] = []
         weights = self.weights
-        # 中文注释：weights 指向一个目录时，按 HF 本地快照加载（离线、不联网）。
         want_hf = self.loader == "hf" or (weights and Path(str(weights)).is_dir())
         if want_hf:
             from transformers import AutoModel
@@ -250,7 +237,6 @@ class DINOv3Backbone(nn.Module):
         if self.loader in {"auto", "torchhub"}:
             try:
                 kwargs = {}
-                # 中文注释：weights 是本地 .pth 离线权重文件 → 交给 torch.hub 的 entrypoint(weights=...) 加载。
                 if weights:
                     kwargs["weights"] = str(weights)
                 source = "local" if Path(self.repo_or_dir).exists() else "github"
@@ -322,11 +308,6 @@ class DINOv3Backbone(nn.Module):
         return tokens
 
     ######### // code // ##########
-    # 中文注释：在线 batch 预处理。输入是一“扁平”图像列表（长度 = B*V），
-    # 每个元素可为 PIL.Image 或 HWC 的 numpy(uint8 / float)。
-    # 在 GPU 上做 Resize((height,width)) + ToTensor([0,1]) + ImageNet Normalize，
-    # 返回 [M,3,height,width] 的 fp32 张量（M=len(images)）。
-    # 与离线 dino_transform 数值口径一致；训练和 eval 都走这一条路径，保证 train/eval 一致。
     @torch.no_grad()
     def preprocess_batch(self, images: Sequence) -> torch.Tensor:
         device = next(self.parameters()).device
@@ -342,9 +323,9 @@ class DINOv3Backbone(nn.Module):
             if not arr.flags.writeable:
                 arr = arr.copy()
             t = torch.as_tensor(arr)
-            if t.ndim == 2:  # 灰度 -> 3 通道
+            if t.ndim == 2:
                 t = t.unsqueeze(-1).repeat(1, 1, 3)
-            if t.shape[-1] in (1, 3, 4):  # HWC -> CHW，丢掉 alpha
+            if t.shape[-1] in (1, 3, 4):
                 t = t[..., :3].permute(2, 0, 1)
             t = t.to(device=device, dtype=torch.float32)
             if float(t.max()) > 1.5:  # uint8 / [0,255] -> [0,1]

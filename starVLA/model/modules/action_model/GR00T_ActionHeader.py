@@ -225,11 +225,6 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
     num_target_vision_tokens: int = field(default=32, metadata={"help": "Number of target vision tokens."})
 
     #######
-    # 中文注释：E1.3 trick 开关（默认关，不影响其它实验与原生）。参考 behavior-1k 冠军方案：
-    #   use_correlated_noise：flow-matching 噪声从 N(0, βR+(1−β)I) 采（R=动作 correlation），而非独立噪声；
-    #   correlation_beta：上式的 β（0.5=半相关）；Σ 的 Cholesky 训练启动时从 dataloader 算好注入；
-    #   correlation_matrix_type：默认 covariance 保持旧实验，Robotwin 新实验显式选 correlation。
-    #   flow_matching_steps：每个 VLM step 对 action expert 跑 N 次不同 (t,noise) 预测并平均，降训练方差（1=关）。
     use_correlated_noise: bool = field(default=False)
     correlation_beta: float = field(default=0.5)
     correlation_matrix_type: str = field(default="covariance")
@@ -256,9 +251,7 @@ DiTConfig = {
 
 
 #######
-# 中文注释：World→Action guidance 的 guidance_mode → DiT world_mode 映射（cross 路由方式）。
 #   alternate_xattn→"alternate"(M4)；dual_xattn / dual_xattn_adaln→"dual"(M5/M6+)；
-#   adaln→"none"（只走 world_to_temb AdaLN，不改 cross 路由）；其它/缺省→"none"。
 def _guidance_to_world_mode(guidance_mode) -> str:
     return {
         "alternate_xattn": "alternate",
@@ -359,9 +352,6 @@ class FlowmatchingActionHead(nn.Module):
         nn.init.normal_(self.future_tokens.weight, mean=0.0, std=0.02)
 
         #######
-        # 中文注释：E1.3 correlated noise 的 Cholesky 缓存（flat=action_horizon·action_dim 的下三角），
-        # 训练启动时由 trainer 算好并 set_action_correlation 注入。开关打开但未注入属于 ABI 错误，
-        # _sample_initial_noise 会立即失败，禁止静默退回独立噪声。
         self.use_correlated_noise = bool(getattr(config, "use_correlated_noise", False))
         self.flow_matching_steps = int(getattr(config, "flow_matching_steps", 1))
         self.prediction_type = str(getattr(config, "prediction_type", "velocity")).lower()
@@ -415,8 +405,6 @@ class FlowmatchingActionHead(nn.Module):
         return (self.config.noise_s - sample) / self.config.noise_s
 
     #######
-    # 中文注释：E1.3——注入 correlated noise 的 Cholesky。训练时 trainer 启动算好注入；评测时 server 从
-    # <run_dir>/action_correlation_cholesky.npy 读出注入（buffer persistent=False 不进 ckpt）。L 形状 [flat,flat]。
     def set_action_correlation(self, chol: torch.Tensor) -> None:
         chol = torch.as_tensor(chol, dtype=torch.float32, device="cpu")
         expected = tuple(self._action_corr_chol.shape)
@@ -431,9 +419,6 @@ class FlowmatchingActionHead(nn.Module):
         self._action_corr_chol.copy_(chol.to(self._action_corr_chol.device))
         self._action_corr_loaded = True
 
-    # 中文注释：采样 flow-matching 初始噪声（按 shape）。开关开时必须已注入 Σ-Cholesky；
-    # 只有开关关闭时才使用独立噪声。
-    # 训练 forward 与推理 predict_action 必须走同一个分布，否则 flow 从错误起点积分（E1.3 之前推理误用 randn → 0% SR）。
     def _sample_initial_noise(self, batch_size: int, device, dtype) -> torch.Tensor:
         if self.use_correlated_noise:
             if not self._action_corr_loaded:
@@ -461,9 +446,7 @@ class FlowmatchingActionHead(nn.Module):
         encoder_attention_mask=None,
         action_is_pad: torch.Tensor = None,
         #######
-        # 中文注释：World→Action guidance（M4/M5/M6+）的可选 world 条件。全 None/"none" 时与原 forward 完全一致。
-        #   world_embs：world memory [B,N_w,cross_dim]（M4 alternate / M5,M6+ dual cross-attn）。
-        #   world_global：pooled world 向量 [B,D]（M6/M6+ AdaLN）。guidance_mode 决定 DiT 路由。
+        # world_embs: world memory [B, N_w, cross_dim] for alternate/dual cross-attention.
         world_embs: torch.Tensor = None,
         world_attention_mask=None,
         world_global: torch.Tensor = None,
@@ -484,8 +467,6 @@ class FlowmatchingActionHead(nn.Module):
                 )
 
         #######
-        # 中文注释：E1.3 multi-step Flow Matching——把 (vl_embs, actions, state) 沿 batch 复制 N 份，
-        # 各采独立 (noise,t)、一次 DiT 前向、平均 loss，降训练方差（N=1 即原行为）。
         n_fm = int(getattr(self, "flow_matching_steps", 1))
         if n_fm > 1:
             vl_embs = vl_embs.repeat(n_fm, 1, 1)
@@ -496,7 +477,6 @@ class FlowmatchingActionHead(nn.Module):
                 encoder_attention_mask = encoder_attention_mask.repeat(n_fm, *([1] * (encoder_attention_mask.ndim - 1)))
             if action_is_pad is not None:
                 action_is_pad = action_is_pad.repeat(n_fm, 1)
-            # world 条件同样复制 N 份，保持与 (vl_embs, actions) 对齐。
             if world_embs is not None:
                 world_embs = world_embs.repeat(n_fm, 1, 1)
             if world_attention_mask is not None and torch.is_tensor(world_attention_mask):
@@ -506,7 +486,7 @@ class FlowmatchingActionHead(nn.Module):
         #######
 
         # Embed noised action trajectory.
-        noise = self._sample_fm_noise(actions)  # 中文注释：E1.3 correlated noise 开关在此生效（默认独立噪声）
+        noise = self._sample_fm_noise(actions)
         t = self.sample_time(actions.shape[0], device=actions.device, dtype=actions.dtype)
         t = t[:, None, None]  # shape (B,1,1) for broadcast
 
@@ -575,7 +555,6 @@ class FlowmatchingActionHead(nn.Module):
         state: torch.Tensor = None,
         encoder_attention_mask=None,
         #######
-        # 中文注释：World→Action guidance 推理条件（与 forward 对称）。全 None/"none" 时与原 predict_action 一致。
         world_embs: torch.Tensor = None,
         world_attention_mask=None,
         world_global: torch.Tensor = None,
@@ -587,7 +566,6 @@ class FlowmatchingActionHead(nn.Module):
         device = vl_embs.device
         world_mode = _guidance_to_world_mode(guidance_mode)
         #######
-        # 中文注释：E1.3——推理初始噪声必须与训练同分布（correlated noise 开时用 z@L^T，否则 randn）。
         actions = self._sample_initial_noise(batch_size, device, vl_embs.dtype)
         #######
 

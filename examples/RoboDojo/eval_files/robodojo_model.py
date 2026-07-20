@@ -53,7 +53,7 @@ def _load_fastwam_image_module():
     RoboDojo Isaac environment.
     """
 
-    module_path = Path(__file__).resolve().parents[3] / "starVLA/dataloader/fastwam_image.py"
+    module_path = Path(__file__).resolve().parents[3] / "deployment/fastwam_image.py"
     spec = importlib.util.spec_from_file_location("_robodojo_fastwam_image", module_path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Cannot load FastWAM compositor from {module_path}")

@@ -109,8 +109,6 @@ class PolicyServerWrapper:
             logging.info("PolicyServerWrapper: injected correlated-noise Cholesky from %s", chol_path)
 
         #######
-        # 中文注释：jointflow 训练用离线 DINO 特征（按 per-suite stats 标准化），eval 在线提取必须用同一份 stats。
-        # 不加载则在线特征是原始尺度→视觉条件失效→SR≈0。stats 随 suite 不同，由 --dino_stats_path 指定。
         if dino_stats_path and hasattr(framework, "set_dino_stats"):
             framework.set_dino_stats(str(dino_stats_path))
             logging.info("PolicyServerWrapper: loaded online-DINO stats from %s", dino_stats_path)
@@ -123,6 +121,15 @@ class PolicyServerWrapper:
         # Co-located metadata.
         self._model_cfg = model_cfg
         self._contract_cfg_path = str(contract_cfg_path)
+        contract_framework_cfg = (contract_cfg.get("framework") or {})
+        accessed_framework_cfg = (model_cfg.get("framework") or {})
+        self._framework_name = str(
+            contract_framework_cfg.get("name", accessed_framework_cfg.get("name", ""))
+        )
+        self._wam_runtime_metadata = self._build_wam_runtime_metadata(
+            framework,
+            contract_cfg,
+        )
         contract_vla_cfg = (contract_cfg.get("datasets") or {}).get("vla_data") or {}
         self._image_layout = str(contract_vla_cfg.get("image_layout", "separate_views"))
         self._composite_view_key = contract_vla_cfg.get("composite_view_key")
@@ -151,6 +158,11 @@ class PolicyServerWrapper:
             raise ValueError(
                 "PolicyServerWrapper: no action_horizon or future_action_window_size found "
                 f"in model config for {self._ckpt_path}"
+            )
+        if self._framework_name == "QwenActionWorldCoFlow" and self._action_chunk_size != 16:
+            raise ValueError(
+                "PolicyServerWrapper: QwenActionWorldCoFlow is a single H16 bridge, "
+                f"got action_chunk_size={self._action_chunk_size}"
             )
         # Cache of PolicyNormProcessor instances per unnorm_key.
         # For single-dataset ckpts unnorm_key is auto-selected; for multi-dataset
@@ -190,6 +202,98 @@ class PolicyServerWrapper:
         """Compatibility shim for callers/tests that only have a config dict."""
 
         return resolve_config_expects_state(model_cfg)[0]
+
+    @staticmethod
+    def _build_wam_runtime_metadata(framework: baseframework, contract_cfg: dict) -> Dict[str, Any]:
+        """Describe the loaded WAM path, including the checkpoint's actual gates."""
+
+        framework_cfg = (contract_cfg.get("framework") or {})
+        trainer_cfg = (contract_cfg.get("trainer") or {})
+        wam_cfg = (framework_cfg.get("wam") or {})
+        saved_guidance = (wam_cfg.get("guidance") or {})
+        runtime_guidance = getattr(framework, "wam_guidance", None)
+        if not hasattr(runtime_guidance, "get"):
+            runtime_guidance = saved_guidance
+
+        wam_enabled = bool(getattr(framework, "wam_enabled", wam_cfg.get("enabled", False)))
+        guidance_enabled = bool(runtime_guidance.get("enabled", False)) if wam_enabled else False
+        phase = str(trainer_cfg.get("wam_two_stage_phase", "") or "").lower() or None
+        recipe = str(
+            trainer_cfg.get("wam_two_stage_recipe", "legacy_v1") or "legacy_v1"
+        ).lower()
+        metadata: Dict[str, Any] = {
+            "wam_enabled": wam_enabled,
+            "wam_two_stage_phase": phase,
+            "wam_two_stage_recipe": recipe if phase is not None else None,
+            "wam_guidance_enabled": guidance_enabled,
+            "wam_action_world_bypass": (
+                bool(runtime_guidance.get("action_world_bypass", False))
+                if guidance_enabled
+                else None
+            ),
+            "wam_world_to_action_enabled": (
+                bool(runtime_guidance.get("world_to_action_enabled", True))
+                if guidance_enabled
+                else None
+            ),
+            "wam_bridge_source": (
+                str(runtime_guidance.get("bridge_source", "")).lower()
+                if guidance_enabled
+                else None
+            ),
+            "wam_world_eval_mode": (
+                str(runtime_guidance.get("world_eval_mode", "")).lower()
+                if guidance_enabled
+                else None
+            ),
+            "wam_detach_action_backbone": (
+                bool(runtime_guidance.get("detach_action_backbone", False))
+                if guidance_enabled
+                else None
+            ),
+            "wam_detach_world_backbone": (
+                bool(runtime_guidance.get("detach_world_backbone", False))
+                if guidance_enabled
+                else None
+            ),
+            "wam_baseline_action_context": (
+                bool(runtime_guidance.get("baseline_action_context", False))
+                if guidance_enabled
+                else None
+            ),
+            "wam_gate_openness": None,
+            "wam_gate_signed_mean": None,
+            "wam_gate_max_openness": None,
+        }
+
+        gate_reader = getattr(framework, "_wam_world_gate_metrics", None)
+        mode = str(runtime_guidance.get("mode", "")).lower() if guidance_enabled else ""
+        has_gated_path = bool(
+            metadata["wam_world_to_action_enabled"]
+            and mode in {"dual_xattn", "dual_xattn_adaln"}
+        )
+        if guidance_enabled and has_gated_path and callable(gate_reader):
+            gate_metrics = gate_reader()
+
+            def scalar(name: str) -> float:
+                value = gate_metrics[name]
+                if torch.is_tensor(value):
+                    value = value.detach().float().cpu().item()
+                return float(value)
+
+            metadata.update(
+                {
+                    "wam_gate_openness": scalar("world_gate_openness"),
+                    "wam_gate_signed_mean": scalar("world_gate_signed_mean"),
+                    "wam_gate_max_openness": scalar("world_gate_max_openness"),
+                }
+            )
+        elif phase == "gate_ft":
+            raise RuntimeError(
+                "Loaded gate_ft checkpoint does not expose the gated WAM action path; "
+                "refusing to start an unverifiable policy server"
+            )
+        return metadata
 
     def _sync_framework_state_contract(self, framework: baseframework) -> None:
         """Make the loaded model consume exactly the checkpoint-declared state ABI.
@@ -349,10 +453,18 @@ class PolicyServerWrapper:
             "expects_state": self._expects_state,
             "state_contract_source": self._state_contract_source,
             "contract_config": self._contract_cfg_path,
+            "framework_name": self._framework_name,
+            "coflow_supported_inference_modes": (
+                ["policy", "diagonal"] if self._framework_name == "QwenActionWorldCoFlow" else []
+            ),
+            "coflow_bridge_horizon": (
+                16 if self._framework_name == "QwenActionWorldCoFlow" else None
+            ),
             "image_layout": self._image_layout,
             "composite_view_key": self._composite_view_key,
             "composite_source_view_keys": self._composite_source_view_keys,
         }
+        base.update(self._wam_runtime_metadata)
         # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:
             proc = self._get_processor(self._default_unnorm_key)

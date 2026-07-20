@@ -12,7 +12,7 @@ MODES="${MODES:-demo_clean demo_randomized}"
 TASKS="${TASKS:-all}"
 SEED="${SEED:-0}"
 RUN_NAME="${RUN_NAME:-robotwin_full_eval}"
-ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-python3}"
+ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-}"
 SERVER_MAX_WAIT="${SERVER_MAX_WAIT:-1800}"
 REPLAN_STEPS="${REPLAN_STEPS:-${ROBOTWIN_REPLAN_STEPS:-}}"
 
@@ -70,6 +70,13 @@ fi
     echo "[ERROR] Only ${#GPU_IDS[@]} visible GPUs for ${NUM_CLIENTS} clients" >&2; exit 1;
 }
 GPU_IDS=("${GPU_IDS[@]:0:NUM_CLIENTS}")
+
+# AIDI bypasses some image entrypoints, so the first `python3` on PATH can be
+# different from the environment used to build CuRobo. Resolve and validate an
+# interpreter once, and serialize any JIT fallback before eight clients import
+# the same extension concurrently.
+source "${SCRIPT_DIR}/robotwin_runtime.sh"
+prepare_robotwin_runtime "${ROBOTWIN_PATH}" "${GPU_IDS[0]}"
 
 # Resolve tasks.
 declare -a SELECTED_TASKS=()

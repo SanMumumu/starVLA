@@ -1,16 +1,12 @@
 #######
-# Strict Stage 1/2: 80k structured future-DINO predictor warmup, IID only.
+# Ablation baseline: native action prediction + detached future-DINO prediction.
 #
-# Shared baseline contract: 50 Hz, z-score, action chunk 32, one 320x384
-# FastWAM composite, current 14-D proprio, release-order actions, 8x8x12 batch,
-# seeded 99/1 split and without-replacement global-frame sampling.
-# Every batch trains action + world prediction.  The action branch calls the
-# exact native IID-baseline Qwen context/action-loss path.  A second, detached
-# dual-query Qwen pass conditions only the future predictor and runs in a
-# forked RNG domain; gates stay closed until Stage 2.
+# There is no world-to-action architecture: no adapter, no action-DiT world
+# cross-attention and no gate are instantiated. Both losses are optimized on
+# every IID batch for 80k steps; the policy path otherwise matches the native
+# FastWAM baseline exactly.
 #######
-
-run_id: robotwin_wam_m5_fastwam_baselinepreserve_warmup_rand_state_h32_dinojitx_iid_80k
+run_id: robotwin_wam_m5_fastwam_dualbranch_no_world2action_rand_state_h32_dinojitx_iid_80k
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin_baselinepreserve
 seed: 42
 wandb_entity: axi-the-cat
@@ -45,6 +41,7 @@ framework:
       detach_world: true
       detached_prediction_eval_mode: true
       action_world_bypass: true
+      world_to_action_enabled: false
       # Policy is primary: action loss updates Qwen exactly as in the IID baseline.
       detach_action_backbone: false
       # Auxiliary future-DINO loss updates only visual head + state conditioner.
@@ -56,11 +53,11 @@ framework:
       qformer_layers: 2
       fusion_layers: 2
       gate_init: 0.0
-      log_gate_openness: true
+      log_gate_openness: false
       world_dropout: 0.0
       world_condition_on_state: true
       include_context_in_action_memory: true
-      # Stage 2 gated world memory is [predicted-future; Qwen image/language context].
+      # Kept for checkpoint schema parity; unused because world->action is absent.
       include_context_in_world_memory: true
       action_world_gradient_ramp:
         enabled: false

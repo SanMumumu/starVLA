@@ -9,9 +9,6 @@ export NCCL_TIMEOUT=10000  # timeout set to 1 hour (unit: seconds)
 export NCCL_SOCKET_TIMEOUT_MS=360000
 export WANDB_MODE=offline
 ###########################################################################################
-# exp7 = policy + FDM(无语言世界模型分支,有动作条件 act_ctx);与 exp8(Passive 无语言) 对照「显式动作条件是否增益未来动态建模」。
-# 与官方 run_libero_train.sh(exp1) 同结构，只换 config_yaml / base_vlm(2B) / batch / steps。
-# fdm + delta-DINO 由 yaml 控（tasks.weights.fdm=0.5、wam.fdm_delta_dino=true）；CLI override 与 exp5 一致。
 Framework_name=QwenGR00T
 freeze_module_list=''
 base_vlm=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B-Instruct/

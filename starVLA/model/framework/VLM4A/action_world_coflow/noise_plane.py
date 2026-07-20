@@ -13,8 +13,8 @@ MODE_TO_ID = {name: index for index, name in enumerate(MODE_NAMES)}
 
 @dataclass
 class NoisePlaneBatch:
-    tau_action: torch.Tensor  # [B, 2]
-    tau_world: torch.Tensor  # [B, 2]
+    tau_action: torch.Tensor  # [B]
+    tau_world: torch.Tensor  # [B]
     mode_ids: torch.Tensor  # [B]
 
 
@@ -29,9 +29,9 @@ class NoisePlaneSampler:
     - joint: independent action/world interior samples (Qantara ``square``)
     - diagonal: tied action/world time (Qantara ``joint``)
 
-    StarVLA samples one action time for the full 32-step chunk; it is expanded
-    over both 16-step blocks.  Qantara's default world chain is monotone over
-    the two future blocks.
+    StarVLA samples one action time and one world time for the single H16
+    action--future bridge.  There is no second temporal block or chained world
+    time in this model.
     """
 
     def __init__(
@@ -71,31 +71,34 @@ class NoisePlaneSampler:
 
     def _sample_action_variable(self, batch_size: int, device, dtype) -> torch.Tensor:
         if self.action_timestep_sampling == "uniform":
-            scalar = torch.rand(batch_size, 1, device=device, dtype=dtype)
+            scalar = torch.rand(batch_size, device=device, dtype=dtype)
         else:
             alpha = torch.tensor(self.action_beta_alpha, device=device, dtype=torch.float32)
             beta = torch.tensor(self.action_beta_beta, device=device, dtype=torch.float32)
-            sample = Beta(alpha, beta).sample((batch_size, 1))
+            sample = Beta(alpha, beta).sample((batch_size,))
             if self.action_timestep_sampling == "starvla_gr00t":
                 scalar = (1.0 - sample) * self.action_noise_s
             else:
                 scalar = (self.action_noise_s - sample.clamp(max=self.action_noise_s)) / self.action_noise_s
             scalar = scalar.to(dtype=dtype)
-        return scalar.expand(-1, 2)
+        return scalar
 
     def _sample_world_variable(self, batch_size: int, device, dtype) -> torch.Tensor:
-        values = torch.rand(batch_size, 2, device=device, dtype=dtype)
-        if self.world_timestep_sampling == "qantara_monotone":
-            values = values.cumprod(dim=1)
-        return values
+        return torch.rand(batch_size, device=device, dtype=dtype)
 
     def sample(self, batch_size: int, device, dtype=torch.float32) -> NoisePlaneBatch:
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
         ratios = self.ratios.to(device=device, dtype=torch.float32)
         mode_ids = torch.multinomial(ratios, batch_size, replacement=True)
-        action_var = self._sample_action_variable(batch_size, device, dtype)
-        world_var = self._sample_world_variable(batch_size, device, dtype)
+        # Treat ``dtype`` as the public output contract even if an autocast
+        # eligible sampling op internally promotes its result to float32.
+        action_var = self._sample_action_variable(batch_size, device, dtype).to(
+            device=device, dtype=dtype
+        )
+        world_var = self._sample_world_variable(batch_size, device, dtype).to(
+            device=device, dtype=dtype
+        )
         tau_action = action_var.clone()
         tau_world = world_var.clone()
 

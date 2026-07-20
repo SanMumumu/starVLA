@@ -1,13 +1,8 @@
-"""Shared-transformer Action--World Co-Flow model.
+"""Single-bridge shared-transformer Action--World Co-Flow model.
 
-The model performs two physically aligned calls with shared weights:
-
-1. ``[context+Z0] [A1:16, Z16]`` predicts the first action/world block.
-2. ``[context+Z0] [A1:16_hat, Z16_source] [A17:32, Z32]`` predicts the
-   second block.  At evaluation ``Z16_source`` is always the model prediction.
-
-Within every block action and world tokens use the same self-attention.  FFNs
-and normalization remain modality-specific (an MM-DiT style compromise).
+Each closed-loop policy call models exactly one physical bridge:
+``[context + Z0] -> [A1:16, Z(t+16)]``.  Action and future-world tokens share
+self-attention; modality-specific norms and FFNs provide asymmetric capacity.
 """
 
 from __future__ import annotations
@@ -29,7 +24,7 @@ from .attention_mask import (
     build_block_causal_attention_mask,
 )
 from .bridge import QantaraWorldBridge
-from .noise_plane import MODE_TO_ID, NoisePlaneSampler
+from .noise_plane import NoisePlaneSampler
 
 
 def _cfg_get(config, key: str, default=None):
@@ -58,7 +53,14 @@ class ContinuousTimeEmbedding(nn.Module):
 
     def forward(self, tau: torch.Tensor) -> torch.Tensor:
         args = tau.float().unsqueeze(-1) * self.scale * self.frequencies
-        return self.mlp(torch.cat([args.cos(), args.sin()], dim=-1))
+        features = torch.cat([args.cos(), args.sin()], dim=-1)
+        # Trigonometric features are intentionally evaluated in float32, but
+        # inference does not run under the trainer's autocast context.  Match
+        # the MLP parameter dtype explicitly so a bf16 checkpoint remains
+        # callable from eval/deployment without relying on ambient autocast.
+        first_weight = self.mlp[0].weight
+        features = features.to(device=first_weight.device, dtype=first_weight.dtype)
+        return self.mlp(features)
 
 
 class SharedSelfAttention(nn.Module):
@@ -96,23 +98,49 @@ class SharedSelfAttention(nn.Module):
 
 
 class ModalityExpertBlock(nn.Module):
-    """Shared attention plus context/action/world-specific norm and FFN."""
+    """Shared attention plus context/action/world-specific norm and FFN.
 
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, dropout: float) -> None:
+    Legacy checkpoints use one common ``mlp_ratio`` and dense expert
+    evaluation.  New asymmetric-MoT checkpoints may opt into distinct expert
+    widths and token-sparse routing.  The legacy construction and state-dict
+    layout are unchanged when those options are absent.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float,
+        dropout: float,
+        *,
+        expert_mlp_ratios: tuple[float, float, float] | None = None,
+        sparse_expert_routing: bool = False,
+    ) -> None:
         super().__init__()
-        intermediate = int(round(hidden_size * float(mlp_ratio)))
+        ratios = (
+            tuple(float(value) for value in expert_mlp_ratios)
+            if expert_mlp_ratios is not None
+            else (float(mlp_ratio),) * 3
+        )
+        if len(ratios) != 3 or any(value <= 0 for value in ratios):
+            raise ValueError(
+                "expert_mlp_ratios must contain three positive values in "
+                "(context, action, world) order"
+            )
+        self.expert_mlp_ratios = ratios
+        self.sparse_expert_routing = bool(sparse_expert_routing)
         self.attention_norms = nn.ModuleList([nn.RMSNorm(hidden_size) for _ in range(3)])
         self.ffn_norms = nn.ModuleList([nn.RMSNorm(hidden_size) for _ in range(3)])
         self.attention = SharedSelfAttention(hidden_size, num_heads, dropout)
         self.ffns = nn.ModuleList(
             [
                 nn.Sequential(
-                    nn.Linear(hidden_size, intermediate),
+                    nn.Linear(hidden_size, int(round(hidden_size * ratio))),
                     nn.GELU(approximate="tanh"),
                     nn.Dropout(dropout),
-                    nn.Linear(intermediate, hidden_size),
+                    nn.Linear(int(round(hidden_size * ratio)), hidden_size),
                 )
-                for _ in range(3)
+                for ratio in ratios
             ]
         )
         self.dropout = nn.Dropout(dropout)
@@ -125,16 +153,48 @@ class ModalityExpertBlock(nn.Module):
             result = result + expert(x) * selector.to(dtype=x.dtype)
         return result
 
+    @staticmethod
+    def _route_sparse(
+        x: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        experts: nn.ModuleList,
+    ) -> torch.Tensor:
+        """Evaluate each expert only on tokens assigned to that modality."""
+
+        if token_type_ids.ndim != 1 or token_type_ids.shape[0] != x.shape[1]:
+            raise ValueError(
+                "sparse expert routing requires one token-type vector shared by the batch; "
+                f"got x={tuple(x.shape)}, token_type_ids={tuple(token_type_ids.shape)}"
+            )
+        result = torch.zeros_like(x)
+        for type_id, expert in enumerate(experts):
+            indices = torch.nonzero(token_type_ids == type_id, as_tuple=False).flatten()
+            if indices.numel() == 0:
+                continue
+            selected = x.index_select(1, indices)
+            result = result.index_copy(1, indices, expert(selected))
+        return result
+
+    def _route_experts(
+        self,
+        x: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        experts: nn.ModuleList,
+    ) -> torch.Tensor:
+        if self.sparse_expert_routing:
+            return self._route_sparse(x, token_type_ids, experts)
+        return self._route(x, token_type_ids, experts)
+
     def forward(
         self,
         x: torch.Tensor,
         token_type_ids: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
-        normed = self._route(x, token_type_ids, self.attention_norms)
+        normed = self._route_experts(x, token_type_ids, self.attention_norms)
         x = x + self.dropout(self.attention(normed, attention_mask))
-        ffn_input = self._route(x, token_type_ids, self.ffn_norms)
-        x = x + self.dropout(self._route(ffn_input, token_type_ids, self.ffns))
+        ffn_input = self._route_experts(x, token_type_ids, self.ffn_norms)
+        x = x + self.dropout(self._route_experts(ffn_input, token_type_ids, self.ffns))
         return x
 
 
@@ -147,12 +207,26 @@ class ActionWorldJointTransformer(nn.Module):
         mlp_ratio: float,
         dropout: float,
         gradient_checkpointing: bool,
+        *,
+        expert_mlp_ratios: tuple[float, float, float] | None = None,
+        sparse_expert_routing: bool = False,
     ) -> None:
         super().__init__()
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.layers = nn.ModuleList(
-            [ModalityExpertBlock(hidden_size, num_heads, mlp_ratio, dropout) for _ in range(int(depth))]
+            [
+                ModalityExpertBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio,
+                    dropout,
+                    expert_mlp_ratios=expert_mlp_ratios,
+                    sparse_expert_routing=sparse_expert_routing,
+                )
+                for _ in range(int(depth))
+            ]
         )
+        self.sparse_expert_routing = bool(sparse_expert_routing)
         self.output_norms = nn.ModuleList([nn.RMSNorm(hidden_size) for _ in range(3)])
 
     def forward(
@@ -166,7 +240,12 @@ class ActionWorldJointTransformer(nn.Module):
                 x = checkpoint(layer, x, token_type_ids, attention_mask, use_reentrant=False)
             else:
                 x = layer(x, token_type_ids, attention_mask)
-        return ModalityExpertBlock._route(x, token_type_ids, self.output_norms)
+        router = (
+            ModalityExpertBlock._route_sparse
+            if self.sparse_expert_routing
+            else ModalityExpertBlock._route
+        )
+        return router(x, token_type_ids, self.output_norms)
 
 
 @dataclass
@@ -177,7 +256,7 @@ class SequenceResult:
 
 
 class ActionWorldCoFlowModel(nn.Module):
-    """Two-block action/world flow model with a single shared transformer."""
+    """One H16 action/future bridge with a shared transformer."""
 
     def __init__(
         self,
@@ -188,16 +267,14 @@ class ActionWorldCoFlowModel(nn.Module):
         coflow_config,
     ) -> None:
         super().__init__()
-        self.action_horizon = int(_cfg_get(action_config, "action_horizon", 32))
+        self.action_horizon = int(_cfg_get(action_config, "action_horizon", 16))
         self.action_dim = int(_cfg_get(action_config, "action_dim", 14))
         self.state_dim = int(_cfg_get(action_config, "state_dim", 0) or 0)
-        self.segment_boundaries = tuple(int(value) for value in _cfg_get(coflow_config, "segment_boundaries", [16, 32]))
-        if self.action_horizon != 32 or self.segment_boundaries != (16, 32):
+        if self.action_horizon != 16:
             raise ValueError(
-                "RoboTwin Action--World Co-Flow currently requires action_horizon=32 and "
-                f"segment_boundaries=[16,32], got H={self.action_horizon}, segments={self.segment_boundaries}"
+                "Action--World Co-Flow is a closed-loop H16 single-bridge model; "
+                f"got action_horizon={self.action_horizon}"
             )
-        self.segment_size = 16
 
         token_grid = tuple(int(value) for value in _cfg_get(coflow_config, "world_token_grid", [4, 8]))
         self.world_grid = token_grid
@@ -215,8 +292,16 @@ class ActionWorldCoFlowModel(nn.Module):
         self.jit_t_eps = float(_cfg_get(action_config, "jit_t_eps", 5.0e-2))
         self.action_inference_steps = int(_cfg_get(coflow_config, "action_inference_steps", 10))
         self.world_inference_steps = int(_cfg_get(coflow_config, "world_inference_steps", 10))
+        self.default_inference_mode = str(
+            _cfg_get(coflow_config, "default_inference_mode", "policy")
+        ).lower()
         if min(self.action_inference_steps, self.world_inference_steps) <= 0:
             raise ValueError("action_inference_steps and world_inference_steps must be positive")
+        if self.default_inference_mode not in {"policy", "diagonal"}:
+            raise ValueError(
+                "default_inference_mode must be 'policy' or 'diagonal', got "
+                f"{self.default_inference_mode!r}"
+            )
 
         bridge_type = str(_cfg_get(coflow_config, "world_bridge_type", "qantara_brownian_bridge")).lower()
         if bridge_type not in {"qantara_brownian_bridge", "qantara_linear_bridge"}:
@@ -231,33 +316,52 @@ class ActionWorldCoFlowModel(nn.Module):
 
         self.action_loss_weight = float(_cfg_get(coflow_config, "action_loss_weight", 1.0))
         self.world_loss_weight = float(_cfg_get(coflow_config, "world_loss_weight", 0.1))
-        self.z16_loss_weight = float(_cfg_get(coflow_config, "z16_loss_weight", 1.0))
-        self.z32_loss_weight = float(_cfg_get(coflow_config, "z32_loss_weight", 1.0))
-        if min(self.action_loss_weight, self.world_loss_weight, self.z16_loss_weight, self.z32_loss_weight) < 0:
-            raise ValueError("all action/world loss weights must be non-negative")
+        if min(self.action_loss_weight, self.world_loss_weight) < 0:
+            raise ValueError("action_loss_weight and world_loss_weight must be non-negative")
 
-        self.intermediate_state_source = str(
-            _cfg_get(coflow_config, "intermediate_state_source", "scheduled")
-        ).lower()
-        valid_sources = {"ground_truth", "predicted_detach", "predicted_e2e", "scheduled"}
-        if self.intermediate_state_source not in valid_sources:
-            raise ValueError(
-                f"Unsupported intermediate_state_source={self.intermediate_state_source!r}; "
-                f"expected one of {sorted(valid_sources)}"
-            )
-        self.predicted_z16_detach = bool(_cfg_get(coflow_config, "predicted_z16_detach", True))
-        self.predicted_action_prefix_detach = bool(
-            _cfg_get(coflow_config, "predicted_action_prefix_detach", True)
+        world_loss_schedule = _cfg_get(coflow_config, "world_loss_schedule", {}) or {}
+        self.world_loss_schedule_enabled = bool(
+            _cfg_get(world_loss_schedule, "enabled", False)
         )
-        self.z16_teacher_ratio_start = float(_cfg_get(coflow_config, "z16_teacher_ratio_start", 1.0))
-        self.z16_teacher_ratio_end = float(_cfg_get(coflow_config, "z16_teacher_ratio_end", 0.0))
-        self.z16_teacher_decay_steps = int(_cfg_get(coflow_config, "z16_teacher_decay_steps", 30000))
-        if not 0 <= self.z16_teacher_ratio_start <= 1 or not 0 <= self.z16_teacher_ratio_end <= 1:
-            raise ValueError("z16 teacher ratios must be in [0,1]")
-        if self.z16_teacher_decay_steps <= 0:
-            raise ValueError("z16_teacher_decay_steps must be positive")
+        self.world_loss_schedule_transition_step = int(
+            _cfg_get(world_loss_schedule, "transition_step", 0)
+        )
+        self.world_loss_schedule_before = float(
+            _cfg_get(world_loss_schedule, "before_weight", self.world_loss_weight)
+        )
+        self.world_loss_schedule_after = float(
+            _cfg_get(world_loss_schedule, "after_weight", self.world_loss_weight)
+        )
+        if self.world_loss_schedule_enabled:
+            if self.world_loss_schedule_transition_step <= 0:
+                raise ValueError(
+                    "world_loss_schedule.transition_step must be positive when enabled"
+                )
+            if min(self.world_loss_schedule_before, self.world_loss_schedule_after) < 0:
+                raise ValueError("world-loss schedule weights must be non-negative")
+            if abs(self.world_loss_schedule_before - self.world_loss_weight) > 1.0e-12:
+                raise ValueError(
+                    "world_loss_weight must equal world_loss_schedule.before_weight so the "
+                    "saved config has one unambiguous initial weight"
+                )
 
         self.log_attention_statistics = bool(_cfg_get(coflow_config, "log_attention_statistics", True))
+        mot_config = _cfg_get(coflow_config, "mot", {}) or {}
+        self.mot_enabled = bool(_cfg_get(mot_config, "enabled", False))
+        if self.mot_enabled:
+            self.mot_expert_mlp_ratios = (
+                float(_cfg_get(mot_config, "context_mlp_ratio", 2.0)),
+                float(_cfg_get(mot_config, "action_mlp_ratio", 10.5)),
+                float(_cfg_get(mot_config, "world_mlp_ratio", 3.5)),
+            )
+            if any(value <= 0 for value in self.mot_expert_mlp_ratios):
+                raise ValueError("all mot expert MLP ratios must be positive")
+            self.mot_sparse_routing = bool(
+                _cfg_get(mot_config, "sparse_routing", True)
+            )
+        else:
+            self.mot_expert_mlp_ratios = None
+            self.mot_sparse_routing = False
         self.action_input_projection = nn.Linear(self.action_dim, self.hidden_size)
         self.world_input_projection = nn.Linear(self.world_dim, self.hidden_size)
         self.context_projection = nn.Linear(int(context_dim), self.hidden_size)
@@ -271,7 +375,7 @@ class ActionWorldCoFlowModel(nn.Module):
             else None
         )
         self.token_type_embedding = nn.Embedding(3, self.hidden_size)
-        self.block_embedding = nn.Embedding(3, self.hidden_size)
+        self.block_embedding = nn.Embedding(2, self.hidden_size)
         self.action_position_embedding = nn.Embedding(self.action_horizon, self.hidden_size)
         self.world_row_embedding = nn.Embedding(token_grid[0], self.hidden_size)
         self.world_col_embedding = nn.Embedding(token_grid[1], self.hidden_size)
@@ -288,6 +392,8 @@ class ActionWorldCoFlowModel(nn.Module):
             mlp_ratio=float(_cfg_get(coflow_config, "mlp_ratio", 4.0)),
             dropout=dropout,
             gradient_checkpointing=bool(_cfg_get(coflow_config, "enable_gradient_checkpointing", True)),
+            expert_mlp_ratios=self.mot_expert_mlp_ratios,
+            sparse_expert_routing=self.mot_sparse_routing,
         )
         self.action_output_norm = nn.RMSNorm(self.hidden_size)
         self.world_output_norm = nn.RMSNorm(self.hidden_size)
@@ -298,6 +404,49 @@ class ActionWorldCoFlowModel(nn.Module):
             # an output parameterization, not a scalar gate between modalities.
             nn.init.zeros_(self.world_output_head.weight)
             nn.init.zeros_(self.world_output_head.bias)
+
+        self.capacity_report = self._build_capacity_report()
+        minimum_action_path_capacity = int(
+            _cfg_get(mot_config, "minimum_action_path_parameters", 0)
+        )
+        minimum_action_expert_capacity = int(
+            _cfg_get(mot_config, "minimum_action_expert_parameters", 0)
+        )
+        if self.mot_enabled and minimum_action_path_capacity > 0:
+            actual_action_path_capacity = self.capacity_report["action_path_parameters"]
+            if actual_action_path_capacity < minimum_action_path_capacity:
+                raise ValueError(
+                    "asymmetric MoT action capacity is below the configured baseline: "
+                    f"actual={actual_action_path_capacity:,}, "
+                    f"minimum={minimum_action_path_capacity:,}"
+                )
+        if self.mot_enabled and minimum_action_expert_capacity > 0:
+            actual_action_expert_capacity = self.capacity_report["action_expert_parameters"]
+            if actual_action_expert_capacity < minimum_action_expert_capacity:
+                raise ValueError(
+                    "asymmetric MoT action-only expert capacity is below the configured "
+                    "baseline: "
+                    f"actual={actual_action_expert_capacity:,}, "
+                    f"minimum={minimum_action_expert_capacity:,}"
+                )
+        target_world_ratio = _cfg_get(
+            mot_config, "target_world_to_action_expert_ratio", None
+        )
+        if self.mot_enabled and target_world_ratio is not None:
+            target_world_ratio = float(target_world_ratio)
+            if target_world_ratio <= 0:
+                raise ValueError(
+                    "mot.target_world_to_action_expert_ratio must be positive"
+                )
+            actual_world_ratio = self.capacity_report[
+                "world_to_action_expert_parameter_ratio"
+            ]
+            if abs(actual_world_ratio - target_world_ratio) > 1.0e-3:
+                raise ValueError(
+                    "asymmetric MoT world/action expert capacity ratio disagrees with the "
+                    "configured target: "
+                    f"actual={actual_world_ratio:.6f}, target={target_world_ratio:.6f}"
+                )
 
         ratios = _cfg_get(coflow_config, "noise_plane_sampling", {})
         self.noise_plane = NoisePlaneSampler(
@@ -318,6 +467,71 @@ class ActionWorldCoFlowModel(nn.Module):
         self.register_buffer("_action_corr_chol", torch.zeros(flat_dim, flat_dim), persistent=False)
         self._action_corr_loaded = False
 
+    @staticmethod
+    def _parameter_count(module: nn.Module | None) -> int:
+        return 0 if module is None else sum(parameter.numel() for parameter in module.parameters())
+
+    def _build_capacity_report(self) -> dict[str, int | float]:
+        """Report unique parameter budgets for the asymmetric expert paths."""
+
+        shared_attention = sum(
+            self._parameter_count(layer.attention) for layer in self.transformer.layers
+        )
+        context_expert = sum(
+            self._parameter_count(layer.ffns[TOKEN_CONTEXT])
+            for layer in self.transformer.layers
+        )
+        action_expert = sum(
+            self._parameter_count(layer.ffns[TOKEN_ACTION])
+            for layer in self.transformer.layers
+        )
+        world_expert = sum(
+            self._parameter_count(layer.ffns[TOKEN_WORLD])
+            for layer in self.transformer.layers
+        )
+        action_norms = sum(
+            self._parameter_count(layer.attention_norms[TOKEN_ACTION])
+            + self._parameter_count(layer.ffn_norms[TOKEN_ACTION])
+            for layer in self.transformer.layers
+        ) + self._parameter_count(self.transformer.output_norms[TOKEN_ACTION])
+        action_conditioning = sum(
+            self._parameter_count(module)
+            for module in (
+                self.action_input_projection,
+                self.action_output_norm,
+                self.action_output_head,
+                self.state_projection,
+                self.action_position_embedding,
+                self.time_embedding,
+                self.token_type_embedding,
+                self.block_embedding,
+            )
+        )
+        return {
+            "shared_attention_parameters": shared_attention,
+            "context_expert_parameters": context_expert,
+            "action_expert_parameters": action_expert,
+            "world_expert_parameters": world_expert,
+            "world_to_action_expert_parameter_ratio": (
+                world_expert / action_expert if action_expert else 0.0
+            ),
+            "action_path_parameters": (
+                shared_attention + action_expert + action_norms + action_conditioning
+            ),
+            "total_parameters": self._parameter_count(self),
+        }
+
+    def world_loss_weight_at_step(self, global_step: int) -> float:
+        """Return the checkpoint-configured world weight for one optimizer step."""
+
+        if not self.world_loss_schedule_enabled:
+            return self.world_loss_weight
+        return (
+            self.world_loss_schedule_before
+            if int(global_step) < self.world_loss_schedule_transition_step
+            else self.world_loss_schedule_after
+        )
+
     def set_action_correlation(self, chol: torch.Tensor) -> None:
         chol = torch.as_tensor(chol, dtype=torch.float32, device="cpu")
         if tuple(chol.shape) != tuple(self._action_corr_chol.shape):
@@ -334,14 +548,34 @@ class ActionWorldCoFlowModel(nn.Module):
         self._action_corr_chol.copy_(chol.to(self._action_corr_chol.device))
         self._action_corr_loaded = True
 
-    def _sample_action_noise(self, batch_size: int, device, dtype) -> torch.Tensor:
+    def _sample_action_noise(
+        self,
+        batch_size: int,
+        device,
+        dtype,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
         if not self.use_correlated_noise:
-            return torch.randn(batch_size, self.action_horizon, self.action_dim, device=device, dtype=dtype)
+            return torch.randn(
+                batch_size,
+                self.action_horizon,
+                self.action_dim,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
         if not self._action_corr_loaded:
             raise RuntimeError(
                 "use_correlated_noise=true but no Cholesky factor was injected before Action--World Co-Flow"
             )
-        base = torch.randn(batch_size, self.action_horizon * self.action_dim, device=device, dtype=dtype)
+        base = torch.randn(
+            batch_size,
+            self.action_horizon * self.action_dim,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
         chol = self._action_corr_chol.to(device=device, dtype=dtype)
         return (base @ chol.T).reshape(batch_size, self.action_horizon, self.action_dim)
 
@@ -368,17 +602,11 @@ class ActionWorldCoFlowModel(nn.Module):
         context_valid: torch.Tensor,
         state: torch.Tensor | None,
         z0: torch.Tensor,
-        a1: torch.Tensor,
-        z16: torch.Tensor,
-        tau_a1: torch.Tensor,
-        tau_z16: torch.Tensor,
-        a2: torch.Tensor | None = None,
-        z32: torch.Tensor | None = None,
-        tau_a2: torch.Tensor | None = None,
-        tau_z32: torch.Tensor | None = None,
-        block1_clean_prefix: bool = False,
-        a1_valid: torch.Tensor | None = None,
-        a2_valid: torch.Tensor | None = None,
+        action: torch.Tensor,
+        future: torch.Tensor,
+        tau_action: torch.Tensor,
+        tau_world: torch.Tensor,
+        action_valid: torch.Tensor | None = None,
     ) -> SequenceResult:
         batch, context_length, _ = context.shape
         if context_valid.shape != (batch, context_length):
@@ -427,37 +655,24 @@ class ActionWorldCoFlowModel(nn.Module):
             append("state", self.state_projection(state).unsqueeze(1), TOKEN_CONTEXT, 0, 1.0)
         append("z0", self.world_input_projection(z0) + world_pos, TOKEN_WORLD, 0, 1.0)
 
-        action_pos1 = self.action_position_embedding(torch.arange(0, 16, device=device)).unsqueeze(0)
+        action_position = self.action_position_embedding(
+            torch.arange(self.action_horizon, device=device)
+        ).unsqueeze(0)
         append(
-            "a1",
-            self.action_input_projection(a1) + action_pos1,
+            "action",
+            self.action_input_projection(action) + action_position,
             TOKEN_ACTION,
             1,
-            1.0 if block1_clean_prefix else tau_a1,
-            valid=a1_valid,
+            tau_action,
+            valid=action_valid,
         )
         append(
-            "z16",
-            self.world_input_projection(z16) + world_pos,
+            "future",
+            self.world_input_projection(future) + world_pos,
             TOKEN_WORLD,
             1,
-            1.0 if block1_clean_prefix else tau_z16,
+            tau_world,
         )
-
-        has_block2 = any(value is not None for value in (a2, z32, tau_a2, tau_z32))
-        if has_block2:
-            if any(value is None for value in (a2, z32, tau_a2, tau_z32)):
-                raise ValueError("block 2 requires a2, z32, tau_a2, and tau_z32 together")
-            action_pos2 = self.action_position_embedding(torch.arange(16, 32, device=device)).unsqueeze(0)
-            append(
-                "a2",
-                self.action_input_projection(a2) + action_pos2,
-                TOKEN_ACTION,
-                2,
-                tau_a2,
-                valid=a2_valid,
-            )
-            append("z32", self.world_input_projection(z32) + world_pos, TOKEN_WORLD, 2, tau_z32)
 
         token_type_ids = torch.cat(type_pieces, dim=0)
         block_ids = torch.cat(block_pieces, dim=0)
@@ -515,54 +730,6 @@ class ActionWorldCoFlowModel(nn.Module):
         valid_f = valid.to(device=per_sample.device, dtype=per_sample.dtype)
         return (per_sample * valid_f).sum() / valid_f.sum().clamp_min(1.0)
 
-    def teacher_ratio(self, global_step: int) -> float:
-        progress = min(max(int(global_step), 0) / float(self.z16_teacher_decay_steps), 1.0)
-        return self.z16_teacher_ratio_start + progress * (
-            self.z16_teacher_ratio_end - self.z16_teacher_ratio_start
-        )
-
-    def _choose_intermediate_source(
-        self,
-        z16_target: torch.Tensor,
-        z16_prediction: torch.Tensor,
-        future_valid_16: torch.Tensor,
-        global_step: int,
-        teacher_eligible: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, float]:
-        batch = z16_target.shape[0]
-        future_valid_16 = future_valid_16.reshape(batch).to(device=z16_target.device, dtype=torch.bool)
-        if teacher_eligible is None:
-            teacher_eligible = future_valid_16
-        else:
-            teacher_eligible = teacher_eligible.reshape(batch).to(
-                device=z16_target.device, dtype=torch.bool
-            ) & future_valid_16
-        source = self.intermediate_state_source
-        if source == "ground_truth":
-            # An episode-tail clamp isn't a real teacher target.  Fall back to
-            # a detached model prediction for those samples so padded future
-            # images can neither leak into valid action tokens nor create an
-            # accidental Stage-2 -> Stage-1 gradient path in this ablation.
-            teacher_mask = future_valid_16
-            mixed = torch.where(
-                teacher_mask[:, None, None],
-                z16_target,
-                z16_prediction.detach(),
-            )
-            return mixed, teacher_mask, 1.0
-        if source == "predicted_e2e":
-            teacher_mask = torch.zeros(batch, device=z16_target.device, dtype=torch.bool)
-            return z16_prediction, teacher_mask, 0.0
-        prediction = z16_prediction.detach() if (source == "predicted_detach" or self.predicted_z16_detach) else z16_prediction
-        if source == "predicted_detach":
-            teacher_mask = torch.zeros(batch, device=z16_target.device, dtype=torch.bool)
-            return prediction, teacher_mask, 0.0
-
-        configured_ratio = self.teacher_ratio(global_step)
-        teacher_mask = (torch.rand(batch, device=z16_target.device) < configured_ratio) & teacher_eligible
-        mixed = torch.where(teacher_mask[:, None, None], z16_target, prediction)
-        return mixed, teacher_mask, configured_ratio
-
     def forward_train(
         self,
         *,
@@ -570,12 +737,10 @@ class ActionWorldCoFlowModel(nn.Module):
         context_valid: torch.Tensor,
         z0: torch.Tensor,
         z16_target: torch.Tensor,
-        z32_target: torch.Tensor,
         actions: torch.Tensor,
         state: torch.Tensor | None,
         action_is_pad: torch.Tensor | None,
         future_valid_16: torch.Tensor,
-        future_valid_32: torch.Tensor,
         global_step: int,
     ) -> dict[str, torch.Tensor]:
         batch = actions.shape[0]
@@ -587,139 +752,74 @@ class ActionWorldCoFlowModel(nn.Module):
         else:
             action_is_pad = action_is_pad.to(device=actions.device, dtype=torch.bool)
             if tuple(action_is_pad.shape) != (batch, self.action_horizon):
-                raise ValueError(f"action_is_pad must be [B,32], got {tuple(action_is_pad.shape)}")
+                raise ValueError(
+                    f"action_is_pad must be [B,{self.action_horizon}], got {tuple(action_is_pad.shape)}"
+                )
 
-        future_valid_16 = future_valid_16.reshape(batch).to(device=actions.device, dtype=torch.bool)
-        future_valid_32 = future_valid_32.reshape(batch).to(device=actions.device, dtype=torch.bool)
-        if bool((future_valid_32 & ~future_valid_16).any()):
-            raise ValueError("future_valid_32=true requires future_valid_16=true for an ordered episode")
-
+        future_valid_16 = future_valid_16.reshape(batch).to(
+            device=actions.device, dtype=torch.bool
+        )
         plane = self.noise_plane.sample(batch, actions.device, actions.dtype)
         action_noise = self._sample_action_noise(batch, actions.device, actions.dtype)
-        world_noise16 = torch.randn_like(z16_target)
-        world_noise32 = torch.randn_like(z32_target)
-        a1_target, a2_target = actions[:, :16], actions[:, 16:]
-        eps1, eps2 = action_noise[:, :16], action_noise[:, 16:]
-        tau_a1, tau_a2 = plane.tau_action[:, 0], plane.tau_action[:, 1]
-        tau_z16 = torch.where(future_valid_16, plane.tau_world[:, 0], torch.zeros_like(plane.tau_world[:, 0]))
-        tau_z32 = torch.where(future_valid_32, plane.tau_world[:, 1], torch.zeros_like(plane.tau_world[:, 1]))
-
-        a1_noisy = (1.0 - tau_a1[:, None, None]) * eps1 + tau_a1[:, None, None] * a1_target
-        z16_noisy = self.world_bridge.interpolate(z0, z16_target, tau_z16, world_noise16)
-        stage1 = self._assemble_sequence(
-            context=context,
-            context_valid=context_valid,
-            state=state,
-            z0=z0,
-            a1=a1_noisy,
-            z16=z16_noisy,
-            tau_a1=tau_a1,
-            tau_z16=tau_z16,
-            a1_valid=~action_is_pad[:, :16],
-        )
-        _, a1_velocity, a1_prediction = self._action_outputs(
-            stage1.hidden[:, stage1.slices["a1"]], a1_noisy, tau_a1
-        )
-        _, z16_prediction = self._world_outputs(stage1.hidden[:, stage1.slices["z16"]], z0)
-
-        forward_edge = plane.mode_ids == MODE_TO_ID["forward"]
-        inverse_edge = plane.mode_ids == MODE_TO_ID["inverse"]
-        policy_edge = plane.mode_ids == MODE_TO_ID["policy"]
-        # The policy locus must generate the *entire* 32-step action without
-        # clean future information, including Block 2.  It therefore uses
-        # predicted Z16 from step 0 even while scheduled teacher forcing is
-        # active for other eligible modes.  Inverse has its own explicit clean
-        # transition semantics and is applied immediately below.
-        teacher_eligible = future_valid_16 & ~policy_edge & ~inverse_edge
-        z16_source, teacher_mask, configured_teacher_ratio = self._choose_intermediate_source(
-            z16_target,
-            z16_prediction,
+        world_noise = torch.randn_like(z16_target)
+        tau_action = plane.tau_action
+        tau_world = torch.where(
             future_valid_16,
-            global_step,
-            teacher_eligible=teacher_eligible,
+            plane.tau_world,
+            torch.zeros_like(plane.tau_world),
         )
-        # Preserve the exact semantics of the two clean conditioning edges.
-        # Forward mode supplies clean actions, so Block 2 must see clean A1
-        # rather than an unsupervised endpoint-head estimate at tau_a=1.
-        # Inverse mode supplies the clean transition, so its valid Z16 prefix
-        # is GT by definition.  All other modes retain the configured
-        # scheduled/predicted sequential exposure used at policy inference.
-        predicted_a1_prefix = a1_prediction.detach() if self.predicted_action_prefix_detach else a1_prediction
-        a1_prefix = torch.where(forward_edge[:, None, None], a1_target, predicted_a1_prefix)
-        inverse_clean_z16 = inverse_edge & future_valid_16
-        z16_source = torch.where(inverse_clean_z16[:, None, None], z16_target, z16_source)
-        a2_noisy = (1.0 - tau_a2[:, None, None]) * eps2 + tau_a2[:, None, None] * a2_target
-        z32_noisy = self.world_bridge.interpolate(z16_source, z32_target, tau_z32, world_noise32)
-        stage2 = self._assemble_sequence(
+        noisy_action = (
+            (1.0 - tau_action[:, None, None]) * action_noise
+            + tau_action[:, None, None] * actions
+        )
+        noisy_future = self.world_bridge.interpolate(
+            z0, z16_target, tau_world, world_noise
+        )
+        bridge = self._assemble_sequence(
             context=context,
             context_valid=context_valid,
             state=state,
             z0=z0,
-            a1=a1_prefix,
-            z16=z16_source,
-            tau_a1=torch.ones_like(tau_a1),
-            tau_z16=torch.ones_like(tau_z16),
-            a2=a2_noisy,
-            z32=z32_noisy,
-            tau_a2=tau_a2,
-            tau_z32=tau_z32,
-            block1_clean_prefix=True,
-            a1_valid=~action_is_pad[:, :16],
-            a2_valid=~action_is_pad[:, 16:],
+            action=noisy_action,
+            future=noisy_future,
+            tau_action=tau_action,
+            tau_world=tau_world,
+            action_valid=~action_is_pad,
         )
-        _, a2_velocity, _ = self._action_outputs(stage2.hidden[:, stage2.slices["a2"]], a2_noisy, tau_a2)
-        _, z32_prediction = self._world_outputs(stage2.hidden[:, stage2.slices["z32"]], z16_source)
+        _, action_velocity, _ = self._action_outputs(
+            bridge.hidden[:, bridge.slices["action"]], noisy_action, tau_action
+        )
+        _, z16_prediction = self._world_outputs(
+            bridge.hidden[:, bridge.slices["future"]], z0
+        )
 
         if self.action_prediction_type == "velocity":
-            target_velocity1 = a1_target - eps1
-            target_velocity2 = a2_target - eps2
+            target_velocity = actions - action_noise
         else:
             # This exactly mirrors FlowmatchingActionHead's JiT clean-x
             # target conversion, including its near-endpoint denominator cap.
-            target_velocity1 = action_prediction_to_velocity(
-                a1_target,
-                a1_noisy,
-                tau_a1[:, None, None],
+            target_velocity = action_prediction_to_velocity(
+                actions,
+                noisy_action,
+                tau_action[:, None, None],
                 prediction_type="jit_x",
                 t_eps=self.jit_t_eps,
             )
-            target_velocity2 = action_prediction_to_velocity(
-                a2_target,
-                a2_noisy,
-                tau_a2[:, None, None],
-                prediction_type="jit_x",
-                t_eps=self.jit_t_eps,
-            )
-        action_error = torch.cat(
-            [(a1_velocity - target_velocity1).pow(2), (a2_velocity - target_velocity2).pow(2)], dim=1
-        )
-        tau_action_valid = torch.cat(
-            [
-                (tau_a1 < 1.0 - 1.0e-6)[:, None].expand(-1, 16),
-                (tau_a2 < 1.0 - 1.0e-6)[:, None].expand(-1, 16),
-            ],
-            dim=1,
-        )
-        action_valid = (~action_is_pad) & tau_action_valid
-        action_loss = self._masked_action_loss(action_error, action_valid)
 
-        z16_valid = future_valid_16 & (tau_z16 < 1.0 - 1.0e-6)
-        z32_valid = future_valid_32 & (tau_z32 < 1.0 - 1.0e-6)
+        action_error = (action_velocity - target_velocity).pow(2)
+        action_time_valid = (tau_action < 1.0 - 1.0e-6)[:, None].expand(
+            -1, self.action_horizon
+        )
+        action_valid = (~action_is_pad) & action_time_valid
+        action_loss = self._masked_action_loss(action_error, action_valid)
+        z16_valid = future_valid_16 & (tau_world < 1.0 - 1.0e-6)
         z16_loss = self._masked_world_loss(z16_prediction, z16_target, z16_valid)
-        z32_loss = self._masked_world_loss(z32_prediction, z32_target, z32_valid)
-        world_loss = self.z16_loss_weight * z16_loss + self.z32_loss_weight * z32_loss
+        world_loss = z16_loss
         weighted_action_loss = self.action_loss_weight * action_loss
-        weighted_world_loss = self.world_loss_weight * world_loss
+        active_world_loss_weight = self.world_loss_weight_at_step(global_step)
+        weighted_world_loss = active_world_loss_weight * world_loss
         total = weighted_action_loss + weighted_world_loss
 
-        schedule_eligible = future_valid_16 & ~inverse_edge
-        schedule_count = schedule_eligible.float().sum().clamp_min(1.0)
-        teacher_realized = (teacher_mask & schedule_eligible).float().sum() / schedule_count
-        predicted_realized = ((~teacher_mask) & schedule_eligible).float().sum() / schedule_count
-        actual_gt_prefix = teacher_mask | inverse_clean_z16
-        valid16_count = future_valid_16.float().sum().clamp_min(1.0)
-        policy_valid = policy_edge & future_valid_16
-        policy_valid_count = policy_valid.float().sum().clamp_min(1.0)
         metrics: dict[str, torch.Tensor] = {
             "action_loss": total,
             "coflow_action_loss_raw": action_loss.detach(),
@@ -730,107 +830,103 @@ class ActionWorldCoFlowModel(nn.Module):
                 weighted_world_loss.detach().abs() / weighted_action_loss.detach().abs().clamp_min(1.0e-12)
             ),
             "coflow_z16_loss_raw": z16_loss.detach(),
-            "coflow_z32_loss_raw": z32_loss.detach(),
-            "coflow_teacher_ratio_configured": total.new_tensor(configured_teacher_ratio),
-            "coflow_teacher_ratio_realized": teacher_realized.detach(),
-            "coflow_predicted_z16_ratio": predicted_realized.detach(),
-            "coflow_actual_gt_z16_prefix_ratio": (
-                (actual_gt_prefix & future_valid_16).float().sum() / valid16_count
-            ).detach(),
-            "coflow_policy_predicted_z16_prefix_ratio": (
-                ((~actual_gt_prefix) & policy_valid).float().sum() / policy_valid_count
-            ).detach(),
-            "coflow_forward_clean_action_prefix_ratio": forward_edge.float().mean().detach(),
-            "coflow_inverse_clean_z16_prefix_ratio": inverse_clean_z16.float().mean().detach(),
             "coflow_future_valid_16_ratio": future_valid_16.float().mean().detach(),
-            "coflow_future_valid_32_ratio": future_valid_32.float().mean().detach(),
             "coflow_z16_valid_ratio": z16_valid.float().mean().detach(),
-            "coflow_z32_valid_ratio": z32_valid.float().mean().detach(),
             "coflow_action_nonpad_ratio": (~action_is_pad).float().mean().detach(),
             "coflow_action_valid_ratio": action_valid.float().mean().detach(),
         }
+        if self.world_loss_schedule_enabled:
+            metrics["coflow_world_loss_weight"] = total.new_tensor(
+                active_world_loss_weight
+            )
         for name, fraction in self.noise_plane.fractions(plane.mode_ids).items():
             metrics[f"coflow_mode_{name}_ratio"] = fraction.detach()
         if self.log_attention_statistics:
-            metrics["coflow_attention_allowed_fraction"] = stage2.attention_mask.float().mean().detach()
+            metrics["coflow_attention_allowed_fraction"] = (
+                bridge.attention_mask.float().mean().detach()
+            )
         return metrics
 
-    @staticmethod
-    def _next_event(index: int, steps: int) -> float:
-        return (index + 1) / float(steps) if index < steps else math.inf
-
-    def _sample_block(
+    def _sample_bridge(
         self,
         *,
         context: torch.Tensor,
         context_valid: torch.Tensor,
         state: torch.Tensor | None,
         z0: torch.Tensor,
-        world_start: torch.Tensor,
         action_noise: torch.Tensor,
-        prefix_action: torch.Tensor | None,
-        prefix_world: torch.Tensor | None,
+        inference_mode: str,
+        generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample one physical 16-step bridge.
+
+        ``policy`` follows the policy edge of the training time plane:
+        :math:`tau_a:0\rightarrow1` while :math:`tau_z=0`.  The world head is
+        evaluated but its state is never fed back into action integration.
+
+        ``diagonal`` follows the tied path :math:`tau_a=tau_z`; action and
+        future state are advanced together.
+        """
+
+        inference_mode = str(inference_mode).lower()
+        if inference_mode not in {"policy", "diagonal"}:
+            raise ValueError(
+                f"inference_mode must be 'policy' or 'diagonal', got {inference_mode!r}"
+            )
         batch = context.shape[0]
         action = action_noise
-        world = world_start
-        action_tau = 0.0
-        world_tau = 0.0
-        action_index = 0
-        world_index = 0
+        world = z0
+        predicted_world = z0
 
-        while action_index < self.action_inference_steps or world_index < self.world_inference_steps:
+        if inference_mode == "diagonal" and self.action_inference_steps != self.world_inference_steps:
+            raise ValueError(
+                "diagonal inference requires equal action/world integration steps so tau_a=tau_z "
+                f"exactly, got action={self.action_inference_steps}, world={self.world_inference_steps}"
+            )
+        steps = self.action_inference_steps
+        for index in range(steps):
+            action_tau = index / float(steps)
+            world_tau = action_tau if inference_mode == "diagonal" else 0.0
             tau_a = torch.full((batch,), action_tau, device=context.device, dtype=context.dtype)
             tau_z = torch.full((batch,), world_tau, device=context.device, dtype=context.dtype)
-            if prefix_action is None:
-                result = self._assemble_sequence(
-                    context=context,
-                    context_valid=context_valid,
-                    state=state,
-                    z0=z0,
-                    a1=action,
-                    z16=world,
-                    tau_a1=tau_a,
-                    tau_z16=tau_z,
+            result = self._assemble_sequence(
+                context=context,
+                context_valid=context_valid,
+                state=state,
+                z0=z0,
+                action=action,
+                future=world,
+                tau_action=tau_a,
+                tau_world=tau_z,
+            )
+            _, velocity, _ = self._action_outputs(
+                result.hidden[:, result.slices["action"]], action, tau_a
+            )
+            _, clean_world = self._world_outputs(
+                result.hidden[:, result.slices["future"]], z0
+            )
+            predicted_world = clean_world
+            next_tau = (index + 1) / float(steps)
+            action = action + (next_tau - action_tau) * velocity
+            if inference_mode == "diagonal":
+                marginal_noise = (
+                    torch.randn(
+                        z0.shape,
+                        device=z0.device,
+                        dtype=z0.dtype,
+                        generator=generator,
+                    )
+                    if generator is not None and next_tau < 1.0 - 1.0e-12
+                    else None
                 )
-                action_slice, world_slice = result.slices["a1"], result.slices["z16"]
-            else:
-                result = self._assemble_sequence(
-                    context=context,
-                    context_valid=context_valid,
-                    state=state,
-                    z0=z0,
-                    a1=prefix_action,
-                    z16=prefix_world,
-                    tau_a1=torch.ones_like(tau_a),
-                    tau_z16=torch.ones_like(tau_z),
-                    a2=action,
-                    z32=world,
-                    tau_a2=tau_a,
-                    tau_z32=tau_z,
-                    block1_clean_prefix=True,
-                )
-                action_slice, world_slice = result.slices["a2"], result.slices["z32"]
-
-            _, velocity, _ = self._action_outputs(result.hidden[:, action_slice], action, tau_a)
-            _, clean_world = self._world_outputs(result.hidden[:, world_slice], world_start)
-            next_action = self._next_event(action_index, self.action_inference_steps)
-            next_world = self._next_event(world_index, self.world_inference_steps)
-            event = min(next_action, next_world)
-            if abs(next_action - event) < 1.0e-12:
-                action = action + (next_action - action_tau) * velocity
-                action_tau = next_action
-                action_index += 1
-            if abs(next_world - event) < 1.0e-12:
                 world = self.world_bridge.reproject(
-                    world_start,
+                    z0,
                     clean_world,
-                    next_world,
-                    add_marginal_noise=next_world < 1.0 - 1.0e-12,
+                    next_tau,
+                    add_marginal_noise=next_tau < 1.0 - 1.0e-12,
+                    noise=marginal_noise,
                 )
-                world_tau = next_world
-                world_index += 1
-        return action, world
+        return action, world if inference_mode == "diagonal" else predicted_world
 
     def sample_actions(
         self,
@@ -839,28 +935,35 @@ class ActionWorldCoFlowModel(nn.Module):
         context_valid: torch.Tensor,
         z0: torch.Tensor,
         state: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Inference from current observation only; no future target arguments exist."""
+        inference_mode: str | None = None,
+        output_horizon: int | None = None,
+        inference_seed: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Infer one H16 action/future bridge from the current observation."""
 
-        noise = self._sample_action_noise(context.shape[0], context.device, context.dtype)
-        action1, z16_prediction = self._sample_block(
+        mode = self.default_inference_mode if inference_mode is None else str(inference_mode).lower()
+        horizon = self.action_horizon if output_horizon is None else int(output_horizon)
+        if mode not in {"policy", "diagonal"}:
+            raise ValueError(f"Unsupported Co-Flow inference_mode={mode!r}")
+        if horizon != self.action_horizon:
+            raise ValueError(f"single-bridge Co-Flow output_horizon must be 16, got {horizon}")
+
+        generator = None
+        if inference_seed is not None:
+            if int(inference_seed) < 0:
+                raise ValueError(f"inference_seed must be non-negative, got {inference_seed}")
+            generator = torch.Generator(device=context.device)
+            generator.manual_seed(int(inference_seed))
+        noise = self._sample_action_noise(
+            context.shape[0], context.device, context.dtype, generator=generator
+        )
+        actions, z16_prediction = self._sample_bridge(
             context=context,
             context_valid=context_valid,
             state=state,
             z0=z0,
-            world_start=z0,
-            action_noise=noise[:, :16],
-            prefix_action=None,
-            prefix_world=None,
+            action_noise=noise,
+            inference_mode=mode,
+            generator=generator,
         )
-        action2, z32_prediction = self._sample_block(
-            context=context,
-            context_valid=context_valid,
-            state=state,
-            z0=z0,
-            world_start=z16_prediction,
-            action_noise=noise[:, 16:],
-            prefix_action=action1,
-            prefix_world=z16_prediction,
-        )
-        return torch.cat([action1, action2], dim=1), z16_prediction, z32_prediction
+        return actions, z16_prediction

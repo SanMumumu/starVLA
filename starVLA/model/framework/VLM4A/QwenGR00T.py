@@ -12,7 +12,6 @@ import sys
 from pathlib import Path
 
 #######
-# 中文注释：JointFlow 分支需要在局部禁用 autocast，并为 unused-parameter anchor 遍历模块参数。
 from contextlib import nullcontext
 import json
 
@@ -30,7 +29,6 @@ import numpy as np
 import torch
 
 #######
-# 中文注释：JointFlow 迁移到 QwenGR00T 后会新增若干可训练子模块，统一使用 nn.Module 类型标注。
 from torch import nn
 
 #######
@@ -52,8 +50,6 @@ from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 
 #######
-# 中文注释：复用 JointFlow 已验证的 DINO token、query token、visual flow head 模块；
-# 这些模块只在 framework.jointflow.enabled=true 时实例化，默认不影响原生 QwenGR00T。
 from starVLA.model.framework.VLM4A.jointflow.attention_mask import build_block_causal_mask
 from starVLA.model.framework.VLM4A.jointflow.dino_v3 import (
     DINOv3Backbone,
@@ -160,11 +156,8 @@ class QwenGR00TDefaultConfig:
     )
 
     #######
-    # 中文注释：JointFlow 迁移开关与默认配置。enabled 默认关闭，保证旧 QwenGR00T 配置、
-    # checkpoint、训练和推理路径不实例化任何新增模块，也不改变原有 action_loss 语义。
     jointflow: dict = field(default_factory=lambda: {"enabled": False})
 
-    # 中文注释：JointFlow future-DINO 条件分支配置；启用后用于在线/离线 DINO latent 处理。
     dino: dict = field(
         default_factory=lambda: {
             "name": "dinov3_vits16",
@@ -182,11 +175,7 @@ class QwenGR00TDefaultConfig:
         }
     )
 
-    # 中文注释：state 与原生 gr00t 完全一致——走 action head 内部 state_encoder（state_dim 在 action_model 里），
-    # 由 datasets.vla_data.include_state 控制是否真喂（原生 LIBERO recipe 默认 false，即声明但惰性、实际不用）。
-    # 不再有 jointflow 特有的 state-token 机制。
 
-    # 中文注释：JointFlow 多任务采样与 block attention mask 配置。
     tasks: dict = field(
         default_factory=lambda: {
             "weights": {"policy": 1.0},
@@ -195,7 +184,6 @@ class QwenGR00TDefaultConfig:
         }
     )
 
-    # 中文注释：future DINO flow-matching head 配置，fdm/passive 任务使用。
     visual_model: dict = field(
         default_factory=lambda: {
             "d_dino": 384,
@@ -252,22 +240,18 @@ class Qwen_GR00T(baseframework):
         # Merge framework defaults with YAML config (YAML wins on conflicts)
         self.config = merge_framework_config(QwenGR00TDefaultConfig, config)
         self._validate_joint_e2e_contract()
+        self._validate_wam_two_stage_contract()
         self.qwen_vl_interface = get_vlm_model(config=self.config)
         # align dims --> we should put them to config or no?
         self.config.framework.action_model.diffusion_model_cfg.cross_attention_dim = (
             self.qwen_vl_interface.model.config.hidden_size
         )
         #######
-        # 中文注释：JointFlow 分支显式开关。默认 false，保持原生 QwenGR00T 完全不变。
-        # state 与原生 gr00t 一致——走 action head 的 state_encoder（state_dim 由 action_model 配置，
-        # include_state=false 时惰性不用），不再强制 state_dim=0、不再用 jointflow state-token。
         self.jointflow_enabled = bool(self.config.framework.get("jointflow", {}).get("enabled", False))
         if self.jointflow_enabled:
             self.config.framework.visual_model.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
         #######
         #######
-        # 中文注释：WAM 分支开关（参考 LaWAM）：qwenvl-gr00t 原生视觉 policy + DINO 只做监督头。
-        # 与 jointflow 互斥——jointflow 把 DINO 当 policy 视觉；wam 用 Qwen 原生视觉，DINO 仅作 future 监督 target，推理不碰。
         self.wam_enabled = bool(self.config.framework.get("wam", {}).get("enabled", False))
         if self.wam_enabled:
             self.config.framework.visual_model.cross_attention_dim = self.qwen_vl_interface.model.config.hidden_size
@@ -279,13 +263,7 @@ class Qwen_GR00T(baseframework):
         #######
 
         #######
-        # 中文注释：动作头骨干选择——默认 GR00T DiT-B；`framework.action_model.backbone: wan` 时换成
-        # Wan-初始化动作头（Wan DiTBlock 架构 + Wan 视频 DiT 骨干截断/插值初始化，参考 FastWAM）。
-        # 对外接口与 FlowmatchingActionHead 完全一致（forward/predict_action/set_action_correlation），
-        # 所以 wam/native 调用处都不用改。
         #######
-        # 中文注释：World→Action guidance 的 M5/M6/M6+ 需要 action DiT 内建 world 子模块（world_attn / world_to_temb），
-        # 必须在构造 action head 之前把开关写进 diffusion_model_cfg。M4(alternate)/concat-family 不需要新参数。
         self._inject_guidance_dit_flags()
         #######
         action_backbone = str(self.config.framework.action_model.get("backbone", "gr00t")).lower()
@@ -303,30 +281,52 @@ class Qwen_GR00T(baseframework):
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
         #######
-        # 中文注释：JointFlow 相关模块只在开关打开时构造，避免旧 checkpoint strict load 出现新增参数。
         if self.jointflow_enabled:
             self._init_jointflow_modules()
         #######
         #######
         if self.wam_enabled:
-            self._init_wam_modules()
+            recipe = str(
+                self.config.trainer.get("wam_two_stage_recipe", "legacy_v1")
+                if getattr(self.config, "trainer", None) is not None
+                else "legacy_v1"
+            ).lower()
+            if recipe == "baseline_preserving_v3":
+                # Auxiliary token rows, predictor, conditioners and adapters
+                # need random initialization, but must not advance the policy
+                # RNG beyond native baseline model construction.  All modules
+                # are still on CPU at this point; runtime CUDA RNG is isolated
+                # separately around every auxiliary forward.
+                with torch.random.fork_rng(devices=[], enabled=True):
+                    self._init_wam_modules()
+            else:
+                self._init_wam_modules()
         #######
 
     #######
     def _validate_joint_e2e_contract(self) -> None:
-        """Fail before loading large backbones if joint E2E semantics are broken."""
+        """Fail before loading large backbones if a joint WAM objective is broken.
+
+        ``joint_e2e`` preserves the original action->world gradient experiment.
+        ``joint_detached`` computes the same action + world objectives on every
+        batch, but requires the policy path to treat the predicted future as a
+        detached condition.  Keeping distinct task names prevents a config
+        merge from silently changing the gradient contract.
+        """
 
         framework = self.config.framework
         tasks = framework.get("tasks", {})
         weights = tasks.get("weights", {}) if hasattr(tasks, "get") else {}
         active = [str(name) for name, weight in weights.items() if float(weight) > 0.0]
-        if "joint_e2e" not in active:
+        joint_tasks = [name for name in active if name in {"joint_e2e", "joint_detached"}]
+        if not joint_tasks:
             return
-        if active != ["joint_e2e"]:
+        if len(joint_tasks) != 1 or len(active) != 1:
             raise ValueError(
-                "joint_e2e is an exclusive task because each of its batches already computes "
+                "joint_e2e/joint_detached is exclusive because each batch already computes "
                 f"action_loss + world_loss; active tasks={active}."
             )
+        joint_task = joint_tasks[0]
 
         wam = framework.get("wam", {})
         guidance = wam.get("guidance", {}) if hasattr(wam, "get") else {}
@@ -341,18 +341,45 @@ class Qwen_GR00T(baseframework):
             problems.append("guidance.exclude_post_query_context must be true")
         if str(guidance.get("bridge_source", "")).lower() != "predicted":
             problems.append("guidance.bridge_source must be predicted")
-        if bool(guidance.get("detach_world", True)):
-            problems.append("guidance.detach_world must be false")
+        detach_world = bool(guidance.get("detach_world", True))
+        if joint_task == "joint_e2e" and detach_world:
+            problems.append("joint_e2e requires guidance.detach_world=false")
+        if joint_task == "joint_detached" and not detach_world:
+            problems.append("joint_detached requires guidance.detach_world=true")
+        if joint_task == "joint_detached" and not bool(
+            guidance.get("detached_prediction_eval_mode", False)
+        ):
+            problems.append(
+                "joint_detached requires guidance.detached_prediction_eval_mode=true "
+                "so policy training samples the world head with inference-time dropout semantics"
+            )
+        if not bool(guidance.get("world_to_action_enabled", True)) and not bool(
+            guidance.get("action_world_bypass", False)
+        ):
+            problems.append(
+                "guidance.world_to_action_enabled=false requires "
+                "guidance.action_world_bypass=true"
+            )
         if str(guidance.get("signal", "")).lower() not in {"z_pred", "delta_z_pred"}:
             problems.append("guidance.signal must be z_pred or delta_z_pred")
         if float(wam.get("dino_loss_weight", 0.0)) <= 0.0:
             problems.append("framework.wam.dino_loss_weight must be positive")
         action_cfg = framework.get("action_model", {})
+        if bool(guidance.get("world_condition_on_state", False)):
+            datasets_cfg = getattr(self.config, "datasets", None)
+            vla_cfg = datasets_cfg.get("vla_data", {}) if datasets_cfg is not None else {}
+            if int(action_cfg.get("state_dim", 0)) <= 0:
+                problems.append("world_condition_on_state requires action_model.state_dim > 0")
+            if not bool(vla_cfg.get("include_state", False)):
+                problems.append("world_condition_on_state requires datasets.vla_data.include_state=true")
         if bool(action_cfg.get("use_correlated_noise", False)):
             problems.append("framework.action_model.use_correlated_noise must be false for the E2E experiment")
 
         ramp = guidance.get("action_world_gradient_ramp", {})
-        if hasattr(ramp, "get") and bool(ramp.get("enabled", False)):
+        ramp_enabled = hasattr(ramp, "get") and bool(ramp.get("enabled", False))
+        if joint_task == "joint_detached" and ramp_enabled:
+            problems.append("joint_detached forbids action_world_gradient_ramp; the action->world scale is fixed at zero")
+        if ramp_enabled:
             start = int(ramp.get("start_step", 0))
             end = int(ramp.get("end_step", 0))
             start_scale = float(ramp.get("start_scale", 0.0))
@@ -364,11 +391,149 @@ class Qwen_GR00T(baseframework):
                     f"gradient ramp scales must be non-negative, got {start_scale} -> {end_scale}"
                 )
         if problems:
-            raise ValueError("Invalid joint_e2e configuration: " + "; ".join(problems))
+            raise ValueError(f"Invalid {joint_task} configuration: " + "; ".join(problems))
+
+    def _validate_wam_two_stage_contract(self) -> None:
+        """Fail early when the strict 80k warmup -> 20k gate-FT recipe drifts.
+
+        This contract is opt-in through ``trainer.wam_two_stage_phase`` and
+        therefore leaves historical configs/checkpoints untouched.
+        """
+
+        trainer = getattr(self.config, "trainer", None)
+        phase = str(trainer.get("wam_two_stage_phase", "") if trainer is not None else "").lower()
+        if not phase:
+            return
+        if phase not in {"predictor_warmup", "gate_ft"}:
+            raise ValueError(
+                "trainer.wam_two_stage_phase must be predictor_warmup or gate_ft, "
+                f"got {phase!r}"
+            )
+        recipe = str(trainer.get("wam_two_stage_recipe", "legacy_v1") or "legacy_v1").lower()
+        if recipe not in {"legacy_v1", "policy_first_v2", "baseline_preserving_v3"}:
+            raise ValueError(
+                "trainer.wam_two_stage_recipe must be legacy_v1, policy_first_v2, "
+                "or baseline_preserving_v3, "
+                f"got {recipe!r}"
+            )
+
+        framework = self.config.framework
+        wam = framework.get("wam", {})
+        guidance = wam.get("guidance", {})
+        weights = framework.get("tasks", {}).get("weights", {})
+        active = [str(name) for name, weight in weights.items() if float(weight) > 0.0]
+        action_cfg = framework.get("action_model", {})
+        datasets_cfg = getattr(self.config, "datasets", None)
+        vla_cfg = datasets_cfg.get("vla_data", {}) if datasets_cfg is not None else {}
+        world_val = trainer.get("world_validation", {})
+        problems: list[str] = []
+
+        if bool(action_cfg.get("use_correlated_noise", False)):
+            problems.append("action_model.use_correlated_noise must be false")
+        if any(str(key).startswith("correlation_") for key in action_cfg.keys()):
+            problems.append("action_model must not contain correlation_* keys")
+        if not bool(vla_cfg.get("include_state", False)):
+            problems.append("datasets.vla_data.include_state must be true")
+        if not bool(guidance.get("world_condition_on_state", False)):
+            problems.append("guidance.world_condition_on_state must be true")
+        if str(guidance.get("bridge_source", "")).lower() != "predicted":
+            problems.append("guidance.bridge_source must be predicted")
+        if not bool(guidance.get("detach_world", False)):
+            problems.append("guidance.detach_world must be true")
+        if not bool(guidance.get("detached_prediction_eval_mode", False)):
+            problems.append("guidance.detached_prediction_eval_mode must be true")
+        if not bool(guidance.get("include_context_in_world_memory", False)):
+            problems.append("guidance.include_context_in_world_memory must be true")
+        if not bool(world_val.get("enabled", False)) or int(world_val.get("interval", 0)) != 5000:
+            problems.append("trainer.world_validation must be enabled every 5000 steps")
+
+        bypass = bool(guidance.get("action_world_bypass", False))
+        if phase == "predictor_warmup":
+            if active != ["joint_detached"]:
+                problems.append(f"predictor_warmup requires only joint_detached, got {active}")
+            if not bypass:
+                problems.append("predictor_warmup requires guidance.action_world_bypass=true")
+            detach_action_backbone = bool(guidance.get("detach_action_backbone", False))
+            detach_world_backbone = bool(guidance.get("detach_world_backbone", False))
+            if recipe in {"policy_first_v2", "baseline_preserving_v3"}:
+                if detach_action_backbone:
+                    problems.append(
+                        f"{recipe} predictor_warmup requires "
+                        "guidance.detach_action_backbone=false so action loss updates Qwen"
+                    )
+                if not detach_world_backbone:
+                    problems.append(
+                        f"{recipe} predictor_warmup requires "
+                        "guidance.detach_world_backbone=true so world loss cannot update Qwen"
+                    )
+                if int(trainer.get("num_warmup_steps", 0)) != 2000:
+                    problems.append(
+                        f"{recipe} predictor_warmup requires num_warmup_steps=2000 "
+                        "to match the IID baseline"
+                    )
+                if recipe == "baseline_preserving_v3" and not bool(
+                    guidance.get("baseline_action_context", False)
+                ):
+                    problems.append(
+                        "baseline_preserving_v3 requires guidance.baseline_action_context=true "
+                        "so policy training/inference reuse the native baseline Qwen context"
+                    )
+            elif not detach_action_backbone:
+                # Preserve construction of already-trained strict Stage-1
+                # checkpoints whose saved config predates policy_first_v2.
+                problems.append(
+                    "legacy_v1 predictor_warmup requires guidance.detach_action_backbone=true"
+                )
+            if int(trainer.get("max_train_steps", 0)) != 80000:
+                problems.append("predictor_warmup requires max_train_steps=80000")
+            if trainer.get("pretrained_checkpoint", None):
+                problems.append("predictor_warmup must start without pretrained_checkpoint")
+        else:
+            if active != ["policy"]:
+                problems.append(f"gate_ft requires only policy, got {active}")
+            if bypass:
+                problems.append("gate_ft requires guidance.action_world_bypass=false")
+            if not bool(guidance.get("world_to_action_enabled", True)):
+                problems.append("gate_ft requires guidance.world_to_action_enabled=true")
+            if int(trainer.get("max_train_steps", 0)) != 20000:
+                problems.append("gate_ft requires max_train_steps=20000")
+            if not trainer.get("pretrained_checkpoint", None):
+                problems.append("gate_ft requires the 80k warmup pretrained_checkpoint")
+            if not bool(trainer.get("reset_world_gates_after_pretrained_load", False)):
+                problems.append("gate_ft requires reset_world_gates_after_pretrained_load=true")
+            if recipe in {"policy_first_v2", "baseline_preserving_v3"} and not bool(
+                guidance.get("detach_world_backbone", False)
+            ):
+                problems.append(
+                    f"{recipe} gate_ft must preserve guidance.detach_world_backbone=true "
+                    "from its Stage-1 parent contract"
+                )
+            if recipe == "baseline_preserving_v3" and not bool(
+                guidance.get("baseline_action_context", False)
+            ):
+                problems.append(
+                    "baseline_preserving_v3 gate_ft requires guidance.baseline_action_context=true"
+                )
+            frozen = {
+                item.strip()
+                for item in str(trainer.get("freeze_modules", "")).split(",")
+                if item.strip()
+            }
+            required_frozen = {
+                "qwen_vl_interface",
+                "wam_visual_head",
+                "wam_state_ctx",
+                "wam_act_ctx",
+            }
+            if not required_frozen.issubset(frozen):
+                problems.append(
+                    "gate_ft freeze_modules must include " + ",".join(sorted(required_frozen))
+                )
+
+        if problems:
+            raise ValueError(f"Invalid WAM two-stage {phase} configuration: " + "; ".join(problems))
 
     #######
-    # 中文注释：在构造 action head 前，把 guidance 的 M5/M6/M6+ 开关注入 action_model.diffusion_model_cfg，
-    # 让 DiT 在 __init__ 时建好 world_attn(每 cross block) / world_to_temb(AdaLN)。默认关 → 不注入任何键。
     def _inject_guidance_dit_flags(self) -> None:
         from omegaconf import OmegaConf
 
@@ -376,13 +541,12 @@ class Qwen_GR00T(baseframework):
         g = wam.get("guidance", {}) if hasattr(wam, "get") else {}
         if not bool(g.get("enabled", False)):
             return
+        if not bool(g.get("world_to_action_enabled", True)):
+            return
         mode = str(g.get("mode", "none")).lower()
         if mode not in ("dual_xattn", "adaln", "dual_xattn_adaln"):
-            return  # M4 alternate 复用 attn1，concat-family 走 memory 拼接，都不需要新 DiT 参数
+            return
         dcfg = self.config.framework.action_model.diffusion_model_cfg
-        # 训练时 self.config 被 AccessTrackedConfig(config_tracker) 包了一层，嵌套节点也是包装对象，
-        # 而 OmegaConf.set_struct 的 monkey-patch 没覆盖 → 直接调会 AttributeError(_set_flag)。
-        # 先 unwrap 成原生 OmegaConf（底层同一引用，改键照样对 self.config 可见）。
         if hasattr(dcfg, "unwrap"):
             dcfg = dcfg.unwrap()
         OmegaConf.set_struct(dcfg, False)
@@ -391,7 +555,6 @@ class Qwen_GR00T(baseframework):
             dcfg.world_gate_init = float(g.get("gate_init", 0.0))
         if mode in ("adaln", "dual_xattn_adaln"):
             dcfg.world_adaln = True
-        # world_cross_attention_dim / world_global_dim 默认 = cross_attention_dim（= d_model），DiT 内部兜底。
 
     #######
 
@@ -403,8 +566,6 @@ class Qwen_GR00T(baseframework):
         return vla_cfg.get("include_state", False) not in ["False", "false", False, 0, None]
 
     #######
-    # 中文注释：初始化 JointFlow 迁移模块。这里复用原生 Qwen3-VL 的 language_model 作为 joint sequence
-    # backbone，复用原生 GR00T action_model 作为 policy/idm 动作流头，只新增 DINO/FDM 必需模块。
     def _init_jointflow_modules(self) -> None:
         hidden_size = int(self.qwen_vl_interface.model.config.hidden_size)
         dino_cfg = self.config.framework.dino
@@ -419,9 +580,6 @@ class Qwen_GR00T(baseframework):
         self.dino_proj = DinoProjector(d_dino=self.d_dino, hidden_size=hidden_size)
         self.act_ctx = ActionContextEncoder(action_dim=self.action_dim, hidden_size=hidden_size)
         #######
-        # 中文注释：action query token 数（conditioning 容量）与 chunk 长度解耦——n_action_query 默认=action_horizon
-        # （不改默认行为）；调大只增加喂给 action DiT cross-attn 的 cond token 数（DiT 是 cross-attn，context 长度可变），
-        # 不改 chunk/数据/eval。E3.x 用它做 sweep（8/16/32/64/128）。
         n_action_query = int(action_cfg.get("n_action_query", self.action_horizon))
         self.action_queries = ActionQueryTokenBank(action_horizon=n_action_query, hidden_size=hidden_size)
         #######
@@ -444,9 +602,6 @@ class Qwen_GR00T(baseframework):
     #######
 
     #######
-    # 中文注释：以下方法是从 QwenJointFlow 迁移到 QwenGR00T 的核心训练逻辑。
-    # 迁移时替换掉独立 text-only Qwen2 wrapper，改用原生 Qwen3-VL/Qwen-VL 的 language_model，
-    # 从而保留 QwenGR00T 的模型注册、checkpoint、trainer、policy server 等工程结构。
     def _jointflow_language_model(self):
         model_root = self.qwen_vl_interface.model.model
         return getattr(model_root, "language_model", model_root)
@@ -454,8 +609,6 @@ class Qwen_GR00T(baseframework):
     def _jointflow_embed_tokens(self):
         language_model = self._jointflow_language_model()
         #######
-        # 中文注释：不能把 get_input_embeddings() 放进 getattr 默认值；
-        # Python 会提前求值，部分 Qwen wrapper/fake smoke 对象没有该方法时会误报。
         if hasattr(language_model, "embed_tokens"):
             return language_model.embed_tokens
         return self.qwen_vl_interface.model.get_input_embeddings()
@@ -510,8 +663,6 @@ class Qwen_GR00T(baseframework):
     @staticmethod
     def _jointflow_module_dtype(module: nn.Module, fallback: torch.dtype = torch.float32) -> torch.dtype:
         #######
-        # 中文注释：DeepSpeed bf16 会把 head 参数转成 bf16；head 输入必须跟随参数 dtype，
-        # 否则禁用 autocast 的局部 fp32 分支会在 Linear 上触发 Float/BFloat16 mismatch。
         for param in module.parameters(recurse=True):
             return param.dtype
         return fallback
@@ -542,8 +693,6 @@ class Qwen_GR00T(baseframework):
         tokenizer = self.qwen_vl_interface.processor.tokenizer
         max_text_length = int(self.config.framework.qwenvl.get("max_text_length", 256))
         #######
-        # 中文注释：JointFlow 的 block mask 用 text_valid_lens 表示“前 N 个文本 token 有效”，
-        # 因此这里必须使用右 padding；原生 Qwen3-VL 推理常用 left padding，不能直接沿用。
         old_padding_side = tokenizer.padding_side
         tokenizer.padding_side = "right"
         try:
@@ -727,16 +876,12 @@ class Qwen_GR00T(baseframework):
         return batch
 
     #######
-    # 中文注释：E1.3 correlated noise——把 trainer 算好的 Σ-Cholesky 透传给 action head。
     def set_action_correlation(self, chol) -> None:
         self.action_model.set_action_correlation(chol)
 
     #######
 
     #######
-    # 中文注释：评测时设置在线 DINO 的 per-suite 归一化 stats（dino_v3_stats.json）。训练用的是离线精算特征
-    # （已按各 suite 的 stats 标准化），而 eval 走在线提取——必须用同一份 stats 归一化，否则 dino_proj 收到
-    # 原始尺度特征→视觉条件失效→SR≈0。每个 suite 的 stats 不同，评测前按 suite 注入对应文件。
     def set_dino_stats(self, stats_path: str) -> None:
         self._load_jointflow_dino_stats(stats_path)
 
@@ -779,11 +924,9 @@ class Qwen_GR00T(baseframework):
         blocks: list[torch.Tensor] = [text_embeds]
         block_sizes: list[int] = [text_embeds.shape[1]]
         #######
-        # 中文注释：序列里不放 state token（state 与源一致走 action head）。块顺序：text → img0 → [action_ctx|img1] → query。
         #######
 
         #######
-        # 中文注释：DINO projector 在 bf16 server 下参数 dtype 会变化，输入按参数 dtype 投影后再对齐 Qwen。
         dino_proj_dtype = self._jointflow_module_dtype(self.dino_proj, fallback=target_dtype)
         dino0 = self._flatten_jointflow_dino(batch["dino_0"]).to(text_embeds.device, dtype=dino_proj_dtype)
         img0_tokens = self.dino_proj(dino0).to(dtype=target_dtype)
@@ -796,7 +939,6 @@ class Qwen_GR00T(baseframework):
             if action is None:
                 raise KeyError("fdm requires `action` context.")
             #######
-            # 中文注释：FDM action context 编码器同样按自身参数 dtype 接收 action，兼容 bf16 推理/训练包装。
             act_ctx_dtype = self._jointflow_module_dtype(self.act_ctx, fallback=target_dtype)
             action_ctx = self.act_ctx(
                 action[:, -self.action_horizon :, : self.action_dim].to(
@@ -926,8 +1068,6 @@ class Qwen_GR00T(baseframework):
         batch = self._jointflow_examples_to_batch(examples, require_future_dino=False, require_action=False)
         cond = self._run_jointflow_path("policy", batch)
         #######
-        # 中文注释：评估服务器可将 action head 参数转成 bf16；predict_action 没有 trainer autocast，
-        # 因此 policy 条件 token 进入 action head 前必须跟随 action head 参数 dtype。
         head_dtype = self._jointflow_module_dtype(self.action_model, fallback=cond.dtype)
         pred_actions = self.action_model.predict_action(
             cond.to(dtype=head_dtype),
@@ -940,8 +1080,6 @@ class Qwen_GR00T(baseframework):
     #######
 
     #######
-    # 中文注释：WAM 模块初始化（qwenvl-gr00t 原生视觉 policy + DINO 只做监督头，参考 LaWAM 占位 token 方案）。
-    # 占位 token：act/flow query 共用一个特殊 token，按出现顺序前 n_act 为 act、其后 n_flow 为 flow（同 LaWAM build_placeholder_masks）。
     def _init_wam_modules(self) -> None:
         dino_cfg = self.config.framework.dino
         visual_cfg = self.config.framework.visual_model
@@ -952,30 +1090,23 @@ class Qwen_GR00T(baseframework):
         self.wam_n_flow = int(visual_cfg.get("n_flow_query", 8))
         self.wam_dino_loss_weight = float(wam_cfg.get("dino_loss_weight", 1.0))
         #######
-        # 中文注释：fdm 预测 delta-DINO 开关（默认 False=预测绝对未来 DINO）。
-        # 开启后 fdm target = DINO(image_1) - DINO(image_0)，让监督头学「动作引起的特征变化」而非整张未来特征，
-        # 与 idm/世界模型差分思路一致；只影响 fdm 范式（passive 仍预测绝对未来 DINO）。
         self.wam_fdm_delta = bool(wam_cfg.get("fdm_delta_dino", False))
         #######
         #######
-        # 中文注释：world_model_no_language——fdm/passive 的 prompt 去掉语言指令(消融:显式动作条件 vs 语言对未来动态建模的作用)。
-        # 默认 False(带语言)；policy/idm 不受影响,永远带语言。
         self.wam_world_model_no_language = bool(wam_cfg.get("world_model_no_language", False))
         #######
-        # 占位 token 注册 + 词表 resize（参考 LaWAM configure_latent_world_processor）。
         self.wam_ph = str(wam_cfg.get("placeholder_token", "<ACT_PH>"))
         tok = self.qwen_vl_interface.processor.tokenizer
         tok.add_special_tokens({"additional_special_tokens": [self.wam_ph]})
         self.wam_ph_id = int(tok.convert_tokens_to_ids(self.wam_ph))
         self.qwen_vl_interface.model.resize_token_embeddings(len(tok))
-        # DINO 仅作监督 target：复用 jointflow 的 DINO 提取(在线) + 未来帧 flow 头；推理完全不用。
         self._jointflow_dino_spec = resolve_dino_spec(dino_cfg)
         self.d_dino = int(self._jointflow_dino_spec["embed_dim"])
         self.config.framework.visual_model.d_dino = self.d_dino
         self.register_buffer("_dino_mean", torch.zeros(self.d_dino), persistent=False)
         self.register_buffer("_dino_std", torch.ones(self.d_dino), persistent=False)
         self._load_jointflow_dino_stats(dino_cfg.get("stats_path", None))
-        object.__setattr__(self, "_dino_teacher", None)  # 仅训练算 target；不注册、不保存进 checkpoint
+        object.__setattr__(self, "_dino_teacher", None)
         if bool(dino_cfg.get("load_live_backbone", False)):
             self._set_dino_teacher(DINOv3Backbone(**self._jointflow_dino_spec))
         self.wam_visual_head = VisualFlowMatchingHead(self.config)
@@ -994,49 +1125,71 @@ class Qwen_GR00T(baseframework):
             action_dit = getattr(self.action_model, "model", None)
             if action_dit is not None and hasattr(action_dit, "gradient_checkpointing"):
                 action_dit.gradient_checkpointing = True
-        # 中文注释：fdm（前向动力学）范式需要动作上下文——把 act_ctx(动作) 拼到 flow-query 作为 DINO 头的 cross-attn 条件。
         self.wam_act_ctx = ActionContextEncoder(
             action_dim=self.action_dim, hidden_size=int(self.qwen_vl_interface.model.config.hidden_size)
         )
         #######
-        # 中文注释：World→Action guidance（M0–M6+ 大计划）的配置与子模块初始化。默认全关。
         self._init_wam_guidance(wam_cfg)
         #######
 
     #######
-    # 中文注释：World→Action guidance 配置解析（plan §3）。所有键默认值在此集中，默认 enabled=False →
-    # guidance 子模块不构造、forward 不进 guided 分支，旧 WAM/原生 QwenGR00T 行为/ckpt 完全不变。
     @staticmethod
     def _wam_guidance_defaults() -> dict:
         return {
             "enabled": False,
-            # 注入结构 mode：concat-family(无需改 action head/DiT) = none|concat|sa_fusion|qformer；
-            # 需改 DiT(后续 P6-P8) = alternate_xattn|dual_xattn|adaln|dual_xattn_adaln。
             "mode": "none",
-            # world 信号 signal：none|h_future|z_pred|delta_z_pred|z_oracle|delta_z_oracle。
             "signal": "none",
-            # prompt：action_only(原 WAM 单 query) | dual_query(act+future 占位同一 forward)。
             "prompt_mode": "action_only",
-            # 原生 causal 顺序是 ACT→FUTURE；FUTURE 可读取动作意图，ACT 不能直接读取 FUTURE。
-            # add_generation_prompt 产生的后缀 token 能同时读取两组 query；新 E2E 必须将其从
-            # action/world raw context memory 排除。默认 false 只用于兼容旧 checkpoint 的原始语义。
             "exclude_post_query_context": False,
-            # bridge：predicted(用 world head 预测) | oracle(用 GT DINO) | scheduled(按 oracle_ratio 混)。
             "bridge_source": "predicted",
-            "detach_world": True,  # True=action loss 不回传 world head（Stage1/2）；False=e2e(Stage3)
-            "oracle_ratio": 1.0,  # scheduled 时逐样本取 oracle 的概率（1→全 oracle, 0→全 predicted）
-            "n_world_tokens": 16,  # M3 Q-Former 压缩后的 token 数
+            "detach_world": True,
+            # Opt-in because historical detached runs sampled the visual head
+            # in train mode.  New joint_detached runs use eval-mode sampling
+            # for the action condition, exactly matching live inference, then
+            # immediately restore train mode for the independent world loss.
+            "detached_prediction_eval_mode": False,
+            # Strict predictor warmup: compute action + world objectives on
+            # the same batch, but keep the policy path identical to baseline
+            # by omitting every predicted-world injection.  Stage-2 disables
+            # this switch and trains the adapter/gates from predicted future.
+            "action_world_bypass": False,
+            # Architecture-level ablation: train the native action predictor
+            # and the future-DINO predictor, but do not instantiate any
+            # world->action adapter, action-DiT cross-attention, or gate.
+            # True is the backward-compatible default for old WAM configs.
+            "world_to_action_enabled": True,
+            # Legacy Stage-1 routing can detach the action/context states from
+            # Qwen. New policy_first_v2 runs leave this false and instead use
+            # detach_world_backbone below, keeping the policy objective in
+            # charge of the shared representation.
+            "detach_action_backbone": False,
+            # Policy-first Stage-1 routing: the auxiliary world loss consumes
+            # a detached Qwen future-query condition.  The visual predictor
+            # and state conditioner still receive gradients, while Qwen is
+            # optimized only by the primary action objective.  Opt-in so old
+            # checkpoints retain their original gradient contract.
+            "detach_world_backbone": False,
+            # Opt-in strict baseline contract.  The policy branch uses the
+            # same build_qwenvl_inputs -> full Qwen hidden sequence as native
+            # QwenGR00T; the dual-query pass exists only for future prediction.
+            # Old checkpoints keep the historical [ACT query; context] memory.
+            "baseline_action_context": False,
+            "oracle_ratio": 1.0,
+            "n_world_tokens": 16,
             "qformer_layers": 2,
-            "fusion_layers": 2,  # M2 CompactSAFusion 层数
+            "fusion_layers": 2,
             "fusion_heads": 8,
             "qformer_heads": 8,
             "pooler_heads": 8,
-            "gate_init": 0.0,  # M5 world_gate 初值（tanh(0)=0 → 平滑从 baseline 起步），DiT 阶段用
+            "gate_init": 0.0,
             # Opt-in for two-stage policy/passive gate runs. joint_e2e logs
             # these metrics unconditionally because the gate is part of its
             # core training contract.
             "log_gate_openness": False,
             "world_dropout": 0.0,
+            # Explicit proprio conditioning for the visual world predictor.
+            # Default false preserves old checkpoint module/state-dict ABI.
+            "world_condition_on_state": False,
             # Backward compatibility: historically the world-memory flag also
             # controlled whether action memory kept the Qwen image/language
             # context.  A missing action-memory override therefore inherits the
@@ -1053,7 +1206,6 @@ class Qwen_GR00T(baseframework):
                 "start_scale": 1.0,
                 "end_scale": 1.0,
             },
-            # 因果消融(plan §11，eval 时生效)：correct|off|zero|shuffled|wrong_task|gt
             "world_eval_mode": "correct",
         }
 
@@ -1065,7 +1217,7 @@ class Qwen_GR00T(baseframework):
             g["include_context_in_action_memory"] = bool(g["include_context_in_world_memory"])
         self.wam_guidance = g
         self.wam_guidance_enabled = bool(g["enabled"])
-        # world_target(absolute|delta)：guidance 下优先；否则回落已有 fdm_delta_dino。delta → world head 学差分。
+        self.wam_state_ctx = None
         wt = str(wam_cfg.get("world_target", "")).lower() if hasattr(wam_cfg, "get") else ""
         if wt in ("absolute", "delta"):
             self.wam_fdm_delta = wt == "delta"
@@ -1073,14 +1225,21 @@ class Qwen_GR00T(baseframework):
             return
         mode = str(g["mode"]).lower()
         signal = str(g["signal"]).lower()
-        # 信号是否走 DINO 潜变量空间（d_dino）：z_pred/delta_z_pred/z_oracle/delta_z_oracle；否则 h_future 走 d_model。
         self._wam_signal_is_latent = signal in ("z_pred", "delta_z_pred", "z_oracle", "delta_z_oracle")
         self._wam_signal_is_delta = signal in ("delta_z_pred", "delta_z_oracle")
         self._wam_signal_is_oracle = signal in ("z_oracle", "delta_z_oracle")
         if self._wam_signal_is_delta:
-            self.wam_fdm_delta = True  # 信号是差分 → world head 必须训练成预测差分
+            self.wam_fdm_delta = True
         d_model = int(self.qwen_vl_interface.model.config.hidden_size)
         d_dino = int(self.d_dino)
+        if bool(g.get("world_condition_on_state", False)):
+            state_dim = int(self.config.framework.action_model.get("state_dim", 0))
+            if state_dim <= 0:
+                raise ValueError("guidance.world_condition_on_state requires action_model.state_dim > 0")
+            self.wam_state_ctx = ActionContextEncoder(
+                action_dim=state_dim,
+                hidden_size=d_model,
+            )
         world_in_dim = d_dino if self._wam_signal_is_latent else d_model
         from starVLA.model.framework.VLM4A.wam_guidance import (
             CompactSAFusion,
@@ -1090,14 +1249,13 @@ class Qwen_GR00T(baseframework):
         )
 
         drop = float(g["world_dropout"])
-        # 子模块按 mode/signal 条件实例化（未用到的不建，省参数 + 避免 DDP unused-param；guided 分支另有 anchor 兜底）。
         self.world_adapter = None
         self.world_fusion = None
         self.world_qformer = None
         self.world_pooler = None
-        if signal != "none":
+        world_to_action_enabled = bool(g.get("world_to_action_enabled", True))
+        if signal != "none" and world_to_action_enabled:
             if mode == "qformer":
-                # M3：压缩空间 DINO tokens → n_world_tokens（不需要 adapter）。
                 self.world_qformer = WorldQFormer(
                     in_dim=world_in_dim,
                     out_dim=d_model,
@@ -1107,7 +1265,6 @@ class Qwen_GR00T(baseframework):
                     dropout=drop,
                 )
             elif mode == "sa_fusion":
-                # M2：对 [h_act; h_future] 轻量 SA（都在 d_model，不需要 adapter）。
                 self.world_fusion = CompactSAFusion(
                     dim=d_model,
                     num_layers=int(g["fusion_layers"]),
@@ -1115,15 +1272,12 @@ class Qwen_GR00T(baseframework):
                     dropout=drop,
                 )
             else:
-                # concat / adaln / dual_xattn / dual_xattn_adaln / alternate_xattn：投影 world 信号到 d_model。
                 self.world_adapter = WorldTokenAdapter(in_dim=world_in_dim, out_dim=d_model, dropout=drop)
             if mode in ("adaln", "dual_xattn_adaln"):
                 self.world_pooler = WorldTokenPooler(dim=d_model, out_dim=d_model, num_heads=int(g["pooler_heads"]))
-        # world head 预测时的默认 token 数（无 GT 兜底，如 live eval）：H/P * W/P。
         self._wam_world_n = dino_num_patches(
             self._jointflow_dino_spec["image_size"], self._jointflow_dino_spec["patch_size"]
         )
-        # dual_query：注册独立 future 占位 token（与 act 占位 <ACT_PH> 区分），便于一个 forward 取两组 query。
         self.wam_future_ph = None
         self.wam_future_ph_id = None
         if str(g["prompt_mode"]).lower() == "dual_query":
@@ -1134,7 +1288,10 @@ class Qwen_GR00T(baseframework):
             self.qwen_vl_interface.model.resize_token_embeddings(len(tok))
         logger.info(
             "WAM guidance ON: mode=%s signal=%s prompt=%s exclude_post_query_context=%s "
-            "bridge=%s detach_world=%s action_context=%s world_context=%s "
+            "bridge=%s detach_world=%s detach_action_backbone=%s detach_world_backbone=%s "
+            "baseline_action_context=%s world_to_action=%s "
+            "detached_prediction_eval=%s "
+            "action_context=%s world_context=%s world_state=%s "
             "(adapter=%s qformer=%s fusion=%s pooler=%s)",
             mode,
             signal,
@@ -1142,8 +1299,14 @@ class Qwen_GR00T(baseframework):
             bool(g["exclude_post_query_context"]),
             g["bridge_source"],
             g["detach_world"],
+            bool(g["detach_action_backbone"]),
+            bool(g["detach_world_backbone"]),
+            bool(g["baseline_action_context"]),
+            world_to_action_enabled,
+            bool(g["detached_prediction_eval_mode"]),
             bool(g["include_context_in_action_memory"]),
             bool(g["include_context_in_world_memory"]),
+            self.wam_state_ctx is not None,
             self.world_adapter is not None,
             self.world_qformer is not None,
             self.world_fusion is not None,
@@ -1161,8 +1324,6 @@ class Qwen_GR00T(baseframework):
         v = np.asarray(v)
         return [v[i] for i in range(v.shape[0])] if v.ndim == 4 else [v]
 
-    # 中文注释：取 (当前所有视角 list, future_main) PIL——当前帧用 image_0(在线 raw [V,H,W,C])/eval 用 image；
-    # 未来帧用 image_1（idm 用，取第 0 视角）。支持任意相机数：LIBERO 2 路(agentview+wrist)、RoboTwin 3 路(head+left+right)。
     def _wam_views(self, ex: dict):
         cur = self._wam_view_list(ex.get("image_0", ex.get("image")))
         views = [to_pil_preserve(v) for v in cur]
@@ -1179,12 +1340,6 @@ class Qwen_GR00T(baseframework):
                 future_main = future_main.resize(target_size)
         return views, future_main
 
-    # 中文注释：task-aware Qwen 原生视觉 prompt（每个任务只放它自己需要的 query 占位）：
-    #   action 任务(policy/idm)：[图(idm 含未来帧), 文本, act 占位×n_act]   —— 只放 action query；
-    #   visual 任务(passive/fdm)：[图,            文本, flow 占位×n_flow]   —— 只放 future query。
-    # 这样 action/future query 不再互相出现在对方任务里：flow query 不会被迫 attend act query（passive 更干净），
-    # action head 也不会吃到 flow 占位。只有 idm 把未来帧也当输入（逆动力学：当前+未来→动作）。
-    # 返回 processor 输入 + 占位 mask（= 本任务唯一一组占位 = query 位置；用于取 query hidden + 在 action memory 屏蔽 raw 占位）。
     def _build_wam_inputs(self, examples: List[dict], task: str = "policy"):
         task = str(task)
         is_action = task in ("policy", "idm")
@@ -1192,8 +1347,6 @@ class Qwen_GR00T(baseframework):
         ph_str = " ".join([self.wam_ph] * n_ph)
         include_future = task == "idm"
         #######
-        # 中文注释：world_model_no_language=true 时,visual 任务(fdm/passive)的 prompt **去掉语言指令**(只 image+flow 占位),
-        # 用来消融「世界模型分支是否需要语言」。policy/idm(动作任务)**永远带语言**(动作必须条件在指令上)。
         drop_lang = (not is_action) and bool(getattr(self, "wam_world_model_no_language", False))
         #######
         proc = self.qwen_vl_interface.processor
@@ -1202,8 +1355,6 @@ class Qwen_GR00T(baseframework):
         for ex in examples:
             views, future_main = self._wam_views(ex)
             text = "" if drop_lang else str(cot).replace("{instruction}", str(ex.get("lang", "")))
-            # 中文注释：所有当前视角（LIBERO 2 / RoboTwin 3）先放，idm 再加未来帧，最后文本 + 单组 query 占位——
-            # 保证 query 占位（native causal）能 attend 到全部图像。
             imgs = list(views)
             if include_future and future_main is not None:
                 imgs.append(future_main)
@@ -1224,7 +1375,7 @@ class Qwen_GR00T(baseframework):
         finally:
             proc.tokenizer.padding_side = old
         inputs = inputs.to(self.qwen_vl_interface.model.device)
-        ph_mask = inputs["input_ids"] == self.wam_ph_id  # 本任务唯一占位组 = query 位置
+        ph_mask = inputs["input_ids"] == self.wam_ph_id
         return inputs, ph_mask
 
     def _wam_qwen_hidden(self, inputs) -> torch.Tensor:
@@ -1263,16 +1414,11 @@ class Qwen_GR00T(baseframework):
         n_q = self.wam_n_act if str(task) in ("policy", "idm") else self.wam_n_flow
         h_query = hidden[ph_mask].view(bsz, n_q, d)
         #######
-        # 中文注释：返回本任务 query hidden（act 或 flow）+ 完整隐藏序列 + padding mask + 占位 mask。
-        # 占位 mask 供 action memory 屏蔽 raw hidden 里的占位 token（只保留图文 hidden + 显式 query）。
         attn = inputs.get("attention_mask", None)
         return h_query, hidden, attn, ph_mask
         #######
 
     #######
-    # 中文注释：wam action head 的 cross-attn memory = act-query（显式保留 metaquery，创新点1）⊕ 图文 hidden。
-    # mask = [act-query 全 1] ⊕ [padding mask AND-NOT 占位]——即屏蔽掉 raw hidden 里的占位 token（task-aware 后只会是 act 占位），
-    # action DiT 只看「显式 h_act + 非占位图文上下文」，与 baseline action_model(完整 last_hidden + mask) 同口径但去掉占位污染。
     def _wam_action_memory(self, h_act: torch.Tensor, hidden: torch.Tensor, attn, ph_mask):
         mem = torch.cat([h_act, hidden.to(h_act.dtype)], dim=1)
         non_ph = ~ph_mask.to(torch.bool)
@@ -1295,6 +1441,120 @@ class Qwen_GR00T(baseframework):
         if value is None:
             return None
         return value.repeat(repeats, *([1] * (value.ndim - 1)))
+
+    def _native_qwen_action_context(
+        self,
+        examples: List[dict],
+        *,
+        resize_to_training: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return the exact Qwen context consumed by the native baseline.
+
+        This helper is shared by ordinary QwenGR00T and the opt-in
+        baseline-preserving WAM recipe.  Keeping one implementation prevents
+        prompt, resize, mask, or Qwen-forward drift between the two paths.
+        """
+
+        batch_images = [example["image"] for example in examples]
+        instructions = [example["lang"] for example in examples]
+        if resize_to_training:
+            batch_images = [to_pil_preserve(images) for images in batch_images]
+            train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
+            if train_obs_image_size:
+                batch_images = resize_images(batch_images, target_size=train_obs_image_size)
+
+        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(
+            images=batch_images,
+            instructions=instructions,
+        )
+        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
+        if backbone_attention_mask is not None:
+            backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            qwenvl_outputs = self.qwen_vl_interface(
+                **qwen_inputs,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            last_hidden = qwenvl_outputs.hidden_states[-1]
+        return last_hidden, backbone_attention_mask
+
+    def _native_action_loss_from_context(
+        self,
+        examples: List[dict],
+        last_hidden: torch.Tensor,
+        backbone_attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply the native baseline action objective to a native Qwen context."""
+
+        actions = [example["action"] for example in examples]
+        state = [example["state"] for example in examples] if "state" in examples[0] else None
+        action_is_pad = (
+            [example["action_is_pad"] for example in examples]
+            if all("action_is_pad" in example for example in examples)
+            else None
+        )
+        with torch.autocast("cuda", dtype=torch.float32):
+            action_tensor = torch.tensor(
+                np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
+            )
+            actions_target = action_tensor[:, -self.action_horizon :, :]
+            action_is_pad_target = None
+            if action_is_pad is not None:
+                action_is_pad_target = torch.as_tensor(
+                    np.asarray(action_is_pad), device=last_hidden.device, dtype=torch.bool
+                )[:, -self.action_horizon :]
+
+            repeats = int(self.config.framework.action_model.get("repeated_diffusion_steps", 4))
+            if repeats <= 0:
+                raise ValueError(f"repeated_diffusion_steps must be positive, got {repeats}")
+            actions_target = actions_target.repeat(repeats, 1, 1)
+            last_hidden = last_hidden.repeat(repeats, 1, 1)
+            if backbone_attention_mask is not None:
+                backbone_attention_mask = backbone_attention_mask.repeat(repeats, 1)
+            action_is_pad_target = (
+                action_is_pad_target.repeat(repeats, 1)
+                if action_is_pad_target is not None
+                else None
+            )
+
+            state_repeated = None
+            if state is not None:
+                state_tensor = torch.tensor(
+                    np.array(state), device=last_hidden.device, dtype=last_hidden.dtype
+                )
+                state_repeated = state_tensor.repeat(repeats, 1, 1)
+
+            return self.action_model(
+                last_hidden,
+                actions_target,
+                state_repeated,
+                encoder_attention_mask=backbone_attention_mask,
+                action_is_pad=action_is_pad_target,
+            )
+
+    def _native_predict_action_from_context(
+        self,
+        examples: List[dict],
+        last_hidden: torch.Tensor,
+        backbone_attention_mask: torch.Tensor | None,
+    ) -> dict:
+        """Apply the native baseline action sampler to a native Qwen context."""
+
+        state = [example["state"] for example in examples] if "state" in examples[0] else None
+        state_tensor = (
+            torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype)
+            if state is not None
+            else None
+        )
+        with torch.autocast("cuda", dtype=torch.float32):
+            pred_actions = self.action_model.predict_action(
+                last_hidden,
+                state_tensor,
+                encoder_attention_mask=backbone_attention_mask,
+            )
+        return {"normalized_actions": pred_actions.detach().cpu().numpy()}
 
     def _wam_action_loss(
         self,
@@ -1332,22 +1592,77 @@ class Qwen_GR00T(baseframework):
             **kwargs,
         )
 
-    def _wam_visual_loss(self, cond: torch.Tensor, target: torch.Tensor, examples: List[dict]) -> torch.Tensor:
-        """Ignore episode-tail future targets while preserving loss scale."""
+    def _wam_visual_loss(
+        self,
+        cond: torch.Tensor,
+        target: torch.Tensor,
+        examples: List[dict],
+        *,
+        return_details: bool = False,
+    ):
+        """Compute the WAM loss with valid-future and spatial-change weights.
+
+        Historical WAM YAMLs set ``visual_model.patch_weighting: change``, but
+        the WAM path previously ignored it (only the older JointFlow path used
+        the setting).  That made static/background patches dominate the 480
+        token objective.  Apply it here while normalizing every sample back to
+        mean weight one so the configured world-loss scale remains meaningful.
+        ``change_balanced`` retains a full static-scene floor and is the safer
+        default for structured absolute-future prediction.
+        """
 
         valid = self._stack_jointflow_field(examples, "future_valid", required=False)
         weights = None
+        valid_patch_weights = None
         if valid is not None:
             valid = valid.reshape(valid.shape[0], -1)[:, 0].clamp_(0.0, 1.0)
             normalizer = valid.new_tensor(float(valid.shape[0])) / valid.sum().clamp_min(1.0)
-            weights = (valid * normalizer)[:, None].expand(-1, target.shape[1])
+            valid_patch_weights = (valid * normalizer)[:, None].expand(-1, target.shape[1])
+
+        visual_cfg = getattr(
+            getattr(getattr(self, "config", None), "framework", None),
+            "visual_model",
+            None,
+        )
+        weighting = str(visual_cfg.get("patch_weighting", "none") if visual_cfg is not None else "none").lower()
+        if weighting not in {"none", "change", "change_balanced"}:
+            raise ValueError(
+                "visual_model.patch_weighting must be none, change, or change_balanced; "
+                f"got {weighting!r}"
+            )
+        if weighting != "none":
+            z0 = self._wam_dino_target(examples, "dino_0", ["image_0", "image"])
+            # Change weights always use absolute current/future DINO tokens,
+            # even when the model target itself is a delta representation.
+            z1 = target
+            if bool(getattr(self, "wam_fdm_delta", False)):
+                z1 = self._wam_dino_target(examples, "dino_1", ["image_1"])
+            change = (z1.float() - z0.to(z1.device, torch.float32)).norm(dim=-1)
+            relative = change / change.mean(dim=1, keepdim=True).clamp_min(1.0e-8)
+            if weighting == "change":
+                patch_weights = relative.clamp(0.1, 10.0)
+            else:
+                strength = float(visual_cfg.get("change_weight_strength", 1.0))
+                if strength < 0.0:
+                    raise ValueError(
+                        f"visual_model.change_weight_strength must be non-negative, got {strength}"
+                    )
+                patch_weights = 1.0 + strength * relative.clamp(0.1, 10.0)
+            patch_weights = patch_weights / patch_weights.mean(dim=1, keepdim=True).clamp_min(1.0e-8)
+            weights = patch_weights.to(device=target.device)
+
+        if valid_patch_weights is not None:
+            weights = valid_patch_weights if weights is None else weights * valid_patch_weights.to(weights.device)
+        if return_details:
+            return self.wam_visual_head(
+                cond,
+                target,
+                weights=weights,
+                return_details=True,
+            )
         return self.wam_visual_head(cond, target, weights=weights)
 
     #######
-    # 中文注释：wam 多任务每步只跑一个 task，未用到的子模块（DINO 头/act_ctx 或 action head）拿不到梯度 →
-    # DeepSpeed/DDP 的 unused-parameter 会卡死/报错（同 jointflow 的坑 [[jointflow-multigpu-ddp]]）。
-    # 给每步「未用模块」加零梯度 anchor 覆盖：policy/idm 未用 visual_head+act_ctx；passive 未用 action_model+act_ctx；fdm 未用 action_model。
-    # 这样单任务（如 exp2/exp3 只 policy）也能多卡训练不挂。
     def _wam_unused_anchor(self, task: str, ref: torch.Tensor) -> torch.Tensor:
         if task in ("policy", "idm"):
             modules = [self.wam_visual_head, self.wam_act_ctx]
@@ -1362,9 +1677,6 @@ class Qwen_GR00T(baseframework):
     #######
 
     #######
-    # 中文注释：WAM 世界模型 target 取法——优先用数据集预存的 DINO latent（dino_target_latents 开时数据集会
-    # 在线出 raw 图的同时附带 dino_0/dino_1）。普通配置缺失时仍可在线抽取；严格预计算配置则立即报错，
-    # 防止集群 latent 路径/字段配置错后悄悄加载 DINO backbone，改变速度、显存和监督来源。
     def _wam_dino_target(self, examples: List[dict], precomp_key: str, online_keys: list[str]) -> torch.Tensor:
         datasets_cfg = getattr(self.config, "datasets", None)
         vla_cfg = getattr(datasets_cfg, "vla_data", None) if datasets_cfg is not None else None
@@ -1417,9 +1729,9 @@ class Qwen_GR00T(baseframework):
         expected_tokens = dino_num_patches(
             self._jointflow_dino_spec["image_size"], self._jointflow_dino_spec["patch_size"]
         )
-        if strict_precomputed and z.shape[1] != expected_tokens:
+        if z.shape[1] != expected_tokens:
             raise ValueError(
-                f"Precomputed DINO target has {z.shape[1]} tokens; expected one image/composite grid "
+                f"DINO target has {z.shape[1]} tokens; expected one image/composite grid "
                 f"with {expected_tokens} tokens."
             )
         if z.shape[-1] != self.d_dino:
@@ -1427,20 +1739,20 @@ class Qwen_GR00T(baseframework):
                 f"DINO target dim {z.shape[-1]} != configured encoder dim {self.d_dino} "
                 f"({self._jointflow_dino_spec['name']})."
             )
+        finite = torch.isfinite(z).all()
+        if z.device.type == "cuda" and hasattr(torch, "_assert_async"):
+            # Avoid a full GPU synchronization on every training batch while
+            # retaining a fail-fast target-integrity assertion.
+            torch._assert_async(finite, f"DINO target {precomp_key!r} contains NaN or infinite values")
+        elif not bool(finite):
+            raise ValueError(f"DINO target {precomp_key!r} contains NaN or infinite values")
         return z
 
     #######
 
-    # 中文注释：WAM 四范式前向（每步一种，由 trainer 按 tasks.weights 广播采样）：
-    #   policy: 当前图 → act-query → action（→ "action_loss"，兼容无 tasks 的 else 分支）
-    #   idm   : 当前图+未来图 → act-query → action（逆动力学，→ "idm_loss"）
-    #   passive: 当前图 → flow-query → 预测未来 DINO（→ "passive_loss"）
-    #   fdm   : 当前图 + 动作上下文 → flow-query → 预测未来 DINO（前向动力学，→ "fdm_loss"）
-    # 两组 query 依托不同范式：act-query 服务 policy/idm（预测 action）；flow-query 服务 passive/fdm（预测 DINO）。
     def _wam_forward(self, examples: List[dict], task: str = "policy", **kwargs) -> dict:
         task = str(task)
         #######
-        # 中文注释：World→Action guidance 开启时走 guided 路径（dual-query + world 注入）。默认关→原 WAM。
         if getattr(self, "wam_guidance_enabled", False):
             return self._wam_guided_forward(examples, task=task, **kwargs)
         #######
@@ -1450,7 +1762,6 @@ class Qwen_GR00T(baseframework):
             actions = actions[:, -self.action_horizon :, : self.action_dim].float()
             state, action_is_pad = self._wam_action_state_and_mask(examples)
             #######
-            # 中文注释：action 条件 = act-query ⊕ 图文 hidden（屏蔽 raw 占位，见 _wam_action_memory）。
             mem, mem_mask = self._wam_action_memory(h_query, hidden, attn, ph_mask)
             hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
             loss = self._wam_action_loss(
@@ -1462,7 +1773,6 @@ class Qwen_GR00T(baseframework):
             )
             #######
             return {("action_loss" if task == "policy" else "idm_loss"): loss + self._wam_unused_anchor(task, loss)}
-        # passive / fdm：flow-query → 预测未来帧 DINO；fdm 额外把 act_ctx(动作) 拼进 cross-attn 条件。
         h_flow = h_query
         z_gt = self._wam_dino_target(examples, "dino_1", ["image_1"])
         cond = h_flow
@@ -1473,11 +1783,6 @@ class Qwen_GR00T(baseframework):
             actx = self.wam_act_ctx(actions.to(ad)).to(h_flow.dtype)
             cond = torch.cat([h_flow, actx], dim=1)
         #######
-        # 中文注释：delta-DINO target（未来 - 当前 DINO 差分）——**对 fdm 和 passive 都生效**（由 fdm_delta_dino 控）。
-        # 这样 fdm(有 act_ctx 动作条件) 与 passive(无动作条件) 用**同一监督 target**，单变量只差「动作条件」，
-        # 干净判断「动作能否塑造更好表征」（用户意图：判断动作时 target 不应改变）。
-        # 历史名 fdm_delta_dino,语义其实是「世界模型 target 用差分」,对两个 visual 范式通用。
-        # 残差幅值远小于 N(0,1) 噪声→按通道(B,N 维)标准化到≈单位方差;DINO 头纯监督、推理不用→无需反归一化。
         if self.wam_fdm_delta:
             z_0 = self._wam_dino_target(examples, "dino_0", ["image_0", "image"])
             z_gt = z_gt - z_0.to(z_gt.device, z_gt.dtype)
@@ -1485,9 +1790,6 @@ class Qwen_GR00T(baseframework):
         #######
         vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=cond.dtype)
         #######
-        # 中文注释：拆出 raw（视觉头原始 MSE）与 weighted（× dino_loss_weight，= 实际反传的）两份，
-        # 供 trainer 分别记录 loss_<task>_raw / loss_<task>_weighted。raw 仅作日志（detach，不进反传）；
-        # backward 只用 weighted（key 以 _loss 结尾才会被 total_loss = sum(*_loss) 计入，raw 以 _loss_raw 结尾不计入）。
         raw_dino = self._wam_visual_loss(cond.to(vh), z_gt, examples)
         loss = self.wam_dino_loss_weight * raw_dino
         return {
@@ -1496,18 +1798,15 @@ class Qwen_GR00T(baseframework):
         }
         #######
 
-    # 中文注释：WAM 推理 = 只走原生视觉 policy（act-query→action head 采样）；DINO/监督头完全不碰。
     @torch.inference_mode()
     def _wam_predict_action(self, examples: List[dict], **kwargs) -> dict:
         if not isinstance(examples, list):
             examples = [examples]
         #######
-        # 中文注释：World→Action guidance 开启时走 guided 推理（dual-query + world 注入 + 可选因果消融）。
         if getattr(self, "wam_guidance_enabled", False):
             return self._wam_guided_predict_action(examples, **kwargs)
         #######
         #######
-        # 中文注释：推理 action 条件与训练 policy 一致 = act-query ⊕ 图文 hidden（屏蔽 raw 占位）；走 policy prompt（仅 act 占位）。
         h_act, hidden, attn, ph_mask = self._wam_backbone(examples, task="policy")
         mem, mem_mask = self._wam_action_memory(h_act, hidden, attn, ph_mask)
         head_dtype = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
@@ -1523,13 +1822,6 @@ class Qwen_GR00T(baseframework):
     #######
 
     #######################################################################
-    # 中文注释：World→Action guidance（M0–M6+ 大计划）的 guided 路径。仅在
-    # framework.wam.guidance.enabled=true 时由 _wam_forward/_wam_predict_action 路由进来。
-    # 与原 WAM 的差别：用 dual-query prompt（act 占位 + future 占位同一 forward），把 future-query
-    # hidden（或 world head 预测的未来 DINO 潜变量）作为 world 信号注入 action 条件，保留原始
-    # action 条件不删（plan §2.1）。当前支持 concat-family 注入：none(M0-Q)/concat(M1.x)/
-    # sa_fusion(M2)/qformer(M3)——均走 action memory 拼接，复用现有 action head 接口，不改 DiT。
-    # alternate/dual_xattn/adaln/dual_xattn_adaln(M4/M5/M6/M6+) 需 DiT 改造，留任务 #14(P6-P8)。
     #######################################################################
 
     @staticmethod
@@ -1579,14 +1871,15 @@ class Qwen_GR00T(baseframework):
         return query_mask.to(dtype=torch.int64).cumsum(dim=1) > 0
 
     def _build_wam_guided_inputs(self, examples: List[dict], task: str = "policy"):
-        """dual-query prompt：指令后接 act 占位×n_act + future 占位×n_flow（同一 forward）。
+        """Build one causal prompt containing action and future query groups.
 
-        中文注释：与 _build_wam_inputs 同构，但**每个任务**都同时放两组 query 占位。原生 causal 顺序
-        使 h_future 可读取 h_act 的动作意图，而 h_act 不可读取 future query；future→action 只经显式 gate 返回。
-        返回 inputs + act_mask + future_mask + 原始 2D padding mask + raw-context 排除 mask。
+        Every task receives both groups. Their native token order lets future
+        queries read action intent while action queries cannot read future
+        queries; the explicit gated path is the only future-to-action return.
+        The method also returns padding and raw-context exclusion masks.
         """
         task = str(task)
-        is_action = task in ("policy", "idm", "joint_e2e")
+        is_action = task in ("policy", "idm", "joint_e2e", "joint_detached")
         include_future = task == "idm"
         act_str = " ".join([self.wam_ph] * self.wam_n_act)
         fut_str = " ".join([self.wam_future_ph] * self.wam_n_flow)
@@ -1658,11 +1951,70 @@ class Qwen_GR00T(baseframework):
         # chat-template token, closing the only non-gate FUTURE->action bridge.
         return h_act, h_future, hidden, attention_2d, context_exclusion_mask
 
-    def _wam_world_target(self, examples: List[dict]) -> torch.Tensor:
-        """GT 未来 world 监督 target：absolute=DINO(image_1)；delta=标准化(DINO(img1)-DINO(img0))。
+    def _wam_visual_condition(
+        self,
+        h_future: torch.Tensor,
+        examples: List[dict],
+        *,
+        task: str,
+    ) -> torch.Tensor:
+        """Build the one canonical condition sequence for world prediction.
 
-        中文注释：passive/fdm 的监督 target 与 oracle bridge 的 GT 必须**同一函数**产出，否则 oracle 与
-        world head 学到的空间不一致（delta 还要按 batch 标准化到≈单位方差，与 _wam_forward 老路一致）。
+        The opt-in state token uses the same normalized proprio vector carried
+        by the action head.  Centralizing this path prevents train/validation,
+        RAE decoding, and live policy inference from silently using different
+        world conditions.
+        """
+
+        cond_parts = [h_future]
+        state_encoder = getattr(self, "wam_state_ctx", None)
+        if state_encoder is not None:
+            state = self._stack_jointflow_field(examples, "state", required=True)
+            if state.ndim == 2:
+                state = state[:, None, :]
+            if state.ndim != 3:
+                raise ValueError(f"World state condition must be [B,T,D], got {tuple(state.shape)}")
+            state_dtype = self._jointflow_module_dtype(state_encoder, fallback=h_future.dtype)
+            state_tokens = state_encoder(state.to(state_dtype)).to(h_future.dtype)
+            cond_parts.append(state_tokens)
+
+        if str(task) == "fdm":
+            actions = self._stack_jointflow_field(examples, "action", required=True)
+            actions = actions[:, -self.action_horizon :, : self.action_dim]
+            action_dtype = self._jointflow_module_dtype(self.wam_act_ctx, fallback=h_future.dtype)
+            action_tokens = self.wam_act_ctx(actions.to(action_dtype)).to(h_future.dtype)
+            cond_parts.append(action_tokens)
+        return torch.cat(cond_parts, dim=1) if len(cond_parts) > 1 else h_future
+
+    def _wam_world_training_condition(
+        self,
+        h_future: torch.Tensor,
+        examples: List[dict],
+        *,
+        task: str,
+    ) -> torch.Tensor:
+        """Build the world-loss condition with an explicit Qwen gradient ABI.
+
+        ``detach_world`` controls gradients from *action loss* through a
+        predicted future.  It does not isolate the auxiliary reconstruction
+        loss from Qwen. ``detach_world_backbone`` is the complementary
+        policy-first switch: only the Qwen future-query tensor is detached,
+        while the visual head and the optional state conditioner remain fully
+        trainable under ``world_loss``.
+        """
+
+        detach_backbone = bool(
+            self.wam_guidance.get("detach_world_backbone", False)
+        )
+        qwen_condition = h_future.detach() if detach_backbone else h_future
+        return self._wam_visual_condition(qwen_condition, examples, task=task)
+
+    def _wam_world_target(self, examples: List[dict]) -> torch.Tensor:
+        """Build the canonical future-world target for supervision and oracle input.
+
+        Absolute mode uses ``DINO(image_1)``; delta mode standardizes
+        ``DINO(image_1) - DINO(image_0)`` to approximately unit variance. Both
+        passive/FDM supervision and the oracle bridge must use this exact path.
         """
         z1 = self._wam_dino_target(examples, "dino_1", ["image_1"])
         if not self.wam_fdm_delta:
@@ -1713,6 +2065,18 @@ class Qwen_GR00T(baseframework):
                 "world_gate_max_openness": effective.abs().max(),
             }
 
+    def _wam_world_to_action_metrics(self, ref: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return structural zeros for the no-world-to-action baseline."""
+
+        if not bool(self.wam_guidance.get("world_to_action_enabled", True)):
+            zero = ref.detach().new_zeros(())
+            return {
+                "world_gate_openness": zero,
+                "world_gate_signed_mean": zero,
+                "world_gate_max_openness": zero,
+            }
+        return self._wam_world_gate_metrics()
+
     def _wam_maybe_logged_gate_metrics(self) -> dict[str, torch.Tensor]:
         """Expose gate state for configured two-stage policy/passive runs."""
 
@@ -1727,12 +2091,13 @@ class Qwen_GR00T(baseframework):
         eval_mode: str = "correct",
         action_world_grad_scale: float = 1.0,
     ):
-        """产出注入 action 的 world tokens [B,N_w,D_model]（或 None=不注入）。
+        """Produce world tokens ``[B, N_w, D_model]`` for action conditioning.
 
-        中文注释：按 guidance.signal 取信号——h_future(直接用 future-query hidden)；z_pred/delta_z_pred
-        (world head 预测未来 DINO 潜变量)；z_oracle/delta_z_oracle(直接用 GT)。bridge_source 决定
-        predicted/oracle/scheduled 混合；detach_world 决定 action loss 是否回传 world head。最后用
-        adapter(concat/dual/adaln) 或 qformer(M3) 投到 d_model。eval_mode 实现因果消融(off/zero/shuffled)。
+        ``guidance.signal`` selects future-query, predicted-latent, or oracle
+        latent features. ``bridge_source`` selects predicted, oracle, or
+        scheduled input; ``detach_world`` controls action-to-world gradients.
+        The configured adapter or Q-Former projects the result, while
+        ``eval_mode`` implements off, zero, and shuffled causal ablations.
         """
         from starVLA.model.framework.VLM4A.wam_guidance import (
             mix_world_tokens,
@@ -1741,6 +2106,10 @@ class Qwen_GR00T(baseframework):
         )
 
         g = self.wam_guidance
+        if not bool(g.get("world_to_action_enabled", True)):
+            raise RuntimeError(
+                "world signal requested while guidance.world_to_action_enabled=false"
+            )
         signal = str(g["signal"]).lower()
         mode = str(g["mode"]).lower()
         em = str(eval_mode or "correct").lower()
@@ -1748,11 +2117,9 @@ class Qwen_GR00T(baseframework):
             return None
 
         if not self._wam_signal_is_latent:
-            # M1.1/M2：world 信号 = future-query hidden（d_model）。
             base = h_future
         else:
             bridge = str(g["bridge_source"]).lower()
-            # oracle（GT DINO/Δ）：仅训练时 dino_1 在 batch 才有；live eval 没有未来帧 → None。
             oracle = None
             want_oracle = self._wam_signal_is_oracle or bridge in ("oracle", "scheduled") or em == "gt"
             if want_oracle:
@@ -1770,7 +2137,6 @@ class Qwen_GR00T(baseframework):
                     if self.training and strict_precomputed:
                         raise
                     oracle = None
-            # predicted：world head 以 h_future 为条件，flow 采样未来 DINO 潜变量。
             predicted = None
             need_pred = (
                 (not self._wam_signal_is_oracle)
@@ -1779,14 +2145,30 @@ class Qwen_GR00T(baseframework):
             )
             if need_pred:
                 n_v = oracle.shape[1] if oracle is not None else int(self._wam_world_n)
+                condition_builder = getattr(self, "_wam_visual_condition", None)
                 if bool(g["detach_world"]):
-                    # detach_world：action loss 不回传 world head（Stage1/2）。直接 no_grad 出预测，
-                    # 不建无用反传图（省显存）；world head 由 passive/fdm 步监督训练。
                     with torch.no_grad():
-                        predicted = self.wam_visual_head.predict_latent(h_future, n=n_v)
+                        prediction_cond = (
+                            condition_builder(h_future, examples, task="policy")
+                            if callable(condition_builder)
+                            else h_future
+                        )
+                        use_eval_mode = bool(g.get("detached_prediction_eval_mode", False))
+                        was_training = bool(self.wam_visual_head.training)
+                        if use_eval_mode and was_training:
+                            self.wam_visual_head.eval()
+                        try:
+                            predicted = self.wam_visual_head.predict_latent(prediction_cond, n=n_v)
+                        finally:
+                            if use_eval_mode and was_training:
+                                self.wam_visual_head.train()
                 else:
-                    # e2e（Stage3）：保留梯度，action loss 经 predict_latent 回传到 world head + h_future。
-                    predicted = self.wam_visual_head.predict_latent(h_future, n=n_v)
+                    prediction_cond = (
+                        condition_builder(h_future, examples, task="policy")
+                        if callable(condition_builder)
+                        else h_future
+                    )
+                    predicted = self.wam_visual_head.predict_latent(prediction_cond, n=n_v)
             if self._wam_signal_is_oracle or em == "gt":
                 base = oracle
             elif bridge == "oracle":
@@ -1798,12 +2180,10 @@ class Qwen_GR00T(baseframework):
             if base is None:
                 return None
         base = base.to(h_future.dtype)
-        # 因果消融（plan §11）：zero=置零；shuffled/wrong_task=batch 内错排（拿别人的未来）。
         if em == "zero":
             base = torch.zeros_like(base)
         elif em in ("shuffled", "wrong_task"):
             base = shuffle_along_batch(base)
-        # 投影到 action cross-attn 维度。
         if mode == "qformer" and self.world_qformer is not None:
             qd = self._jointflow_module_dtype(self.world_qformer, fallback=base.dtype)
             world = self.world_qformer(base.to(qd)).to(h_future.dtype)
@@ -1826,13 +2206,12 @@ class Qwen_GR00T(baseframework):
         context_exclusion_mask,
         world_tokens,
     ):
-        """组装 action DiT 的 cross-attn memory（concat-family）。
+        """Assemble cross-attention memory for concat-family action heads.
 
-        中文注释（plan §4.2）：
-          none(M0-Q)   memory = [h_act ; qwen_context]（world 不注入，仅 dual-query 影响 Qwen 表征）。
-          concat/qformer memory = [h_act ; world_tokens ; qwen_context]。
-          sa_fusion(M2)  memory = [SA([h_act;h_future]) ; qwen_context]。
-        qwen_context = 原始图文 hidden（屏蔽两组占位）。保留原始 action 条件不删。
+        M0-Q uses ``[h_act; qwen_context]``; concat/Q-Former inserts world
+        tokens; compact self-attention uses ``[SA(h_act, h_future);
+        qwen_context]``. Query placeholders are excluded from raw context, and
+        the original action condition is never removed.
         """
         g = self.wam_guidance
         mode = str(g["mode"]).lower()
@@ -1863,9 +2242,6 @@ class Qwen_GR00T(baseframework):
         return torch.cat(blocks, dim=1), torch.cat(masks, dim=1)
 
     #######
-    # 中文注释：World memory（M4 alternate / M5,M6+ dual cross-attn 用）：M_w=[world_tokens ; qwen_context]
-    # （include_context_in_world_memory 控制是否带 context）。它和 action memory 的 context 开关独立，
-    # 供 action DiT 的 gated world cross-attn 读取。
     def _build_world_memory(self, world_tokens, hidden, attn, context_exclusion_mask):
         g = self.wam_guidance
         dtype = world_tokens.dtype
@@ -1878,10 +2254,6 @@ class Qwen_GR00T(baseframework):
             masks.append(keep.to(hidden.device))
         return torch.cat(blocks, dim=1), torch.cat(masks, dim=1)
 
-    # 中文注释：统一组装 guided action head 的输入——返回 (action_mem, action_mask, world_embs, world_mask, world_global)。
-    #   concat-family(none/concat/sa_fusion/qformer)：world 进 action memory 拼接，world_embs/global=None。
-    #   DIT-family(alternate/dual/adaln/dual_adaln)：action_mem=[h_act;ctx]（baseline），world 经 cross-attn(world_embs)
-    #     和/或 AdaLN(world_global=pooler(world_tokens)) 注入。
     _CONCAT_MODES = ("none", "concat", "sa_fusion", "qformer")
     _DIT_XATTN_MODES = ("alternate_xattn", "dual_xattn", "dual_xattn_adaln")
     _DIT_ADALN_MODES = ("adaln", "dual_xattn_adaln")
@@ -1917,10 +2289,63 @@ class Qwen_GR00T(baseframework):
             world_global = self.world_pooler(world_tokens.to(pd)).to(h_act.dtype)
         return mem, mem_mask, world_embs, world_mask, world_global
 
+    def _wam_uses_native_action_context(self) -> bool:
+        """Whether policy conditioning must be byte-for-byte baseline shaped."""
+
+        return bool(self.wam_guidance.get("baseline_action_context", False))
+
+    @staticmethod
+    def _wam_auxiliary_rng_context(reference: torch.Tensor):
+        """Keep auxiliary future sampling from perturbing baseline policy RNG."""
+
+        devices = []
+        if reference.device.type == "cuda":
+            devices = [
+                reference.device.index
+                if reference.device.index is not None
+                else torch.cuda.current_device()
+            ]
+        return torch.random.fork_rng(devices=devices, enabled=True)
+
+    def _assemble_native_guided_inputs(
+        self,
+        mode: str,
+        native_hidden: torch.Tensor,
+        native_attention_mask: torch.Tensor | None,
+        world_tokens: torch.Tensor | None,
+    ):
+        """Add only gated world memory around the native baseline context.
+
+        The primary DiT encoder memory stays exactly ``last_hidden`` from
+        ``build_qwenvl_inputs``.  No ACT query token or dual-query suffix is
+        inserted into that memory.  Stage 2 can therefore change the policy
+        only through the explicitly zero-initialized world residual.
+        """
+
+        mem = native_hidden
+        mem_mask = (
+            native_attention_mask.to(device=mem.device, dtype=torch.bool)
+            if native_attention_mask is not None
+            else torch.ones(mem.shape[:2], device=mem.device, dtype=torch.bool)
+        )
+        world_embs, world_mask, world_global = None, None, None
+        if mode in self._DIT_XATTN_MODES and world_tokens is not None:
+            no_exclusions = torch.zeros_like(mem_mask, dtype=torch.bool)
+            world_embs, world_mask = self._build_world_memory(
+                world_tokens,
+                native_hidden,
+                mem_mask,
+                no_exclusions,
+            )
+        if mode in self._DIT_ADALN_MODES and world_tokens is not None and self.world_pooler is not None:
+            pd = self._jointflow_module_dtype(self.world_pooler, fallback=world_tokens.dtype)
+            world_global = self.world_pooler(world_tokens.to(pd)).to(native_hidden.dtype)
+        return mem, mem_mask, world_embs, world_mask, world_global
+
     #######
 
     def _wam_guided_unused_anchor(self, task: str, ref: torch.Tensor) -> torch.Tensor:
-        """guided 单任务/优化步：给本步**结构上不会用到**的子模块加零梯度 anchor（DDP/DeepSpeed 全覆盖）。"""
+        """Anchor structurally unused modules with zero gradients for DDP/DeepSpeed."""
         g = self.wam_guidance
         mode = str(g["mode"]).lower()
         signal = str(g["signal"]).lower()
@@ -1928,15 +2353,22 @@ class Qwen_GR00T(baseframework):
             "action": self.action_model,
             "visual": self.wam_visual_head,
             "act_ctx": self.wam_act_ctx,
+            "state_ctx": getattr(self, "wam_state_ctx", None),
             "adapter": getattr(self, "world_adapter", None),
             "fusion": getattr(self, "world_fusion", None),
             "qformer": getattr(self, "world_qformer", None),
             "pooler": getattr(self, "world_pooler", None),
         }
         used: set[str] = set()
-        if task in ("policy", "idm", "joint_e2e"):
+        action_world_bypass = bool(g.get("action_world_bypass", False)) and task in {
+            "joint_e2e",
+            "joint_detached",
+        }
+        if task in ("policy", "idm", "joint_e2e", "joint_detached"):
             used.add("action")
-            if signal != "none":
+            if task in ("joint_e2e", "joint_detached") and self.wam_state_ctx is not None:
+                used.add("state_ctx")
+            if signal != "none" and not action_world_bypass:
                 if mode == "qformer":
                     used.add("qformer")
                 elif mode == "sa_fusion":
@@ -1945,79 +2377,219 @@ class Qwen_GR00T(baseframework):
                     used.add("adapter")
                 if mode in ("adaln", "dual_xattn_adaln"):
                     used.add("pooler")
-                # world head 仅在 e2e(detach_world=false) 时由 action loss 真正受梯度；detach_world=true 下
-                # predict_latent 在 no_grad 里跑、输出 detach → world head 本步无梯度 → 需 anchor 兜底
-                # （它由 passive/fdm 步监督）。oracle 信号根本不跑 world head。
                 if self._wam_signal_is_latent and not self._wam_signal_is_oracle and not bool(g["detach_world"]):
                     used.add("visual")
         else:  # passive / fdm
             used.add("visual")
+            if self.wam_state_ctx is not None:
+                used.add("state_ctx")
             if task == "fdm":
                 used.add("act_ctx")
         unused = [m for k, m in all_mods.items() if k not in used]
         return self._zero_grad_anchor_for_modules(unused, ref)
 
+    def _wam_action_world_bypass_anchor(self, task: str, ref: torch.Tensor) -> torch.Tensor:
+        """Cover action-DiT world-only parameters while Stage-1 bypasses them."""
+
+        if task not in {"joint_e2e", "joint_detached"} or not bool(
+            self.wam_guidance.get("action_world_bypass", False)
+        ):
+            return ref.new_zeros(())
+        if not self._unused_param_anchors_enabled:
+            return ref.new_zeros(())
+
+        action_dit = getattr(self.action_model, "model", None)
+        blocks = getattr(action_dit, "transformer_blocks", ())
+        world_modules: list[nn.Module | None] = []
+        gates: list[torch.Tensor] = []
+        for block in blocks:
+            world_modules.extend(
+                [
+                    getattr(block, "world_attn", None),
+                    getattr(block, "world_to_temb", None),
+                ]
+            )
+            gate = getattr(block, "world_gate", None)
+            if gate is not None:
+                gates.append(gate)
+        anchor = self._zero_grad_anchor_for_modules(world_modules, ref)
+        for gate in gates:
+            if gate.requires_grad and gate.numel() > 0:
+                anchor = anchor + gate.reshape(-1)[0].to(dtype=anchor.dtype) * 0.0
+        return anchor
+
     def _wam_guided_forward(self, examples: List[dict], task: str = "policy", **kwargs) -> dict:
         task = str(task)
         mode = str(self.wam_guidance["mode"]).lower()
-        h_act, h_future, hidden, attn, context_exclusion_mask = self._wam_guided_backbone(examples, task=task)
-        if task == "joint_e2e":
-            # One causal batch, one Qwen forward, two objectives.  The action
-            # branch never sees GT future features; GT is used only as the
-            # auxiliary world-prediction target.
-            bridge = str(self.wam_guidance["bridge_source"]).lower()
-            if bridge != "predicted" or bool(self.wam_guidance["detach_world"]):
-                raise ValueError(
-                    "joint_e2e requires guidance.bridge_source=predicted and detach_world=false; "
-                    f"got bridge_source={bridge!r}, detach_world={self.wam_guidance['detach_world']!r}."
+        use_native_action = self._wam_uses_native_action_context() and task in {
+            "policy",
+            "joint_e2e",
+            "joint_detached",
+        }
+        native_hidden, native_attn, native_joint_action_loss = None, None, None
+        if use_native_action:
+            native_hidden, native_attn = self._native_qwen_action_context(
+                examples,
+                resize_to_training=False,
+            )
+            # Compute action first, through the exact native baseline path.
+            # The auxiliary future branch below runs in a forked RNG domain,
+            # so it cannot shift policy noise/dropout in later optimizer steps.
+            if task in {"joint_e2e", "joint_detached"}:
+                native_joint_action_loss = self._native_action_loss_from_context(
+                    examples,
+                    native_hidden,
+                    native_attn,
                 )
 
-            z_gt = self._wam_world_target(examples)
-            vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=h_future.dtype)
-            raw_world_loss = self._wam_visual_loss(h_future.to(vh), z_gt, examples)
-            world_loss = self.wam_dino_loss_weight * raw_world_loss
+        auxiliary_rng = (
+            self._wam_auxiliary_rng_context(native_hidden)
+            if use_native_action
+            else nullcontext()
+        )
+        with auxiliary_rng:
+            detach_world_backbone = bool(
+                self.wam_guidance.get("detach_world_backbone", False)
+            )
+            future_backbone_context = (
+                torch.no_grad()
+                if use_native_action and detach_world_backbone
+                else nullcontext()
+            )
+            with future_backbone_context:
+                h_act, h_future, hidden, attn, context_exclusion_mask = self._wam_guided_backbone(
+                    examples,
+                    task=task,
+                )
 
-            grad_scale = self._wam_action_world_grad_scale(int(kwargs.get("global_step", 0)))
-            world_tokens = self._build_world_signal(
-                h_future,
-                examples,
-                action_world_grad_scale=grad_scale,
+            if task in ("joint_e2e", "joint_detached"):
+                # The baseline-preserving recipe intentionally uses two Qwen
+                # passes: native policy context plus a detached dual-query
+                # future condition.  Legacy recipes retain their one-pass ABI.
+                bridge = str(self.wam_guidance["bridge_source"]).lower()
+                detach_world = bool(self.wam_guidance["detach_world"])
+                expected_detach = task == "joint_detached"
+                if bridge != "predicted" or detach_world != expected_detach:
+                    raise ValueError(
+                        f"{task} requires guidance.bridge_source=predicted and "
+                        f"detach_world={str(expected_detach).lower()}; got "
+                        f"bridge_source={bridge!r}, detach_world={detach_world!r}."
+                    )
+
+                z_gt = self._wam_world_target(examples)
+                world_cond = self._wam_world_training_condition(
+                    h_future,
+                    examples,
+                    task=task,
+                )
+                vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=h_future.dtype)
+                raw_world_loss, world_details = self._wam_visual_loss(
+                    world_cond.to(vh),
+                    z_gt,
+                    examples,
+                    return_details=True,
+                )
+                world_loss = self.wam_dino_loss_weight * raw_world_loss
+
+                predictor_grad_scale = (
+                    0.0
+                    if detach_world
+                    else self._wam_action_world_grad_scale(int(kwargs.get("global_step", 0)))
+                )
+                action_world_bypass = bool(self.wam_guidance.get("action_world_bypass", False))
+                detach_action_backbone = bool(
+                    self.wam_guidance.get("detach_action_backbone", False)
+                )
+                signal_grad_scale = 1.0 if detach_world else predictor_grad_scale
+                world_tokens = None
+                if not action_world_bypass:
+                    world_tokens = self._build_world_signal(
+                        h_future,
+                        examples,
+                        action_world_grad_scale=signal_grad_scale,
+                    )
+            elif task in ("policy", "idm"):
+                world_tokens = self._build_world_signal(h_future, examples)
+            else:
+                z_gt = self._wam_world_target(examples)
+                cond = self._wam_visual_condition(h_future, examples, task=task)
+                vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=cond.dtype)
+                raw = self._wam_visual_loss(cond.to(vh), z_gt, examples)
+
+        if task in ("joint_e2e", "joint_detached"):
+            if use_native_action:
+                action_loss = native_joint_action_loss
+            else:
+                # Historical guided action memory remains unchanged for every
+                # legacy checkpoint/config that does not opt into v3.
+                action_h_act = h_act.detach() if detach_action_backbone else h_act
+                action_h_future = h_future.detach() if detach_action_backbone else h_future
+                action_hidden = hidden.detach() if detach_action_backbone else hidden
+                mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
+                    mode,
+                    action_h_act,
+                    action_h_future,
+                    action_hidden,
+                    attn,
+                    context_exclusion_mask,
+                    world_tokens,
+                )
+                actions = self._stack_jointflow_field(examples, "action", required=True)
+                actions = actions[:, -self.action_horizon :, : self.action_dim].float()
+                state, action_is_pad = self._wam_action_state_and_mask(examples)
+                hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
+                action_loss = self._wam_action_loss(
+                    mem.to(hd),
+                    actions.to(hd),
+                    state.to(hd) if state is not None else None,
+                    mem_mask,
+                    action_is_pad,
+                    world_embs=(w_embs.to(hd) if w_embs is not None else None),
+                    world_attention_mask=w_mask,
+                    world_global=(w_global.to(hd) if w_global is not None else None),
+                    guidance_mode=mode,
+                )
+            action_loss = (
+                action_loss
+                + self._wam_guided_unused_anchor(task, action_loss)
+                + self._wam_action_world_bypass_anchor(task, action_loss)
             )
-            mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
-                mode, h_act, h_future, hidden, attn, context_exclusion_mask, world_tokens
-            )
-            actions = self._stack_jointflow_field(examples, "action", required=True)
-            actions = actions[:, -self.action_horizon :, : self.action_dim].float()
-            state, action_is_pad = self._wam_action_state_and_mask(examples)
-            hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
-            action_loss = self._wam_action_loss(
-                mem.to(hd),
-                actions.to(hd),
-                state.to(hd) if state is not None else None,
-                mem_mask,
-                action_is_pad,
-                world_embs=(w_embs.to(hd) if w_embs is not None else None),
-                world_attention_mask=w_mask,
-                world_global=(w_global.to(hd) if w_global is not None else None),
-                guidance_mode=mode,
-            )
-            action_loss = action_loss + self._wam_guided_unused_anchor(task, action_loss)
             output = {
                 "action_loss": action_loss,
                 "world_loss": world_loss,
                 "world_loss_raw": raw_world_loss.detach(),
-                "action_world_grad_scale": action_loss.detach().new_tensor(grad_scale),
+                "action_world_grad_scale": action_loss.detach().new_tensor(predictor_grad_scale),
+                "action_world_bypassed": action_loss.detach().new_tensor(float(action_world_bypass)),
+                "action_backbone_detached": action_loss.detach().new_tensor(
+                    float(detach_action_backbone)
+                ),
+                "world_backbone_detached": action_loss.detach().new_tensor(
+                    float(detach_world_backbone)
+                ),
+                "baseline_action_context": action_loss.detach().new_tensor(
+                    float(use_native_action)
+                ),
+                "world_flow_loss_raw": world_details["flow_loss_raw"],
+                "world_clean_loss_raw": world_details["clean_loss_raw"],
+                "world_cosine_loss_raw": world_details["cosine_loss_raw"],
             }
-            output.update(self._wam_world_gate_metrics())
+            output.update(self._wam_world_to_action_metrics(action_loss))
             return output
         if task in ("policy", "idm"):
             actions = self._stack_jointflow_field(examples, "action", required=True)
             actions = actions[:, -self.action_horizon :, : self.action_dim].float()
             state, action_is_pad = self._wam_action_state_and_mask(examples)
-            world_tokens = self._build_world_signal(h_future, examples)
-            mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
-                mode, h_act, h_future, hidden, attn, context_exclusion_mask, world_tokens
-            )
+            if use_native_action:
+                mem, mem_mask, w_embs, w_mask, w_global = self._assemble_native_guided_inputs(
+                    mode,
+                    native_hidden,
+                    native_attn,
+                    world_tokens,
+                )
+            else:
+                mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
+                    mode, h_act, h_future, hidden, attn, context_exclusion_mask, world_tokens
+                )
             hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
             loss = self._wam_action_loss(
                 mem.to(hd),
@@ -2031,20 +2603,12 @@ class Qwen_GR00T(baseframework):
                 guidance_mode=mode,
             )
             key = "action_loss" if task == "policy" else "idm_loss"
-            output = {key: loss + self._wam_guided_unused_anchor(task, loss)}
+            output = {
+                key: loss + self._wam_guided_unused_anchor(task, loss),
+                "baseline_action_context": loss.detach().new_tensor(float(use_native_action)),
+            }
             output.update(self._wam_maybe_logged_gate_metrics())
             return output
-        # passive / fdm：world head 监督（dual-query 的 h_future 为条件，与 policy 一致）。
-        z_gt = self._wam_world_target(examples)
-        cond = h_future
-        if task == "fdm":
-            a = self._stack_jointflow_field(examples, "action", required=True)
-            a = a[:, -self.action_horizon :, : self.action_dim]
-            ad = self._jointflow_module_dtype(self.wam_act_ctx, fallback=h_future.dtype)
-            actx = self.wam_act_ctx(a.to(ad)).to(h_future.dtype)
-            cond = torch.cat([h_future, actx], dim=1)
-        vh = self._jointflow_module_dtype(self.wam_visual_head, fallback=cond.dtype)
-        raw = self._wam_visual_loss(cond.to(vh), z_gt, examples)
         loss = self.wam_dino_loss_weight * raw
         output = {
             f"{task}_loss": loss + self._wam_guided_unused_anchor(task, loss),
@@ -2057,18 +2621,132 @@ class Qwen_GR00T(baseframework):
         return output
 
     @torch.inference_mode()
+    def evaluate_wam_world_prediction(
+        self,
+        examples: List[dict],
+        *,
+        task: str = "joint_detached",
+        seed: int = 0,
+        num_samples: int = 1,
+        num_inference_timesteps: int | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return reducible held-out metrics for the sampled future DINO.
+
+        This evaluates the quantity used by policy inference, not the training
+        velocity loss: sample a future latent from IID Gaussian noise, compare
+        it directly with the held-out t+stride DINO tokens, and also report a
+        no-change (copy-current) baseline.  All values are sums/counts so the
+        trainer can all-reduce them exactly across data-parallel workers.
+        """
+
+        if not isinstance(examples, list):
+            examples = [examples]
+        if num_samples <= 0:
+            raise ValueError(f"world validation num_samples must be positive, got {num_samples}")
+
+        _h_act, h_future, _hidden, _attn, _excluded = self._wam_guided_backbone(
+            examples, task=str(task)
+        )
+        target = self._wam_world_target(examples)
+        cond = self._wam_visual_condition(h_future, examples, task=str(task))
+
+        valid = self._stack_jointflow_field(examples, "future_valid", required=False)
+        if valid is None:
+            valid_mask = torch.ones(target.shape[0], device=target.device, dtype=torch.bool)
+        else:
+            valid_mask = valid.reshape(valid.shape[0], -1)[:, 0] > 0.5
+
+        device = cond.device
+        result = torch.zeros(6, device=device, dtype=torch.float64)
+        if not bool(valid_mask.any()):
+            return {
+                "squared_error_sum": result[0],
+                "element_count": result[1],
+                "cosine_sum": result[2],
+                "token_count": result[3],
+                "copy_squared_error_sum": result[4],
+                "valid_sample_count": result[5],
+            }
+
+        target_valid = target[valid_mask].float()
+        if bool(getattr(self, "wam_fdm_delta", False)):
+            copy_prediction = torch.zeros_like(target_valid)
+        else:
+            current = self._wam_dino_target(examples, "dino_0", ["image_0", "image"])
+            copy_prediction = current[valid_mask].float()
+        copy_sse = (copy_prediction - target_valid).square().sum(dtype=torch.float64)
+
+        head_dtype = self._jointflow_module_dtype(self.wam_visual_head, fallback=cond.dtype)
+        for sample_index in range(int(num_samples)):
+            generator = torch.Generator(device=device)
+            generator.manual_seed(int(seed) + sample_index)
+            prediction = self.wam_visual_head.predict_latent(
+                cond.to(head_dtype),
+                n=int(target.shape[1]),
+                generator=generator,
+                num_inference_timesteps=num_inference_timesteps,
+            )
+            prediction_valid = prediction[valid_mask].float()
+            result[0] += (prediction_valid - target_valid).square().sum(dtype=torch.float64)
+            result[1] += float(target_valid.numel())
+            result[2] += torch.nn.functional.cosine_similarity(
+                prediction_valid, target_valid, dim=-1, eps=1.0e-8
+            ).sum(dtype=torch.float64)
+            result[3] += float(target_valid.shape[0] * target_valid.shape[1])
+            result[4] += copy_sse
+            result[5] += float(target_valid.shape[0])
+
+        return {
+            "squared_error_sum": result[0],
+            "element_count": result[1],
+            "cosine_sum": result[2],
+            "token_count": result[3],
+            "copy_squared_error_sum": result[4],
+            "valid_sample_count": result[5],
+        }
+
+    @torch.inference_mode()
     def _wam_guided_predict_action(self, examples: List[dict], **kwargs) -> dict:
         if not isinstance(examples, list):
             examples = [examples]
         mode = str(self.wam_guidance["mode"]).lower()
-        h_act, h_future, hidden, attn, context_exclusion_mask = self._wam_guided_backbone(
-            examples, task="policy"
-        )
-        eval_mode = str(self.wam_guidance.get("world_eval_mode", "correct")).lower()
-        world_tokens = self._build_world_signal(h_future, examples, eval_mode=eval_mode)
-        mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
-            mode, h_act, h_future, hidden, attn, context_exclusion_mask, world_tokens
-        )
+        use_native_action = self._wam_uses_native_action_context()
+        if use_native_action:
+            native_hidden, native_attn = self._native_qwen_action_context(
+                examples,
+                resize_to_training=True,
+            )
+            if bool(self.wam_guidance.get("action_world_bypass", False)):
+                # Stage-1 evaluation is the native baseline policy, including
+                # its prompt, context mask and action sampler.  No auxiliary
+                # future pass is needed when the explicit residual is closed.
+                return self._native_predict_action_from_context(
+                    examples,
+                    native_hidden,
+                    native_attn,
+                )
+            with self._wam_auxiliary_rng_context(native_hidden):
+                _h_act, h_future, _hidden, _attn, _excluded = self._wam_guided_backbone(
+                    examples,
+                    task="policy",
+                )
+                eval_mode = str(self.wam_guidance.get("world_eval_mode", "correct")).lower()
+                world_tokens = self._build_world_signal(h_future, examples, eval_mode=eval_mode)
+            mem, mem_mask, w_embs, w_mask, w_global = self._assemble_native_guided_inputs(
+                mode,
+                native_hidden,
+                native_attn,
+                world_tokens,
+            )
+        else:
+            h_act, h_future, hidden, attn, context_exclusion_mask = self._wam_guided_backbone(
+                examples, task="policy"
+            )
+            eval_mode = str(self.wam_guidance.get("world_eval_mode", "correct")).lower()
+            world_tokens = self._build_world_signal(h_future, examples, eval_mode=eval_mode)
+            mem, mem_mask, w_embs, w_mask, w_global = self._assemble_guided_inputs(
+                mode, h_act, h_future, hidden, attn, context_exclusion_mask, world_tokens
+            )
         hd = self._jointflow_module_dtype(self.action_model, fallback=mem.dtype)
         state, _ = self._wam_action_state_and_mask(examples)
         pred = self.action_model.predict_action(
@@ -2091,77 +2769,20 @@ class Qwen_GR00T(baseframework):
     ) -> Tuple:
         """ """
         #######
-        # 中文注释：WAM 优先接管（原生视觉 policy + DINO 监督头）；其次 JointFlow；都关则原生 action_loss。
         if self.wam_enabled:
             return self._wam_forward(examples, **kwargs)
-        # 中文注释：JointFlow-style 训练只在显式启用时接管 forward；原生 QwenGR00T 保持 action_loss 路径。
         if self.jointflow_enabled:
             return self._jointflow_forward(examples, task=str(kwargs.get("task", "policy")))
         #######
-        batch_images = [example["image"] for example in examples]  #  [B，[PLT]]
-        instructions = [example["lang"] for example in examples]  # [B, str]
-        actions = [example["action"] for example in examples]  # label [B， len, 7]
-
-        state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
-        action_is_pad = (
-            [example["action_is_pad"] for example in examples]
-            if all("action_is_pad" in example for example in examples)
-            else None
+        last_hidden, backbone_attention_mask = self._native_qwen_action_context(
+            examples,
+            resize_to_training=False,
         )
-
-        # Step 1: QWenVL input format
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
-
-        # Step 4: Action Expert Forward and Loss
-        with torch.autocast("cuda", dtype=torch.float32):
-            actions = torch.tensor(
-                np.array(actions), device=last_hidden.device, dtype=last_hidden.dtype
-            )  # [B, T_full, action_dim]
-            actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
-            action_is_pad_target = None
-            if action_is_pad is not None:
-                action_is_pad_target = torch.as_tensor(
-                    np.asarray(action_is_pad), device=last_hidden.device, dtype=torch.bool
-                )[:, -self.action_horizon :]
-
-            repeated_diffusion_steps = (
-                self.config.framework.action_model.get("repeated_diffusion_steps", 4)
-                if self.config and hasattr(self.config, "framework")
-                else 4
-            )
-            actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
-            action_is_pad_repeated = (
-                action_is_pad_target.repeat(repeated_diffusion_steps, 1) if action_is_pad_target is not None else None
-            )
-            last_hidden_repeated = last_hidden.repeat(repeated_diffusion_steps, 1, 1)
-            if backbone_attention_mask is not None:
-                backbone_attention_mask = backbone_attention_mask.repeat(repeated_diffusion_steps, 1).to(
-                    dtype=torch.bool
-                )
-
-            state_repeated = None
-            if state is not None:
-                state = torch.tensor(np.array(state), device=last_hidden.device, dtype=last_hidden.dtype)
-                state_repeated = state.repeat(repeated_diffusion_steps, 1, 1)
-
-            action_loss = self.action_model(
-                last_hidden_repeated,
-                actions_target_repeated,
-                state_repeated,
-                encoder_attention_mask=backbone_attention_mask,
-                action_is_pad=action_is_pad_repeated,
-            )  # (B, chunk_len, action_dim)
-
+        action_loss = self._native_action_loss_from_context(
+            examples,
+            last_hidden,
+            backbone_attention_mask,
+        )
         return {"action_loss": action_loss}
 
     @torch.inference_mode()
@@ -2180,54 +2801,22 @@ class Qwen_GR00T(baseframework):
                 normalized_actions (np.ndarray): Shape [B, T, action_dim], diffusion-sampled normalized actions.
         """
         #######
-        # 中文注释：WAM 推理只走原生视觉 policy（不碰 DINO）；其次 JointFlow。
         if self.wam_enabled:
             return self._wam_predict_action(examples=examples, **kwargs)
-        # 中文注释：评估/部署阶段只走 JointFlow 的 policy 路径，禁止触发 fdm/idm 辅助任务。
         if self.jointflow_enabled:
             return self._jointflow_predict_action(examples=examples, **kwargs)
         #######
         if type(examples) is not list:
             examples = [examples]
-        batch_images = [to_pil_preserve(example["image"]) for example in examples]  #  [B，[PLT]]
-        instructions = [example["lang"] for example in examples]  # [B, str]
-
-        state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
-
-        train_obs_image_size = getattr(self.config.datasets.vla_data, "obs_image_size", None)
-        if train_obs_image_size:
-            batch_images = resize_images(batch_images, target_size=train_obs_image_size)
-
-        # Step 1: QWenVL input format
-        qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
-        backbone_attention_mask = qwen_inputs.get("attention_mask", None)
-        if backbone_attention_mask is not None:
-            backbone_attention_mask = backbone_attention_mask.to(dtype=torch.bool)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            qwenvl_outputs = self.qwen_vl_interface(
-                **qwen_inputs,
-                output_attentions=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-
-            # last_hidden_state: [B, seq_len, H]
-            last_hidden = qwenvl_outputs.hidden_states[-1]  # [B, L, H]
-
-        state = (
-            torch.from_numpy(np.array(state)).to(last_hidden.device, dtype=last_hidden.dtype)
-            if state is not None
-            else None
+        last_hidden, backbone_attention_mask = self._native_qwen_action_context(
+            examples,
+            resize_to_training=True,
         )
-
-        # Step 4: Action Expert Forward
-        with torch.autocast("cuda", dtype=torch.float32):
-            pred_actions = self.action_model.predict_action(
-                last_hidden, state, encoder_attention_mask=backbone_attention_mask
-            )  # (B, chunk_len, action_dim)
-
-        normalized_actions = pred_actions.detach().cpu().numpy()
-        return {"normalized_actions": normalized_actions}
+        return self._native_predict_action_from_context(
+            examples,
+            last_hidden,
+            backbone_attention_mask,
+        )
 
 
 if __name__ == "__main__":

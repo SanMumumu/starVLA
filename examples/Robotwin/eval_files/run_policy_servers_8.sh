@@ -12,6 +12,8 @@ USE_BF16="${USE_BF16:-1}"
 SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-900}"
 READY_CHECK_INTERVAL="${READY_CHECK_INTERVAL:-3}"
 ADVERTISE_HOST="${ADVERTISE_HOST:-}"
+WAM_EXPECTED_PHASE="${WAM_EXPECTED_PHASE:-}"
+WAM_EXPECTED_WORLD_TO_ACTION="${WAM_EXPECTED_WORLD_TO_ACTION:-}"
 
 if [[ ! -f "${CKPT}" ]]; then
     echo "[ERROR] Checkpoint does not exist: ${CKPT}" >&2
@@ -49,7 +51,28 @@ if [[ ! -x "${STARVLA_PYTHON}" ]]; then
     exit 1
 fi
 
-# 使用 Python 看到的 CUDA 数量，避免 nvidia-smi 与 CUDA_VISIBLE_DEVICES 不一致。
+if [[ -n "${WAM_EXPECTED_PHASE}" ]]; then
+    if [[ "${WAM_EXPECTED_PHASE}" != "predictor_warmup" && \
+          "${WAM_EXPECTED_PHASE}" != "gate_ft" ]]; then
+        echo "[ERROR] WAM_EXPECTED_PHASE must be predictor_warmup or gate_ft" >&2
+        exit 1
+    fi
+    verify_args=(
+        --checkpoint "${CKPT}"
+        --replan-steps "${REPLAN_STEPS:-24}"
+        --expected-wam-phase "${WAM_EXPECTED_PHASE}"
+    )
+    if [[ -n "${WAM_EXPECTED_WORLD_TO_ACTION}" ]]; then
+        if [[ "${WAM_EXPECTED_WORLD_TO_ACTION}" != "enabled" && \
+              "${WAM_EXPECTED_WORLD_TO_ACTION}" != "disabled" ]]; then
+            echo "[ERROR] WAM_EXPECTED_WORLD_TO_ACTION must be enabled or disabled" >&2
+            exit 1
+        fi
+        verify_args+=(--expected-world-to-action "${WAM_EXPECTED_WORLD_TO_ACTION}")
+    fi
+    "${STARVLA_PYTHON}" "${SCRIPT_DIR}/verify_fastwam_checkpoint_contract.py" "${verify_args[@]}"
+fi
+
 GPU_COUNT="$(
     "${STARVLA_PYTHON}" - <<'PY'
 try:
@@ -65,7 +88,6 @@ if (( GPU_COUNT < NUM_SERVERS )); then
     exit 1
 fi
 
-# 当前 Job 对其他 Job 可见的地址。允许通过 ADVERTISE_HOST 手动覆盖。
 if [[ -z "${ADVERTISE_HOST}" ]]; then
     ADVERTISE_HOST="$(
         hostname -I 2>/dev/null |
@@ -154,7 +176,6 @@ cleanup() {
 
 trap cleanup INT TERM EXIT
 
-# 真正执行 WebSocket 握手，不能再用裸 TCP socket 探测。
 websocket_is_ready() {
     local host="$1"
     local port="$2"

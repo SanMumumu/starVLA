@@ -84,17 +84,6 @@ if [[ ! "${NUM_CLIENTS}" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
-if [[ -z "${ROBOTWIN_PYTHON}" ]]; then
-    if command -v python3 >/dev/null 2>&1; then
-        ROBOTWIN_PYTHON="$(command -v python3)"
-    elif command -v python >/dev/null 2>&1; then
-        ROBOTWIN_PYTHON="$(command -v python)"
-    else
-        echo "[ERROR] Cannot find python3/python. Set ROBOTWIN_PYTHON." >&2
-        exit 1
-    fi
-fi
-
 if [[ -z "${ROBOTWIN_PATH}" ]]; then
     for candidate in \
         /workspace/RoboTwin \
@@ -150,6 +139,9 @@ if (( ${#GPU_IDS[@]} < NUM_CLIENTS )); then
     exit 1
 fi
 GPU_IDS=("${GPU_IDS[@]:0:NUM_CLIENTS}")
+
+source "${SCRIPT_DIR}/robotwin_runtime.sh"
+prepare_robotwin_runtime "${ROBOTWIN_PATH}" "${GPU_IDS[0]}"
 
 declare -a SELECTED_TASKS=()
 if [[ "${TASKS}" == "all" ]]; then

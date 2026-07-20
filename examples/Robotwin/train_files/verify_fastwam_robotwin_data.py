@@ -282,8 +282,17 @@ def main() -> None:
     with args.config_yaml.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     data_config = config["datasets"]["vla_data"]
-    if data_config.get("data_mix") != "robotwin_fastwam":
-        raise ValueError(f"Expected data_mix=robotwin_fastwam in {args.config_yaml}")
+    action_horizon = int(config["framework"]["action_model"]["action_horizon"])
+    data_mix = data_config.get("data_mix")
+    valid_layouts = {
+        (32, "robotwin_fastwam"),
+        (16, "robotwin_fastwam_h16"),
+    }
+    if (action_horizon, data_mix) not in valid_layouts:
+        raise ValueError(
+            "FastWAM config must use (H32,robotwin_fastwam) or "
+            f"(H16,robotwin_fastwam_h16), got H={action_horizon}, data_mix={data_mix!r}"
+        )
     expected_config = {
         "fastwam_expected_fps": 50,
         "fastwam_val_fraction": 0.01,
@@ -305,8 +314,16 @@ def main() -> None:
             "datasets.vla_data.include_state must be an explicit YAML boolean so the checkpoint records its "
             "inference ABI"
         )
-    if int(config["framework"]["action_model"]["action_horizon"]) != 32:
-        raise ValueError("FastWAM experiment requires framework.action_model.action_horizon=32")
+    if bool(data_config.get("fastwam_action_world_coflow_targets", False)):
+        if (action_horizon, data_mix) != (16, "robotwin_fastwam_h16"):
+            raise ValueError(
+                "Action--World Co-Flow is one H16 bridge and requires "
+                f"data_mix=robotwin_fastwam_h16, got H={action_horizon}, data_mix={data_mix!r}"
+            )
+        if "fastwam_coflow_future_strides" in data_config:
+            raise ValueError(
+                "fastwam_coflow_future_strides was removed; Co-Flow always uses t+16"
+            )
 
     data_root = Path(data_config["data_root_dir"])
     stats_path = Path(data_config.get("fastwam_dataset_stats_path", data_root / "dataset_stats.json"))

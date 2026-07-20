@@ -9,13 +9,10 @@ LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-${LIBERO_HOME}/libero}"
 
 CKPT="${CKPT:-/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_qwenwam/gr00t/0618_libero4in1_qwen3gr00t/final_model/pytorch_model.pt}"
 
-# client/server 不在同一 task 时，必须用 server 日志里的 IP
 HOST="${HOST:-10.237.89.194}"
 PORT="${PORT:-6694}"
 
-# 默认全测四套；单测可用：
 # TASK_SUITE_NAME=libero_goal bash examples/LIBERO/eval_files/eval_libero.sh
-# 自定义多套可用：
 # TASK_SUITES="libero_spatial libero_object" bash examples/LIBERO/eval_files/eval_libero.sh
 TASK_SUITES="${TASK_SUITES:-${TASK_SUITE_NAME:-libero_spatial libero_object libero_goal libero_10}}"
 
@@ -69,7 +66,6 @@ SITECUSTOMIZE
 export PYTHONPATH="/tmp/pydeps:${PYTHONPATH:-}"
 # ---------------------------------------------------------------------
 
-# 兼容 final_model/pytorch_model.pt 和 checkpoints/xxx.pt
 if [[ "${CKPT}" == *"/final_model/"* ]]; then
   MODEL_ROOT="$(dirname "$(dirname "${CKPT}")")"
   CKPT_TAG="final_model_$(basename "${CKPT}" .pt)"
@@ -81,8 +77,6 @@ else
   CKPT_TAG="$(basename "${CKPT}" .pt)"
 fi
 
-# 输出到对应实验目录下，并且 result 文件夹名带 ckpt
-# 例如：
 # .../0618_wam_exp3_policy_tricks/eval_results_steps_40000_pytorch_model/libero_goal/
 OUTPUT_ROOT="${OUTPUT_ROOT:-${MODEL_ROOT}/eval_results_${CKPT_TAG}}"
 

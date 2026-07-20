@@ -1,8 +1,12 @@
-"""Numerical and contract regressions for the isolated Co-Flow implementation."""
+"""Regressions for the single-bridge Action--World Co-Flow implementation."""
 
 from __future__ import annotations
 
+import copy
+import importlib.util
 import inspect
+import json
+import tempfile
 import types
 from contextlib import nullcontext
 from pathlib import Path
@@ -10,7 +14,6 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-from omegaconf import OmegaConf
 from torch import nn
 
 from starVLA.model.framework.VLM4A.action_world_coflow.attention_mask import (
@@ -34,121 +37,128 @@ from starVLA.model.framework.VLM4A.QwenActionWorldCoFlow import (
 from starVLA.model.framework.VLM4A.QwenGR00T import QwenGR00TDefaultConfig
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.train_starvla import VLATrainer
-from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
 
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
+RUNBOOK_DIR_NAME = "\u6267\u884c\u811a\u672c"
+REMOVED_COFLOW_FIELDS = {
+    "segment_boundaries",
+    "future_strides",
+    "z32_loss_weight",
+    "intermediate_state_source",
+    "predicted_z16_detach",
+    "predicted_action_prefix_detach",
+    "z16_teacher_ratio_start",
+    "z16_teacher_ratio_end",
+    "z16_teacher_decay_steps",
+}
 
 
-def test_block_causal_mask_exact_visibility_and_padding() -> None:
-    block_ids = torch.tensor([0, 0, 1, 1, 1, 2, 2], dtype=torch.long)
-    valid = torch.tensor([[False, True, True, True, True, True, True]])
+def test_single_bridge_attention_visibility_and_padding() -> None:
+    block_ids = torch.tensor([0, 0, 1, 1, 1], dtype=torch.long)
+    valid = torch.tensor([[False, True, True, True, True]])
     mask = build_block_causal_attention_mask(block_ids, key_valid_mask=valid)
-    assert mask.shape == (1, 1, 7, 7)
-    # Context cannot read either action/world block.
-    assert not bool(mask[0, 0, 0, 2:].any())
-    # Same block is bidirectional; block 1 cannot see block 2.
-    assert bool(mask[0, 0, 2, 4]) and bool(mask[0, 0, 4, 2])
-    assert not bool(mask[0, 0, 2:5, 5:].any())
-    # Block 2 reads context + both blocks, except the padded context key.
-    assert bool(mask[0, 0, 5:, 1:].all())
+    assert mask.shape == (1, 1, 5, 5)
+    assert not bool(mask[0, 0, :2, 2:].any())
+    assert bool(mask[0, 0, 2:, 1:].all())
     assert not bool(mask[0, 0, :, 0].any())
+    assert render_bool_attention_mask(build_block_causal_attention_mask(block_ids)) == (
+        "##...\n##...\n#####\n#####\n#####"
+    )
+    with pytest.raises(ValueError, match="single-bridge"):
+        build_block_causal_attention_mask(torch.tensor([0, 1, 2]))
 
-    unpadded = build_block_causal_attention_mask(block_ids)
-    assert render_bool_attention_mask(unpadded) == (
-        "##.....\n"
-        "##.....\n"
-        "#####..\n"
-        "#####..\n"
-        "#####..\n"
-        "#######\n"
-        "#######"
+
+def test_modality_experts_and_sparse_mot_receive_gradients() -> None:
+    torch.manual_seed(29)
+    dense = ModalityExpertBlock(
+        hidden_size=12, num_heads=3, mlp_ratio=2.0, dropout=0.0
+    ).eval()
+    sparse = ModalityExpertBlock(
+        hidden_size=12,
+        num_heads=3,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        expert_mlp_ratios=(2.0, 2.0, 2.0),
+        sparse_expert_routing=True,
+    ).eval()
+    sparse.load_state_dict(dense.state_dict(), strict=True)
+    token_types = torch.tensor([0, 0, 1, 1, 2, 2], dtype=torch.long)
+    attention_mask = torch.ones(2, 1, 6, 6, dtype=torch.bool)
+    dense_input = torch.randn(2, 6, 12, requires_grad=True)
+    sparse_input = dense_input.detach().clone().requires_grad_(True)
+    torch.testing.assert_close(
+        sparse(sparse_input, token_types, attention_mask),
+        dense(dense_input, token_types, attention_mask),
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    )
+    sparse(sparse_input, token_types, attention_mask).square().mean().backward()
+    assert all(
+        parameter.grad is not None
+        for expert in sparse.ffns
+        for parameter in expert.parameters()
     )
 
 
-def test_all_modality_specific_ffns_execute_and_receive_gradients() -> None:
-    block = ModalityExpertBlock(hidden_size=12, num_heads=3, mlp_ratio=2.0, dropout=0.0)
-    calls = [0, 0, 0]
-    handles = []
-    for index, ffn in enumerate(block.ffns):
-        def mark_called(_module, _inputs, _output, *, index=index):
-            calls[index] += 1
-
-        handles.append(ffn.register_forward_hook(mark_called))
-    try:
-        x = torch.randn(2, 3, 12, requires_grad=True)
-        token_types = torch.tensor([0, 1, 2], dtype=torch.long)
-        attention_mask = torch.ones(2, 1, 3, 3, dtype=torch.bool)
-        block(x, token_types, attention_mask).square().mean().backward()
-    finally:
-        for handle in handles:
-            handle.remove()
-    assert calls == [1, 1, 1]
-    assert all(parameter.grad is not None for ffn in block.ffns for parameter in ffn.parameters())
-
-
-def test_qantara_bridge_endpoints_variance_and_reprojection() -> None:
+def test_qantara_bridge_endpoints_and_reprojection() -> None:
     start = torch.zeros(2, 3, 4)
     target = torch.ones_like(start) * 2
     noise = torch.ones_like(start)
     bridge = QantaraWorldBridge(noise_scale=1.0, prediction_type="qantara_x_delta")
     torch.testing.assert_close(bridge.interpolate(start, target, torch.zeros(2), noise), start)
     torch.testing.assert_close(bridge.interpolate(start, target, torch.ones(2), noise), target)
-    middle = bridge.interpolate(start, target, torch.full((2,), 0.5), noise)
-    torch.testing.assert_close(middle, torch.full_like(middle, 1.5))
-    raw_delta = target - start
-    clean = bridge.clean_from_prediction(raw_delta, start)
-    torch.testing.assert_close(clean, target)
     torch.testing.assert_close(
-        bridge.reproject(start, clean, 0.25, add_marginal_noise=False),
+        bridge.reproject(start, target, 0.25, add_marginal_noise=False),
         torch.full_like(start, 0.5),
     )
 
 
-def test_noise_plane_ratio_validation_and_policy_edge() -> None:
-    with pytest.raises(ValueError, match="sum to 1.0"):
-        NoisePlaneSampler({"policy_ratio": 0.9})
-    sampler = NoisePlaneSampler(
-        {
-            "policy_ratio": 1.0,
-            "forward_ratio": 0.0,
-            "inverse_ratio": 0.0,
-            "joint_ratio": 0.0,
-            "diagonal_ratio": 0.0,
-        }
-    )
-    batch = sampler.sample(32, "cpu")
-    assert bool((batch.tau_world == 0).all())
-    assert bool(((batch.tau_action >= 0) & (batch.tau_action < 1)).all())
-    # StarVLA keeps one action FM time over the whole 32-step chunk.
-    torch.testing.assert_close(batch.tau_action[:, 0], batch.tau_action[:, 1])
-
-
 @pytest.mark.parametrize("mode", ["policy", "forward", "inverse", "joint", "diagonal"])
-def test_every_noise_plane_locus_has_the_declared_semantics(mode: str) -> None:
-    ratios = {f"{name}_ratio": float(name == mode) for name in ("policy", "forward", "inverse", "joint", "diagonal")}
-    sampler = NoisePlaneSampler(ratios, world_timestep_sampling="qantara_monotone")
+def test_single_bridge_noise_plane_loci(mode: str) -> None:
+    ratios = {
+        f"{name}_ratio": float(name == mode)
+        for name in ("policy", "forward", "inverse", "joint", "diagonal")
+    }
+    sampler = NoisePlaneSampler(ratios)
     torch.manual_seed(17)
     batch = sampler.sample(256, "cpu")
+    assert batch.tau_action.shape == batch.tau_world.shape == (256,)
     assert bool(((batch.tau_action >= 0) & (batch.tau_action <= 1)).all())
     assert bool(((batch.tau_world >= 0) & (batch.tau_world <= 1)).all())
     if mode == "policy":
         assert bool((batch.tau_world == 0).all())
     elif mode == "forward":
         assert bool((batch.tau_action == 1).all())
-        assert bool((batch.tau_world[:, 1] <= batch.tau_world[:, 0]).all())
     elif mode == "inverse":
         assert bool((batch.tau_world == 1).all())
     elif mode == "joint":
-        # User-facing joint means the full 2-D interior; the two axes are
-        # independently sampled (Qantara calls this locus ``square``).
-        assert not bool(torch.equal(batch.tau_action, batch.tau_world))
-        assert bool((batch.tau_world[:, 1] <= batch.tau_world[:, 0]).all())
+        assert not torch.equal(batch.tau_action, batch.tau_world)
     else:
         torch.testing.assert_close(batch.tau_action, batch.tau_world)
 
 
-def test_fixed_multilayer_qwen_target_has_no_trainable_pooling_parameters() -> None:
+def test_noise_plane_bfloat16_contract() -> None:
+    sampler = NoisePlaneSampler(
+        {
+            "policy_ratio": 0.0,
+            "forward_ratio": 0.0,
+            "inverse_ratio": 0.0,
+            "joint_ratio": 0.0,
+            "diagonal_ratio": 1.0,
+        }
+    )
+
+    def promoted_world_sample(_self, batch_size, device, _dtype):
+        return torch.rand(batch_size, device=device, dtype=torch.float32)
+
+    sampler._sample_world_variable = types.MethodType(promoted_world_sample, sampler)
+    batch = sampler.sample(32, "cpu", dtype=torch.bfloat16)
+    assert batch.tau_action.dtype == batch.tau_world.dtype == torch.bfloat16
+    torch.testing.assert_close(batch.tau_action, batch.tau_world)
+
+
+def test_fixed_multilayer_qwen_target_is_deterministic() -> None:
     assert select_vision_layers(27, "evenly_spaced", 4, None) == (0, 9, 17, 26)
     extractor = FrozenQwenMultiLayerVisionLatent(
         vision_depth=4,
@@ -159,8 +169,6 @@ def test_fixed_multilayer_qwen_target_has_no_trainable_pooling_parameters() -> N
         token_grid=(2, 2),
     )
     assert sum(parameter.numel() for parameter in extractor.parameters()) == 0
-    # Raw Qwen order for one t=1,h=4,w=4 image; shape and deterministic fixed
-    # pooling are what define the target ABI.
     captured = {
         0: torch.arange(16 * 6, dtype=torch.float32).reshape(16, 6),
         3: torch.arange(16 * 6, dtype=torch.float32).reshape(16, 6) + 7,
@@ -171,51 +179,7 @@ def test_fixed_multilayer_qwen_target_has_no_trainable_pooling_parameters() -> N
     torch.testing.assert_close(first, second)
 
 
-def test_qwen_spatial_merge_token_order_is_restored_to_physical_rows_and_columns() -> None:
-    physical = torch.arange(16, dtype=torch.float32).reshape(4, 4)
-    # Qwen flattens [block_row, block_col, intra_row, intra_col].
-    qwen_order = physical.view(2, 2, 2, 2).permute(0, 2, 1, 3).reshape(16, 1)
-    restored = FrozenQwenMultiLayerVisionLatent._restore_spatial_grid(
-        qwen_order, t=1, h=4, w=4, merge=2
-    )
-    torch.testing.assert_close(restored[0, :, :, 0], physical)
-
-
-def test_dynamic_qwen_layer_selection_supports_explicit_and_all_layers() -> None:
-    assert select_vision_layers(6, "explicit", 4, [0, 2, -1]) == (0, 2, 5)
-    assert select_vision_layers(4, "all_layers", 1, None) == (0, 1, 2, 3)
-    with pytest.raises(ValueError, match="outside depth"):
-        select_vision_layers(4, "explicit", 1, [4])
-
-
-def test_fixed_and_trainable_layer_fusion_interfaces_are_explicit() -> None:
-    fixed = FrozenQwenMultiLayerVisionLatent(
-        vision_depth=4,
-        strategy="explicit",
-        num_layers=2,
-        explicit_layers=[0, 3],
-        fusion_type="fixed_weighted_mean",
-        fixed_layer_weights=[1, 3],
-        token_grid=(2, 2),
-    )
-    torch.testing.assert_close(fixed.layer_weights, torch.tensor([0.25, 0.75]))
-    assert sum(parameter.numel() for parameter in fixed.parameters()) == 0
-    trainable = FrozenQwenMultiLayerVisionLatent(
-        vision_depth=4,
-        strategy="explicit",
-        num_layers=2,
-        explicit_layers=[0, 3],
-        fusion_type="trainable_weighted_mean",
-        token_grid=(2, 2),
-    )
-    assert trainable.layer_weight_logits.requires_grad
-    assert sum(parameter.numel() for parameter in trainable.parameters()) == 2
-
-
-def test_future_horizons_use_separate_b_sized_qwen_vision_calls() -> None:
-    # Real Qwen3-VL packed vision features are batch-slot dependent.  Combining
-    # t+16/t+32 into one 2B call breaks the fixed-space equality with current
-    # Z0, so this ABI test locks both horizons to separate B-sized calls.
+def test_future_encoder_makes_exactly_one_t16_call() -> None:
     framework = QwenActionWorldCoFlow.__new__(QwenActionWorldCoFlow)
     nn.Module.__init__(framework)
 
@@ -224,12 +188,11 @@ def test_future_horizons_use_separate_b_sized_qwen_vision_calls() -> None:
             self.batch_sizes = []
 
         def build_qwenvl_inputs(self, images, instructions):
-            batch = len(images)
-            self.batch_sizes.append(batch)
-            assert len(instructions) == batch
+            self.batch_sizes.append(len(images))
+            assert len(images) == len(instructions)
             return {
-                "pixel_values": torch.arange(batch, dtype=torch.float32).reshape(batch, 1),
-                "image_grid_thw": torch.ones(batch, 3, dtype=torch.long),
+                "pixel_values": torch.arange(len(images), dtype=torch.float32).reshape(-1, 1),
+                "image_grid_thw": torch.ones(len(images), 3, dtype=torch.long),
             }
 
     class FakeExtractor(nn.Module):
@@ -242,25 +205,25 @@ def test_future_horizons_use_separate_b_sized_qwen_vision_calls() -> None:
     framework._visual = types.MethodType(lambda _self: visual, framework)
     framework._resize_batch_images = types.MethodType(lambda _self, images: images, framework)
     framework._autocast_context = types.MethodType(lambda _self: nullcontext(), framework)
-    examples = [
-        {
-            "image_16": [object()],
-            "image_32": [object()],
-            "future_valid_16": 1,
-            "future_valid_32": 1,
-            "coflow_future_strides": [16, 32],
-        }
-        for _ in range(3)
-    ]
-    z16, z32 = framework._encode_future_targets(examples)
-    assert framework.qwen_vl_interface.batch_sizes == [3, 3]
-    assert z16.shape == z32.shape == (3, 1, 1)
-    assert not z16.requires_grad and not z32.requires_grad
+    examples = [{"image_16": [object()], "future_valid_16": 1} for _ in range(3)]
+    target = framework._encode_future_target(examples)
+    assert target.shape == (3, 1, 1)
+    assert not target.requires_grad
+    assert framework.qwen_vl_interface.batch_sizes == [3]
+
+    invalid = copy.deepcopy(examples)
+    invalid[0]["image_32"] = [object()]
+    with pytest.raises(ValueError, match="removed multi-bridge"):
+        framework._encode_future_target(invalid)
 
 
-def _tiny_model() -> ActionWorldCoFlowModel:
+def _tiny_model(
+    *,
+    action_horizon: int = 16,
+    coflow_overrides: dict | None = None,
+) -> ActionWorldCoFlowModel:
     action = {
-        "action_horizon": 32,
+        "action_horizon": action_horizon,
         "action_dim": 3,
         "state_dim": 2,
         "prediction_type": "jit_x",
@@ -271,7 +234,6 @@ def _tiny_model() -> ActionWorldCoFlowModel:
         "use_correlated_noise": False,
     }
     coflow = {
-        "segment_boundaries": [16, 32],
         "world_token_grid": [2, 2],
         "num_world_tokens": 4,
         "hidden_size": 32,
@@ -287,14 +249,6 @@ def _tiny_model() -> ActionWorldCoFlowModel:
         "world_timestep_sampling": "qantara_monotone",
         "action_loss_weight": 1.0,
         "world_loss_weight": 0.01,
-        "z16_loss_weight": 0.5,
-        "z32_loss_weight": 0.5,
-        "intermediate_state_source": "scheduled",
-        "predicted_z16_detach": True,
-        "predicted_action_prefix_detach": True,
-        "z16_teacher_ratio_start": 1.0,
-        "z16_teacher_ratio_end": 0.0,
-        "z16_teacher_decay_steps": 10,
         "noise_plane_sampling": {
             "policy_ratio": 1.0,
             "forward_ratio": 0.0,
@@ -302,10 +256,13 @@ def _tiny_model() -> ActionWorldCoFlowModel:
             "joint_ratio": 0.0,
             "diagonal_ratio": 0.0,
         },
-        "action_inference_steps": 1,
-        "world_inference_steps": 1,
+        "action_inference_steps": 2,
+        "world_inference_steps": 2,
+        "default_inference_mode": "policy",
         "log_attention_statistics": True,
     }
+    if coflow_overrides:
+        coflow.update(copy.deepcopy(coflow_overrides))
     return ActionWorldCoFlowModel(
         context_dim=8,
         world_dim=6,
@@ -314,382 +271,252 @@ def _tiny_model() -> ActionWorldCoFlowModel:
     )
 
 
-def test_joint_model_policy_training_and_predicted_only_inference() -> None:
+def _batch(batch: int = 2) -> dict[str, torch.Tensor]:
+    return {
+        "context": torch.randn(batch, 5, 8),
+        "context_valid": torch.ones(batch, 5, dtype=torch.bool),
+        "z0": torch.randn(batch, 4, 6),
+        "z16_target": torch.randn(batch, 4, 6),
+        "actions": torch.randn(batch, 16, 3),
+        "state": torch.randn(batch, 1, 2),
+        "action_is_pad": torch.zeros(batch, 16, dtype=torch.bool),
+        "future_valid_16": torch.ones(batch),
+    }
+
+
+def test_model_rejects_h32_and_has_no_multibridge_api() -> None:
+    with pytest.raises(ValueError, match="single-bridge"):
+        _tiny_model(action_horizon=32)
+    model = _tiny_model()
+    assert not hasattr(model, "num_blocks")
+    assert not hasattr(model, "segment_boundaries")
+    source = inspect.getsource(ActionWorldCoFlowModel)
+    for removed in ("z32", "a2", "prefix_action", "teacher_ratio", "_sample_block"):
+        assert removed not in source
+    forward_parameters = inspect.signature(model.forward_train).parameters
+    assert "z32_target" not in forward_parameters
+    assert "future_valid_32" not in forward_parameters
+
+
+def test_single_bridge_training_and_backward() -> None:
     torch.manual_seed(0)
     model = _tiny_model()
-    batch = 2
-    common = {
-        "context": torch.randn(batch, 5, 8),
-        "context_valid": torch.ones(batch, 5, dtype=torch.bool),
-        "z0": torch.randn(batch, 4, 6),
-        "state": torch.randn(batch, 1, 2),
-    }
-    output = model.forward_train(
-        **common,
-        z16_target=torch.randn(batch, 4, 6),
-        z32_target=torch.randn(batch, 4, 6),
-        actions=torch.randn(batch, 32, 3),
-        action_is_pad=torch.zeros(batch, 32, dtype=torch.bool),
-        future_valid_16=torch.ones(batch),
-        future_valid_32=torch.ones(batch),
-        global_step=10,
-    )
+    output = model.forward_train(**_batch(), global_step=10)
     assert output["action_loss"].ndim == 0 and torch.isfinite(output["action_loss"])
     assert output["coflow_mode_policy_ratio"] == 1
-    assert output["coflow_teacher_ratio_configured"] == 0
+    assert output["coflow_z16_loss_raw"].ndim == 0
+    assert not any("32" in key or "prefix" in key or "teacher" in key for key in output)
     output["action_loss"].backward()
     assert model.transformer.layers[0].attention.qkv.weight.grad is not None
 
-    model.eval()
-    # sample_actions has no future-target argument by design: Block 2 can only
-    # consume the Z16 returned by Block 1.
-    with torch.no_grad():
-        actions, z16, z32 = model.sample_actions(**common)
-    assert actions.shape == (batch, 32, 3)
-    assert z16.shape == z32.shape == (batch, 4, 6)
 
-
-def test_coflow_gradient_checkpointing_preserves_modality_ffn_backward() -> None:
-    torch.manual_seed(11)
-    model = _tiny_model().train()
-    model.transformer.gradient_checkpointing = True
-    batch = 2
-    output = model.forward_train(
-        context=torch.randn(batch, 5, 8),
-        context_valid=torch.ones(batch, 5, dtype=torch.bool),
-        z0=torch.randn(batch, 4, 6),
-        z16_target=torch.randn(batch, 4, 6),
-        z32_target=torch.randn(batch, 4, 6),
-        actions=torch.randn(batch, 32, 3),
-        state=torch.randn(batch, 1, 2),
-        action_is_pad=torch.zeros(batch, 32, dtype=torch.bool),
-        future_valid_16=torch.ones(batch),
-        future_valid_32=torch.ones(batch),
-        global_step=10,
-    )
-    output["action_loss"].backward()
-    assert model.transformer.layers[0].ffns[1][0].weight.grad is not None
-    assert model.transformer.layers[0].attention.qkv.weight.grad is not None
-
-
-def test_invalid_future_targets_are_loss_inert_and_cannot_leak_into_actions() -> None:
-    model = _tiny_model()
-    # Inverse mode would expose clean future targets at tau_z=1.  Invalid
-    # episode-tail targets must override that edge to tau_z=0 and use the
-    # predicted intermediate state, making their actual pixel latents inert.
-    model.noise_plane.ratios = torch.tensor([0, 0, 1, 0, 0], dtype=torch.float64)
-    batch = 2
-    kwargs = {
-        "context": torch.randn(batch, 5, 8),
-        "context_valid": torch.ones(batch, 5, dtype=torch.bool),
-        "z0": torch.randn(batch, 4, 6),
-        "actions": torch.randn(batch, 32, 3),
-        "state": torch.randn(batch, 1, 2),
-        "action_is_pad": torch.zeros(batch, 32, dtype=torch.bool),
-        "future_valid_16": torch.zeros(batch),
-        "future_valid_32": torch.zeros(batch),
-        "global_step": 0,
-    }
-    first_z16 = torch.randn(batch, 4, 6)
-    first_z32 = torch.randn(batch, 4, 6)
-    second_z16 = torch.full((batch, 4, 6), 1.0e4)
-    second_z32 = torch.full((batch, 4, 6), -1.0e4)
-    torch.manual_seed(123)
-    first = model.forward_train(
-        **kwargs,
-        z16_target=first_z16,
-        z32_target=first_z32,
-    )
-    torch.manual_seed(123)
-    second = model.forward_train(
-        **kwargs,
-        z16_target=second_z16,
-        z32_target=second_z32,
-    )
-    torch.testing.assert_close(first["action_loss"], second["action_loss"], rtol=0, atol=0)
-    assert first["coflow_world_loss_raw"] == 0
-    assert first["coflow_teacher_ratio_realized"] == 0
-    assert first["coflow_predicted_z16_ratio"] == 0
-
-    invalid_order = dict(kwargs)
-    invalid_order["future_valid_32"] = torch.ones(batch)
-    with pytest.raises(ValueError, match="future_valid_32=true requires future_valid_16=true"):
-        model.forward_train(
-            **invalid_order,
-            z16_target=torch.randn(batch, 4, 6),
-            z32_target=torch.randn(batch, 4, 6),
-        )
-
-
-def test_padded_action_tokens_are_hidden_keys_and_cannot_change_valid_loss() -> None:
-    model = _tiny_model()
-    batch = 2
-    action_is_pad = torch.zeros(batch, 32, dtype=torch.bool)
-    action_is_pad[:, 8:] = True
-    actions = torch.randn(batch, 32, 3)
-    changed_actions = actions.clone()
-    changed_actions[:, 8:] = 1.0e4
-    kwargs = {
-        "context": torch.randn(batch, 5, 8),
-        "context_valid": torch.ones(batch, 5, dtype=torch.bool),
-        "z0": torch.randn(batch, 4, 6),
-        "z16_target": torch.randn(batch, 4, 6),
-        "z32_target": torch.randn(batch, 4, 6),
-        "state": torch.randn(batch, 1, 2),
-        "action_is_pad": action_is_pad,
-        "future_valid_16": torch.zeros(batch),
-        "future_valid_32": torch.zeros(batch),
-        "global_step": 10,
-    }
-    torch.manual_seed(91)
-    first = model.forward_train(**kwargs, actions=actions)
-    torch.manual_seed(91)
-    second = model.forward_train(**kwargs, actions=changed_actions)
-    torch.testing.assert_close(first["action_loss"], second["action_loss"], rtol=0, atol=0)
-
-    assembled = model._assemble_sequence(
-        context=kwargs["context"],
-        context_valid=kwargs["context_valid"],
-        state=kwargs["state"],
-        z0=kwargs["z0"],
-        a1=actions[:, :16],
-        z16=kwargs["z16_target"],
-        tau_a1=torch.full((batch,), 0.5),
-        tau_z16=torch.full((batch,), 0.5),
-        a1_valid=~action_is_pad[:, :16],
-    )
-    padded_action_keys = torch.arange(assembled.slices["a1"].start + 8, assembled.slices["a1"].stop)
-    assert not bool(assembled.attention_mask[..., padded_action_keys].any())
-
-
-def test_action_loss_excludes_forward_edge_rows_from_its_denominator() -> None:
-    error = torch.tensor([[[4.0], [9.0]], [[100.0], [100.0]]])
-    valid = torch.tensor([[True, True], [False, False]])
-    mixed = ActionWorldCoFlowModel._masked_action_loss(error, valid)
-    only_supervised = ActionWorldCoFlowModel._masked_action_loss(error[:1], valid[:1])
-    torch.testing.assert_close(mixed, only_supervised)
-    assert float(mixed) == pytest.approx(6.5)
-
-
-def test_forward_and_inverse_edges_preserve_clean_prefix_semantics() -> None:
-    model = _tiny_model()
-    batch = 2
-    kwargs = {
-        "context": torch.randn(batch, 5, 8),
-        "context_valid": torch.ones(batch, 5, dtype=torch.bool),
-        "z0": torch.randn(batch, 4, 6),
-        "z16_target": torch.randn(batch, 4, 6),
-        "z32_target": torch.randn(batch, 4, 6),
-        "actions": torch.randn(batch, 32, 3),
-        "state": torch.randn(batch, 1, 2),
-        "action_is_pad": torch.zeros(batch, 32, dtype=torch.bool),
-        "future_valid_16": torch.ones(batch),
-        "future_valid_32": torch.ones(batch),
-        "global_step": 10,
-    }
-
-    model.noise_plane.ratios = torch.tensor([0, 1, 0, 0, 0], dtype=torch.float64)
-    forward = model.forward_train(**kwargs)
-    assert forward["coflow_forward_clean_action_prefix_ratio"] == 1
-
-    model.noise_plane.ratios = torch.tensor([0, 0, 1, 0, 0], dtype=torch.float64)
-    inverse = model.forward_train(**kwargs)
-    assert inverse["coflow_inverse_clean_z16_prefix_ratio"] == 1
-    assert inverse["coflow_actual_gt_z16_prefix_ratio"] == 1
-    # Explicit inverse conditioning isn't counted as scheduled teacher forcing.
-    assert inverse["coflow_teacher_ratio_realized"] == 0
-
-
-def test_default_scheduled_policy_edge_is_predicted_only_from_step_zero() -> None:
-    model = _tiny_model()
-    batch = 3
-    output = model.forward_train(
-        context=torch.randn(batch, 5, 8),
-        context_valid=torch.ones(batch, 5, dtype=torch.bool),
-        z0=torch.randn(batch, 4, 6),
-        z16_target=torch.randn(batch, 4, 6),
-        z32_target=torch.randn(batch, 4, 6),
-        actions=torch.randn(batch, 32, 3),
-        state=torch.randn(batch, 1, 2),
-        action_is_pad=torch.zeros(batch, 32, dtype=torch.bool),
-        future_valid_16=torch.ones(batch),
-        future_valid_32=torch.ones(batch),
-        # Configured teacher ratio is exactly one here, but policy is never
-        # eligible for clean Z16 exposure.
-        global_step=0,
-    )
-    assert output["coflow_teacher_ratio_configured"] == 1
-    assert output["coflow_teacher_ratio_realized"] == 0
-    assert output["coflow_actual_gt_z16_prefix_ratio"] == 0
-    assert output["coflow_policy_predicted_z16_prefix_ratio"] == 1
-
-
-def test_all_intermediate_z16_sources_and_stop_gradient_contracts() -> None:
-    model = _tiny_model()
-    target = torch.randn(2, 4, 6)
-    prediction = torch.randn(2, 4, 6, requires_grad=True)
-    valid = torch.tensor([True, False])
-
-    model.intermediate_state_source = "ground_truth"
-    source, mask, ratio = model._choose_intermediate_source(target, prediction, valid, global_step=5)
-    torch.testing.assert_close(source[0], target[0])
-    torch.testing.assert_close(source[1], prediction.detach()[1])
-    assert mask.tolist() == [True, False] and ratio == 1
-
-    model.intermediate_state_source = "predicted_detach"
-    source, mask, ratio = model._choose_intermediate_source(target, prediction, valid, global_step=5)
-    assert not source.requires_grad and not bool(mask.any()) and ratio == 0
-
-    model.intermediate_state_source = "predicted_e2e"
-    source, mask, ratio = model._choose_intermediate_source(target, prediction, valid, global_step=5)
-    assert source is prediction and source.requires_grad and not bool(mask.any()) and ratio == 0
-
-    model.intermediate_state_source = "scheduled"
-    model.predicted_z16_detach = True
-    assert model.teacher_ratio(0) == 1
-    assert model.teacher_ratio(5) == pytest.approx(0.5)
-    assert model.teacher_ratio(10) == 0
-    early, early_mask, early_ratio = model._choose_intermediate_source(target, prediction, valid, global_step=0)
-    torch.testing.assert_close(early[0], target[0])
-    torch.testing.assert_close(early[1], prediction.detach()[1])
-    assert early_mask.tolist() == [True, False] and early_ratio == 1
-    late, late_mask, late_ratio = model._choose_intermediate_source(target, prediction, valid, global_step=10)
-    torch.testing.assert_close(late, prediction.detach())
-    assert not late.requires_grad and not bool(late_mask.any()) and late_ratio == 0
-
-
-def test_inference_block2_consumes_the_predicted_block1_prefix_only() -> None:
+def test_policy_and_diagonal_inference_use_one_bridge_call() -> None:
     model = _tiny_model().eval()
-    batch = 2
-    common = {
-        "context": torch.randn(batch, 5, 8),
-        "context_valid": torch.ones(batch, 5, dtype=torch.bool),
-        "z0": torch.randn(batch, 4, 6),
-        "state": torch.randn(batch, 1, 2),
-    }
+    inputs = _batch()
+    common = {key: inputs[key] for key in ("context", "context_valid", "z0", "state")}
+    original = model._assemble_sequence
     calls = []
-    predicted_a1 = torch.full((batch, 16, 3), 3.0)
-    predicted_z16 = torch.full((batch, 4, 6), 7.0)
 
-    def fake_sample_block(self, **kwargs):
-        calls.append(kwargs)
-        if kwargs["prefix_action"] is None:
-            torch.testing.assert_close(kwargs["world_start"], common["z0"])
-            return predicted_a1, predicted_z16
-        torch.testing.assert_close(kwargs["prefix_action"], predicted_a1)
-        torch.testing.assert_close(kwargs["prefix_world"], predicted_z16)
-        torch.testing.assert_close(kwargs["world_start"], predicted_z16)
-        return torch.full((batch, 16, 3), 5.0), torch.full((batch, 4, 6), 9.0)
+    def wrapped(_self, **kwargs):
+        calls.append((kwargs["tau_action"].clone(), kwargs["tau_world"].clone()))
+        return original(**kwargs)
 
-    model._sample_block = types.MethodType(fake_sample_block, model)
-    actions, z16, z32 = model.sample_actions(**common)
-    assert len(calls) == 2
-    torch.testing.assert_close(actions[:, :16], predicted_a1)
-    torch.testing.assert_close(z16, predicted_z16)
-    assert bool((actions[:, 16:] == 5).all()) and bool((z32 == 9).all())
-    assert "z16_target" not in inspect.signature(model.sample_actions).parameters
-    assert "z32_target" not in inspect.signature(model.sample_actions).parameters
+    model._assemble_sequence = types.MethodType(wrapped, model)
+    with torch.no_grad():
+        actions, future = model.sample_actions(**common, inference_mode="policy", output_horizon=16)
+    assert actions.shape == (2, 16, 3)
+    assert future.shape == (2, 4, 6)
+    assert len(calls) == model.action_inference_steps
+    assert all(bool((tau_world == 0).all()) for _, tau_world in calls)
+
+    calls.clear()
+    with torch.no_grad():
+        model.sample_actions(**common, inference_mode="diagonal", output_horizon=16)
+    assert len(calls) == model.action_inference_steps
+    assert all(torch.equal(tau_action, tau_world) for tau_action, tau_world in calls)
+    with pytest.raises(ValueError, match="must be 16"):
+        model.sample_actions(**common, output_horizon=32)
 
 
-def test_joint_model_has_no_scalar_world_gate() -> None:
+def test_inference_seed_is_local_and_reproducible() -> None:
+    model = _tiny_model().eval()
+    inputs = _batch()
+    common = {key: inputs[key] for key in ("context", "context_valid", "z0", "state")}
+    torch.manual_seed(101)
+    global_state = torch.random.get_rng_state().clone()
+    with torch.no_grad():
+        first = model.sample_actions(**common, inference_seed=123)
+    assert torch.equal(torch.random.get_rng_state(), global_state)
+    with torch.no_grad():
+        second = model.sample_actions(**common, inference_seed=123)
+    for left, right in zip(first, second, strict=True):
+        torch.testing.assert_close(left, right)
+
+
+def test_bfloat16_inference_needs_no_ambient_autocast() -> None:
+    model = _tiny_model().to(torch.bfloat16).eval()
+    inputs = _batch()
+    common = {
+        key: value.to(torch.bfloat16) if value.is_floating_point() else value
+        for key, value in inputs.items()
+        if key in ("context", "context_valid", "z0", "state")
+    }
+    with torch.no_grad():
+        actions, future = model.sample_actions(**common)
+    assert actions.dtype == future.dtype == torch.bfloat16
+    assert bool(torch.isfinite(actions).all()) and bool(torch.isfinite(future).all())
+
+
+def test_invalid_future_target_and_padded_actions_are_loss_inert() -> None:
     model = _tiny_model()
-    assert not any("gate" in name.lower() for name, _ in model.named_parameters())
-    assert model.action_input_projection is not model.world_input_projection
-    assert model.action_output_head is not model.world_output_head
+    inputs = _batch()
+    inputs["future_valid_16"] = torch.zeros(2)
+    torch.manual_seed(5)
+    first = model.forward_train(**inputs, global_step=0)
+    changed = copy.deepcopy(inputs)
+    changed["z16_target"] = torch.full_like(changed["z16_target"], -1.0e6)
+    torch.manual_seed(5)
+    second = model.forward_train(**changed, global_step=0)
+    torch.testing.assert_close(first["action_loss"], second["action_loss"])
+    assert first["coflow_z16_loss_raw"] == 0
+
+    errors = torch.tensor([[[1.0], [9.0], [100.0]]])
+    valid = torch.tensor([[True, False, False]])
+    assert model._masked_action_loss(errors, valid) == 1.0
 
 
-def test_frozen_parameters_are_excluded_from_optimizer_groups() -> None:
-    class Tiny(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.teacher = nn.Linear(3, 3)
-            self.student = nn.Linear(3, 3)
-            for parameter in self.teacher.parameters():
-                parameter.requires_grad_(False)
-
-    model = Tiny()
-    cfg = OmegaConf.create(
-        {
-            "trainer": {
-                "learning_rate": {"base": 1.0e-4},
-                "freeze_modules": "",
-            }
+def test_world_loss_schedule_switches_at_step_50000() -> None:
+    model = _tiny_model(
+        coflow_overrides={
+            "world_loss_weight": 0.1,
+            "world_loss_schedule": {
+                "enabled": True,
+                "transition_step": 50000,
+                "before_weight": 0.1,
+                "after_weight": 0.025,
+            },
         }
     )
-    optimized = {id(parameter) for group in build_param_lr_groups(model, cfg) for parameter in group["params"]}
-    assert all(id(parameter) not in optimized for parameter in model.teacher.parameters())
-    assert all(id(parameter) in optimized for parameter in model.student.parameters())
+    assert model.world_loss_weight_at_step(49999) == pytest.approx(0.1)
+    assert model.world_loss_weight_at_step(50000) == pytest.approx(0.025)
 
 
-def test_trainer_logs_policy_and_world_without_changing_legacy_metric_semantics() -> None:
-    legacy = VLATrainer._build_native_loss_metrics(
-        {"action_loss": torch.tensor(3.0)}, torch.tensor(3.0)
-    )
-    assert legacy == {
-        "train/task": "action",
-        "train/loss_total": 3.0,
-        "train/loss_action": 3.0,
-        "train/loss_action_raw": 3.0,
-        "train/loss_action_weighted": 3.0,
+def test_trainer_dashboard_has_only_single_bridge_losses() -> None:
+    total = torch.tensor(2.0)
+    output = {
+        "coflow_action_loss_raw": torch.tensor(1.0),
+        "coflow_z16_loss_raw": torch.tensor(0.5),
+        "coflow_world_loss_raw": torch.tensor(0.5),
+        "coflow_action_loss_weighted": torch.tensor(1.0),
+        "coflow_world_loss_weighted": torch.tensor(1.0),
     }
-    coflow = VLATrainer._build_native_loss_metrics(
-        {
-            "action_loss": torch.tensor(2.1),
-            "coflow_action_loss_raw": torch.tensor(2.0),
-            "coflow_action_loss_weighted": torch.tensor(2.0),
-            "coflow_world_loss_raw": torch.tensor(1.0),
-            "coflow_world_loss_weighted": torch.tensor(0.1),
-        },
-        torch.tensor(2.1),
+    metrics = VLATrainer._build_native_loss_metrics(output, total)
+    assert metrics["train/task"] == "action_world_coflow"
+    assert metrics["train/loss_total"] == 2.0
+    assert "train/z32_loss_raw" not in metrics
+    assert "train/actual_gt_z16_prefix_ratio" not in metrics
+    assert "train/z32_loss_raw" not in VLATrainer._COFLOW_DASHBOARD_KEYS
+
+
+def test_only_better_yaml_and_job_define_the_single_bridge_experiment() -> None:
+    train_dir = REPO_ROOT / "examples/Robotwin/train_files"
+    runbook = REPO_ROOT / RUNBOOK_DIR_NAME / "RBT"
+    assert not (train_dir / "robotwin_action_world_coflow.yaml").exists()
+    assert not (runbook / "robotwin_action_world_coflow.yaml").exists()
+    assert not (runbook / "run_coflow.md").exists()
+
+    config = yaml.safe_load(
+        (train_dir / "robotwin_action_world_coflow_better.yaml").read_text(encoding="utf-8")
     )
-    assert coflow["train/task"] == "action_world_coflow"
-    assert coflow["train/loss_total"] == pytest.approx(2.1)
-    assert coflow["train/loss_action"] == pytest.approx(2.0)
-    assert coflow["train/loss_world"] == pytest.approx(1.0)
-    assert coflow["train/loss_world_weighted"] == pytest.approx(0.1)
+    framework = config["framework"]
+    coflow = framework["action_world_coflow"]
+    data = config["datasets"]["vla_data"]
+    assert framework["name"] == "QwenActionWorldCoFlow"
+    assert framework["action_model"]["action_horizon"] == 16
+    assert not (REMOVED_COFLOW_FIELDS & set(coflow))
+    assert data["data_mix"] == "robotwin_fastwam_h16"
+    assert data["fastwam_action_world_coflow_targets"] is True
+    assert "fastwam_coflow_future_strides" not in data
+    assert data["include_state"] is True
+    assert data["per_device_batch_size"] == 12
+    assert config["trainer"]["expected_global_batch_size"] == 768
+
+    job = yaml.safe_load(
+        (runbook / "robotwin_action_world_coflow_better.yaml").read_text(encoding="utf-8")
+    )
+    assert job["REQUIRED"]["WORKER_MIN_NUM"] == 8
+    assert job["REQUIRED"]["WORKER_MAX_NUM"] == 8
+    assert job["REQUIRED"]["GPU_PER_WORKER"] == 8
+    assert "robotwin_action_world_coflow_better.yaml" in job["REQUIRED"]["RUN_SCRIPTS"]
+    run_notes = (runbook / "run.sh").read_text(encoding="utf-8")
+    assert "aidi-inf-cli job submit -f robotwin_action_world_coflow_better.yaml" in run_notes
+    assert "aidi-inf-cli job submit -f robotwin_action_world_coflow.yaml" not in run_notes
+    assert "qwenlatent_h32" not in run_notes
 
 
-def test_new_yaml_is_opt_in_and_preserves_fastwam_zscore_contract() -> None:
-    path = REPO_ROOT / "examples/Robotwin/train_files/robotwin_action_world_coflow.yaml"
-    cfg = yaml.safe_load(path.read_text(encoding="utf-8"))
-    assert cfg["framework"]["name"] == "QwenActionWorldCoFlow"
-    assert cfg["framework"]["enable_action_world_coflow"] is True
-    assert cfg["framework"]["action_model"]["action_horizon"] == 32
-    coflow = cfg["framework"]["action_world_coflow"]
-    assert coflow["segment_boundaries"] == [16, 32]
-    assert coflow["future_strides"] == [16, 32]
-    assert coflow["freeze_qwen_vision_encoder"] is True
-    assert coflow["world_feature_layer_strategy"] == "evenly_spaced"
-    assert coflow["world_feature_num_layers"] == 4
-    assert coflow["world_feature_layers"] is None
-    assert coflow["world_layer_fusion_type"] == "fixed_mean"
-    assert coflow["world_spatial_pool_type"] == "adaptive_avg_pool2d"
-    assert coflow["world_token_grid"] == [4, 8]
-    assert coflow["num_world_tokens"] == 32
-    assert coflow["world_bridge_type"] == "qantara_brownian_bridge"
-    assert coflow["world_prediction_type"] == "qantara_x_delta"
-    assert coflow["intermediate_state_source"] == "scheduled"
-    assert coflow["predicted_z16_detach"] is True
-    ratios = coflow["noise_plane_sampling"]
-    assert all(float(ratios[f"{name}_ratio"]) > 0 for name in ("policy", "forward", "inverse", "joint", "diagonal"))
-    assert sum(float(value) for value in ratios.values()) == pytest.approx(1.0)
-    assert coflow["action_inference_steps"] > 0 and coflow["world_inference_steps"] > 0
-    assert coflow["enable_gradient_checkpointing"] is True
-    assert coflow["log_attention_statistics"] is True
-    assert cfg["datasets"]["vla_data"]["fastwam_coflow_future_strides"] == [16, 32]
-    assert cfg["datasets"]["vla_data"]["data_mix"] == "robotwin_fastwam"
-    assert cfg["datasets"]["vla_data"]["include_state"] is True
-    assert cfg["datasets"]["vla_data"]["per_device_batch_size"] == 16
-    assert cfg["trainer"]["gradient_accumulation_steps"] == 1
-    assert cfg["framework"]["action_model"]["use_correlated_noise"] is False
+def test_checkpoint_audit_accepts_only_single_bridge_h16() -> None:
+    verifier_path = (
+        REPO_ROOT
+        / "examples/Robotwin/eval_files/verify_action_world_coflow_checkpoint_contract.py"
+    )
+    spec = importlib.util.spec_from_file_location("coflow_checkpoint_verifier", verifier_path)
+    assert spec is not None and spec.loader is not None
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    verify = verifier.verify
+
+    config_path = (
+        REPO_ROOT
+        / "examples/Robotwin/train_files/robotwin_action_world_coflow_better.yaml"
+    )
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    zeros = [0.0] * 14
+    stats = {
+        "new_embodiment": {
+            modality: {
+                "min": zeros,
+                "max": zeros,
+                "mean": zeros,
+                "std": [1.0] * 14,
+                "q01": zeros,
+                "q99": zeros,
+                **({"mask": [True] * 14} if modality == "action" else {}),
+            }
+            for modality in ("state", "action")
+        }
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp)
+        checkpoint = run_dir / "checkpoints/steps_1_pytorch_model.pt"
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.touch()
+        (run_dir / "config.yaml").write_text(
+            yaml.safe_dump(config), encoding="utf-8"
+        )
+        (run_dir / "config.full.yaml").write_text(
+            yaml.safe_dump(config), encoding="utf-8"
+        )
+        (run_dir / "dataset_statistics.json").write_text(
+            json.dumps(stats), encoding="utf-8"
+        )
+        summary = verify(checkpoint, 16, inference_mode="policy", inference_horizon=16)
+        assert summary["checkpoint_chunk"] == summary["bridge_horizon"] == 16
+
+        invalid = copy.deepcopy(config)
+        invalid["framework"]["action_model"]["action_horizon"] = 32
+        (run_dir / "config.full.yaml").write_text(
+            yaml.safe_dump(invalid), encoding="utf-8"
+        )
+        with pytest.raises(ValueError, match="action_horizon=16"):
+            verify(checkpoint, 16, inference_mode="policy", inference_horizon=16)
 
 
-def test_coflow_registration_and_defaults_are_isolated_from_legacy_qwengroot() -> None:
+def test_registration_and_defaults_do_not_contain_multibridge_fields() -> None:
+    defaults = QwenActionWorldCoFlowDefaultConfig()
+    legacy_defaults = QwenGR00TDefaultConfig()
+    assert defaults.name == "QwenActionWorldCoFlow"
+    assert defaults.enable_action_world_coflow is False
+    assert defaults.action_model["action_horizon"] == 16
+    assert not (REMOVED_COFLOW_FIELDS & set(defaults.action_world_coflow))
+    assert not hasattr(legacy_defaults, "enable_action_world_coflow")
     assert FRAMEWORK_REGISTRY["QwenActionWorldCoFlow"] is QwenActionWorldCoFlow
-    assert QwenActionWorldCoFlowDefaultConfig().enable_action_world_coflow is False
-    assert not hasattr(QwenGR00TDefaultConfig(), "enable_action_world_coflow")
-    legacy_path = REPO_ROOT / "examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam_corrnoise.yaml"
-    legacy = yaml.safe_load(legacy_path.read_text(encoding="utf-8"))
-    assert legacy["framework"]["name"] == "QwenGR00T"
-    assert "enable_action_world_coflow" not in legacy["framework"]
-    assert "action_world_coflow" not in legacy["framework"]

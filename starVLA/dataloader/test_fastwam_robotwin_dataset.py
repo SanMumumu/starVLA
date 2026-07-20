@@ -4,17 +4,22 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+RUNBOOK_DIR_NAME = "\u6267\u884c\u811a\u672c"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 import pandas as pd
+import pytest
+import torch
 import yaml
 from omegaconf import OmegaConf
 
@@ -278,8 +283,8 @@ def test_fastwam_split_domain_and_wam_composite_target() -> None:
         assert "state" not in no_state_sample
 
 
-def test_fastwam_action_world_coflow_dual_future_contract() -> None:
-    """t+16/t+32 targets share the 50 Hz index and have independent masks."""
+def test_fastwam_action_world_coflow_h16_single_future_contract() -> None:
+    """The closed-loop recipe loads exactly t/t+16 and a 16-step action chunk."""
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -287,41 +292,37 @@ def test_fastwam_action_world_coflow_dual_future_contract() -> None:
         dataset = get_vla_dataset(
             _config(
                 root,
+                data_mix="robotwin_fastwam_h16",
                 fastwam_action_world_coflow_targets=True,
-                fastwam_coflow_future_strides=[16, 32],
             )
         )
         _mock_video(dataset)
-        assert dataset.delta_indices["video.cam_high"].tolist() == [0, 16, 32]
+        assert dataset.delta_indices["video.cam_high"].tolist() == [0, 16]
         sample = dataset._pack_sample(dataset.transforms(dataset.get_step_data(0, 0)))
-        assert sample["action"].shape == (32, 14)
-        assert sample["action_is_pad"].shape == (32,)
+        assert sample["action"].shape == (16, 14)
+        assert sample["action_is_pad"].shape == (16,)
         assert sample["future_valid_16"] == 1
-        assert sample["future_valid_32"] == 1
-        assert sample["coflow_future_strides"].tolist() == [16, 32]
-        assert sample["coflow_view_keys"] == ["video.robotwin_composite"]
-        assert sample["image_16"][0].size == sample["image_32"][0].size == (320, 384)
-        # Mock decoder returns one distinguishable image per requested delta.
-        assert int(np.asarray(sample["image_16"][0])[10, 10, 0]) == 21
-        assert int(np.asarray(sample["image_32"][0])[10, 10, 0]) == 22
+        assert "coflow_future_strides" not in sample
+        assert sample["image_16"][0].size == (320, 384)
 
-        tail = dataset._pack_sample(dataset.transforms(dataset.get_step_data(0, 10)))
-        assert tail["future_valid_16"] == 1
-        assert tail["future_valid_32"] == 0
-        assert int(tail["action_is_pad"].sum()) == 2
-
-        try:
+        with pytest.raises(ValueError, match="was removed"):
             get_vla_dataset(
                 _config(
                     root,
+                    data_mix="robotwin_fastwam_h16",
+                    fastwam_action_world_coflow_targets=True,
+                    fastwam_coflow_future_strides=[16],
+                )
+            )
+        with pytest.raises(ValueError, match="enable exactly one"):
+            get_vla_dataset(
+                _config(
+                    root,
+                    data_mix="robotwin_fastwam_h16",
                     fastwam_wam_targets=True,
                     fastwam_action_world_coflow_targets=True,
                 )
             )
-        except ValueError as exc:
-            assert "enable exactly one" in str(exc)
-        else:
-            raise AssertionError("WAM and Co-Flow target ABIs must be mutually exclusive")
 
 
 def test_fastwam_train_infer_order_and_contract() -> None:
@@ -344,6 +345,84 @@ def test_fastwam_train_infer_order_and_contract() -> None:
     client.expects_state = False
     assert client._prepare_state_for_server(state) is None
     np.testing.assert_array_equal(client._prepare_action_for_env(state), state)
+    client.coflow_inference_mode = "policy"
+    client.coflow_inference_horizon = 16
+    client.coflow_inference_seed = 7
+    client._coflow_query_index = 0
+    assert client._extra_inference_request_kwargs() == {
+        "coflow_inference_mode": "policy",
+        "coflow_inference_horizon": 16,
+        "coflow_inference_seed": 7,
+    }
+    assert client._coflow_query_index == 1
+
+
+def test_policy_server_metadata_exposes_loaded_gate_ft_contract() -> None:
+    from deployment.model_server.policy_wrapper import PolicyServerWrapper
+
+    class GateFramework:
+        wam_enabled = True
+        wam_guidance = {
+            "enabled": True,
+            "mode": "dual_xattn",
+            "action_world_bypass": False,
+            "bridge_source": "predicted",
+            "world_eval_mode": "correct",
+            "baseline_action_context": True,
+        }
+
+        @staticmethod
+        def _wam_world_gate_metrics():
+            return {
+                "world_gate_openness": torch.tensor(0.2),
+                "world_gate_signed_mean": torch.tensor(-0.05),
+                "world_gate_max_openness": torch.tensor(0.7),
+            }
+
+    contract = {
+        "framework": {"wam": {"enabled": True, "guidance": {"enabled": True}}},
+        "trainer": {
+            "wam_two_stage_phase": "gate_ft",
+            "wam_two_stage_recipe": "baseline_preserving_v3",
+        },
+    }
+    metadata = PolicyServerWrapper._build_wam_runtime_metadata(GateFramework(), contract)
+    assert metadata["wam_two_stage_phase"] == "gate_ft"
+    assert metadata["wam_two_stage_recipe"] == "baseline_preserving_v3"
+    assert metadata["wam_action_world_bypass"] is False
+    assert metadata["wam_bridge_source"] == "predicted"
+    assert metadata["wam_baseline_action_context"] is True
+    assert metadata["wam_gate_openness"] == pytest.approx(0.2)
+    assert metadata["wam_gate_signed_mean"] == pytest.approx(-0.05)
+    assert metadata["wam_gate_max_openness"] == pytest.approx(0.7)
+
+
+def test_policy_server_metadata_accepts_physical_no_world2action_baseline() -> None:
+    from deployment.model_server.policy_wrapper import PolicyServerWrapper
+
+    framework = SimpleNamespace(
+        wam_enabled=True,
+        wam_guidance={
+            "enabled": True,
+            "mode": "dual_xattn",
+            "action_world_bypass": True,
+            "world_to_action_enabled": False,
+            "bridge_source": "predicted",
+            "world_eval_mode": "correct",
+            "baseline_action_context": True,
+        },
+    )
+    contract = {
+        "framework": {"wam": {"enabled": True, "guidance": {"enabled": True}}},
+        "trainer": {
+            "wam_two_stage_phase": "predictor_warmup",
+            "wam_two_stage_recipe": "baseline_preserving_v3",
+        },
+    }
+    metadata = PolicyServerWrapper._build_wam_runtime_metadata(framework, contract)
+    assert metadata["wam_world_to_action_enabled"] is False
+    assert metadata["wam_action_world_bypass"] is True
+    assert metadata["wam_gate_openness"] is None
 
 
 def test_fastwam_real_cluster_config_snapshots() -> None:
@@ -356,7 +435,7 @@ def test_fastwam_real_cluster_config_snapshots() -> None:
     from deployment.model_server.policy_wrapper import PolicyServerWrapper
     from examples.Robotwin.eval_files.verify_fastwam_checkpoint_contract import verify
 
-    snapshot_dir = REPO_ROOT / "执行脚本/集群FastWAM IID checkpoint yaml"
+    snapshot_dir = REPO_ROOT / RUNBOOK_DIR_NAME / "\u96c6\u7fa4FastWAM IID checkpoint yaml"
     accessed_source = snapshot_dir / "config.yaml"
     full_source = snapshot_dir / "config.full.yaml"
     accessed = yaml.safe_load(accessed_source.read_text(encoding="utf-8"))
@@ -539,55 +618,70 @@ def test_correlated_noise_artifact_is_a_strict_train_deploy_contract() -> None:
         assert framework.injected is None
 
 
-def test_joint_e2e_rand_clean_yaml_contracts() -> None:
-    """The two E2E runs differ only where the experiment requires it."""
+def test_robotwin_active_two_stage_and_coflow_yaml_contracts() -> None:
+    """Only strict two-stage WAM and context-conditioned Co-Flow stay active."""
 
-    from deployment.model_server.checkpoint_contract import resolve_config_expects_state
     from starVLA.dataloader.gr00t_lerobot.registry import ROBOT_TYPE_CONFIG_MAP
     from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
 
     config_dir = REPO_ROOT / "examples/Robotwin/train_files"
-    rand = yaml.safe_load((config_dir / "robotwin_wam_e2e_rand.yaml").read_text(encoding="utf-8"))
-    clean = yaml.safe_load((config_dir / "robotwin_wam_e2e_clean.yaml").read_text(encoding="utf-8"))
+    pairs = (
+        ("robotwin_wam_warmup_rand.yaml", "robotwin_wam_gate_rand2clean.yaml"),
+        ("robotwin_wam_warmup_clean.yaml", "robotwin_wam_gate_clean2clean.yaml"),
+    )
+    for warmup_name, gate_name in pairs:
+        warmup = yaml.safe_load((config_dir / warmup_name).read_text(encoding="utf-8"))
+        gate = yaml.safe_load((config_dir / gate_name).read_text(encoding="utf-8"))
+        for cfg in (warmup, gate):
+            action_cfg = cfg["framework"]["action_model"]
+            data_cfg = cfg["datasets"]["vla_data"]
+            guidance = cfg["framework"]["wam"]["guidance"]
+            assert action_cfg["use_correlated_noise"] is False
+            assert not any(str(key).startswith("correlation_") for key in action_cfg)
+            assert action_cfg["action_horizon"] == 32
+            assert data_cfg["include_state"] is True
+            assert data_cfg["obs_image_size"] == [320, 384]
+            assert data_cfg["per_device_batch_size"] == 12
+            assert data_cfg["num_workers"] == 4
+            assert cfg["trainer"]["gradient_accumulation_steps"] == 1
+            assert cfg["trainer"]["expected_global_batch_size"] == 768
+            assert guidance["include_context_in_action_memory"] is True
+            assert guidance["include_context_in_world_memory"] is True
+        assert warmup["trainer"]["wam_two_stage_phase"] == "predictor_warmup"
+        assert warmup["trainer"]["wam_two_stage_recipe"] == "baseline_preserving_v3"
+        assert warmup["trainer"]["max_train_steps"] == 80000
+        assert warmup["trainer"]["num_warmup_steps"] == 2000
+        assert warmup["framework"]["wam"]["guidance"]["action_world_bypass"] is True
+        assert warmup["framework"]["wam"]["guidance"]["detach_action_backbone"] is False
+        assert warmup["framework"]["wam"]["guidance"]["detach_world_backbone"] is True
+        assert warmup["framework"]["wam"]["guidance"]["baseline_action_context"] is True
+        assert gate["trainer"]["wam_two_stage_phase"] == "gate_ft"
+        assert gate["trainer"]["wam_two_stage_recipe"] == "baseline_preserving_v3"
+        assert gate["trainer"]["max_train_steps"] == 20000
+        assert gate["framework"]["wam"]["guidance"]["action_world_bypass"] is False
+        assert gate["framework"]["wam"]["guidance"]["detach_world_backbone"] is True
+        assert gate["framework"]["wam"]["guidance"]["baseline_action_context"] is True
 
-    for cfg in (rand, clean):
-        weights = cfg["framework"]["tasks"]["weights"]
-        assert [name for name, weight in weights.items() if float(weight) > 0] == ["joint_e2e"]
-        guidance = cfg["framework"]["wam"]["guidance"]
-        assert guidance["bridge_source"] == "predicted"
-        assert guidance["detach_world"] is False
-        assert guidance["oracle_ratio"] == 0.0
-        assert guidance["gate_init"] == 0.0
-        assert guidance["exclude_post_query_context"] is True
-        assert guidance["action_world_gradient_ramp"] == {
-            "enabled": True,
-            "start_step": 10000,
-            "end_step": 30000,
-            "start_scale": 0.0,
-            "end_scale": 1.0,
-        }
-        assert cfg["framework"]["wam"]["dino_loss_weight"] == 0.01
-        assert cfg["framework"]["action_model"]["action_horizon"] == 32
-        assert cfg["datasets"]["vla_data"]["fastwam_future_stride"] == 32
-        assert cfg["datasets"]["vla_data"]["obs_image_size"] == [320, 384]
-        assert cfg["framework"]["dino"]["image_size"] == [384, 320]
-        assert cfg["framework"]["dino"]["future_view_keys"] == ["video.robotwin_composite"]
-        assert cfg["framework"]["visual_model"]["max_target_tokens"] == 480
-        assert cfg["datasets"]["vla_data"]["per_device_batch_size"] == 16
-        assert cfg["trainer"]["gradient_accumulation_steps"] == 1
-        action_cfg = cfg["framework"]["action_model"]
-        assert action_cfg["use_correlated_noise"] is False
-        assert "correlation_cholesky_path" not in action_cfg
-        assert not any(str(key).startswith("correlation_") for key in action_cfg)
-        assert cfg["framework"]["qwenvl"]["attn_implementation"] == "flash_attention_2"
-        assert "iidnoise" in cfg["run_id"] and "corrnoise" not in cfg["run_id"]
-
-    assert resolve_config_expects_state(rand)[0] is False
-    assert resolve_config_expects_state(clean)[0] is True
-    assert rand["datasets"]["vla_data"]["fastwam_dataset_stats_path"] != clean["datasets"]["vla_data"][
-        "fastwam_dataset_stats_path"
-    ]
-    assert clean["datasets"]["vla_data"]["fastwam_domain"] == "clean"
+    assert not (config_dir / "robotwin_action_world_coflow.yaml").exists()
+    coflow = yaml.safe_load(
+        (config_dir / "robotwin_action_world_coflow_better.yaml").read_text(encoding="utf-8")
+    )
+    assert coflow["framework"]["name"] == "QwenActionWorldCoFlow"
+    assert coflow["framework"]["enable_action_world_coflow"] is True
+    assert coflow["framework"]["action_model"]["use_correlated_noise"] is False
+    assert coflow["framework"]["action_model"]["action_horizon"] == 16
+    coflow_model = coflow["framework"]["action_world_coflow"]
+    assert "segment_boundaries" not in coflow_model
+    assert "future_strides" not in coflow_model
+    assert "z32_loss_weight" not in coflow_model
+    coflow_data = coflow["datasets"]["vla_data"]
+    assert coflow_data["data_mix"] == "robotwin_fastwam_h16"
+    assert "fastwam_coflow_future_strides" not in coflow_data
+    assert coflow_data["include_state"] is True
+    assert coflow_data["per_device_batch_size"] == 12
+    assert coflow_data["num_workers"] == 4
+    assert coflow["trainer"]["gradient_accumulation_steps"] == 1
+    assert coflow["trainer"]["expected_global_batch_size"] == 768
 
     data_config = ROBOT_TYPE_CONFIG_MAP["robotwin_fastwam"]
     state_action_transforms = [
@@ -598,6 +692,42 @@ def test_joint_e2e_rand_clean_yaml_contracts() -> None:
         set(transform.normalization_modes.values()) == {"fastwam_zscore"}
         for transform in state_action_transforms
     )
+
+
+def test_coflow_checkpoint_verifier_accepts_only_h16_single_bridge() -> None:
+    from examples.Robotwin.eval_files.verify_action_world_coflow_checkpoint_contract import verify
+
+    source = REPO_ROOT / "examples/Robotwin/train_files/robotwin_action_world_coflow_better.yaml"
+    h16_config = yaml.safe_load(source.read_text(encoding="utf-8"))
+    values = [0.0] * 14
+    modality = {
+        "min": values,
+        "max": values,
+        "mean": values,
+        "std": [1.0] * 14,
+        "q01": values,
+        "q99": values,
+        "mask": [True] * 14,
+    }
+    stats = {"new_embodiment": {"state": modality, "action": modality}}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "coflow"
+        checkpoint = run_dir / "checkpoints/steps_1_pytorch_model.pt"
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.touch()
+        (run_dir / "config.yaml").write_text(yaml.safe_dump(h16_config), encoding="utf-8")
+        (run_dir / "config.full.yaml").write_text(yaml.safe_dump(h16_config), encoding="utf-8")
+        (run_dir / "dataset_statistics.json").write_text(json.dumps(stats), encoding="utf-8")
+
+        h16 = verify(checkpoint, 16, inference_mode="policy", inference_horizon=16)
+        assert h16["checkpoint_chunk"] == h16["inference_horizon"] == 16
+
+        invalid = copy.deepcopy(h16_config)
+        invalid["framework"]["action_model"]["action_horizon"] = 32
+        (run_dir / "config.full.yaml").write_text(yaml.safe_dump(invalid), encoding="utf-8")
+        with pytest.raises(ValueError, match="action_horizon=16"):
+            verify(checkpoint, 16, inference_mode="diagonal", inference_horizon=16)
 
 
 def test_robodojo_train_and_deploy_contracts() -> None:
@@ -716,18 +846,23 @@ def test_robodojo_train_and_deploy_contracts() -> None:
     eval_dir = REPO_ROOT / "examples/RoboDojo/eval_files"
     eval_script = (eval_dir / "eval_robodojo.sh").read_text(encoding="utf-8")
     model_script = (eval_dir / "robodojo_model.py").read_text(encoding="utf-8")
-    run_notes = (REPO_ROOT / "执行脚本/RBT/run.sh").read_text(encoding="utf-8")
-    client_job = yaml.safe_load((REPO_ROOT / "执行脚本/RBT/job_client_robodojo.yaml").read_text(encoding="utf-8"))
-    e2e_job = yaml.safe_load((REPO_ROOT / "执行脚本/RBT/robodojo_wam_e2e.yaml").read_text(encoding="utf-8"))
+    runbook_root = REPO_ROOT / RUNBOOK_DIR_NAME / "RBT"
+    run_notes = (runbook_root / "run.sh").read_text(encoding="utf-8")
+    client_job = yaml.safe_load((runbook_root / "job_client_robodojo.yaml").read_text(encoding="utf-8"))
+    e2e_job = yaml.safe_load((runbook_root / "robodojo_wam_e2e.yaml").read_text(encoding="utf-8"))
     assert "build_robotwin_composite" in model_script
     assert "task_instruction" in model_script
     assert '"state": state' in model_script
     assert "XPolicyLab/policy/starVLA/eval.sh" not in run_notes
-    assert "examples/RoboDojo/eval_files/eval_robodojo.sh" in run_notes
+    assert "examples/RoboDojo/eval_files/run_aidi_robodojo_fast_full.sh" in run_notes
+    assert "examples/RoboDojo/eval_files/run_aidi_robodojo_visualize.sh" in run_notes
     assert "aidi-inf-cli job submit -f robodojo_wam_e2e.yaml" in run_notes
     assert "starvla_qwengroot_robodojo_wam_e2e.yaml" in e2e_job["REQUIRED"]["RUN_SCRIPTS"]
     assert "Third_github" not in eval_script
-    assert "run_aidi_robodojo.sh" in client_job["REQUIRED"]["RUN_SCRIPTS"]
+    # The client job intentionally opens the clean interactive 8-GPU shell;
+    # run.sh contains the selectable fast-full / visualize commands entered
+    # after startup.
+    assert client_job["REQUIRED"]["RUN_SCRIPTS"].endswith("/run_aidi.sh")
     assert "ppu" not in client_job["OPTIONAL"]["DOCKER_IMAGE"].lower()
 
 
@@ -782,10 +917,13 @@ if __name__ == "__main__":
     test_fastwam_metadata_and_composite()
     test_fastwam_checkpoint_sample_and_direct_sampler()
     test_fastwam_split_domain_and_wam_composite_target()
+    test_fastwam_action_world_coflow_h16_single_future_contract()
     test_fastwam_train_infer_order_and_contract()
+    test_policy_server_metadata_exposes_loaded_gate_ft_contract()
     test_fastwam_real_cluster_config_snapshots()
     test_fastwam_cluster_preflight_fixture()
     test_correlated_noise_artifact_is_a_strict_train_deploy_contract()
-    test_joint_e2e_rand_clean_yaml_contracts()
+    test_robotwin_active_two_stage_and_coflow_yaml_contracts()
+    test_coflow_checkpoint_verifier_accepts_only_h16_single_bridge()
     test_robodojo_train_and_deploy_contracts()
     test_robodojo_checkpoint_preflight()

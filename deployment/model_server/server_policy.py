@@ -47,8 +47,6 @@ def build_argparser():
     parser.add_argument("--port", type=int, default=10093)
     parser.add_argument("--use_bf16", action="store_true")
     #######
-    # 中文注释：jointflow 评测专用——在线 DINO 的 per-suite 归一化 stats（dino_v3_stats.json）。
-    # 训练用离线精算特征（按各 suite stats 标准化），eval 在线提取必须用同一份 stats，否则视觉条件失效 SR≈0。
     parser.add_argument("--dino_stats_path", type=str, default=None,
                         help="per-suite dino_v3_stats.json for online DINO normalization (jointflow eval)")
     #######

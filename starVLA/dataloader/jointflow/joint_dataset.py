@@ -1,12 +1,8 @@
-"""PR1: JointFlow LeRobot dataset wrapper.
+"""Dual-query LeRobot dataset wrappers.
 
-复用:
-- starVLA.dataloader.gr00t_lerobot.datasets.LeRobotSingleDataset / LeRobotMixtureDataset
-- starVLA.dataloader.gr00t_lerobot.registry registries
-- starVLA.dataloader.lerobot_datasets.collate_fn
-
-说明:
-本文件通过子类化/组合读取 DINOv3 离线特征，不修改 gr00t_lerobot 源码。
+The implementation composes the standard single/mixture datasets, registry,
+and collator without modifying the upstream LeRobot data path. It supports
+both precomputed DINO targets and the online feature path.
 """
 
 from __future__ import annotations
@@ -38,7 +34,6 @@ from starVLA.dataloader.lerobot_datasets import collate_fn
 
 
 ######### // code // ##########
-# 中文注释：把 torch.Tensor / numpy / list 统一转成 numpy，便于 pack sample。
 def _to_numpy(value: Any) -> np.ndarray:
     if torch.is_tensor(value):
         return value.detach().cpu().numpy()
@@ -126,20 +121,12 @@ def _drop_video_transforms(base_transforms):
 
 
 ######### // code // ##########
-# 中文注释：JointFlow 数据集子类。
-# RGB 模式（历史字段 online_dino=True，默认）：返回原始图像 image_0=s_t，并按需返回 image_1=s_{t+stride}
-#   （[V,H,W,C] uint8）。dino_target_latents=True 时，DINO target 仍从磁盘预计算 latent 读取，模型不在线编码 target；
-#   只有样本没有预计算 latent 且未启用 strict 时，framework 才会在线提取 DINO。视频解码在 worker 里完成。
-# 离线模式（online_dino=False）：保留旧逻辑，读取离线 DINOv3 特征 dino_0/dino_1 [V,N_v,D]（已按 stats 标准化）。
-# 两种模式都返回 action [H_a,7]，state [1,state_dim]，lang str。
 class JointLiberoDataset(LeRobotSingleDataset):
     def __init__(
         self,
         *args,
         online_dino: bool = True,
         dino_feature_dir: str = "latents",
-        # 中文注释：≥视角数才能让同一样本 dino_0→dino_1 全部命中（3 视角时 2 会把 view0 挤掉→重读）。
-        # 缓存现已在 _pack_sample 末尾逐样本清空（防 per-dataset×worker 常驻膨胀→节点 OOM），此值只是样本内瞬态上限。
         dino_episode_cache_size: int = 4,
         dino_target_latents: bool = False,
         **kwargs,
@@ -147,9 +134,6 @@ class JointLiberoDataset(LeRobotSingleDataset):
         self.online_dino = bool(online_dino)
         self.dino_feature_dir_name = dino_feature_dir
         #######
-        # 中文注释：hybrid 开关——在线模式(出 raw 图给 Qwen 原生视觉)的同时,额外读预存 DINO latent 当
-        # 世界模型 target(dino_0/dino_1)。这样 WAM 既有 raw 图喂 policy、又用上预存 latent,
-        # 不用每步在线跑 DINO backbone(省算力 + 不必加载大 backbone 权重)。需 latents/ store 存在。
         self._dino_target_latents = bool(dino_target_latents)
         #######
         self._dino_episode_cache_size = max(int(dino_episode_cache_size), 0)
@@ -410,26 +394,22 @@ class JointLiberoDataset(LeRobotSingleDataset):
         data = {}
         self.curr_traj_data = self.get_trajectory_data(trajectory_id)
 
-        # 中文注释：在线模式解码视频帧（video delta_indices=[0, stride] → 每个 view 返回 2 帧：
-        # 当前帧 s_t 和未来帧 s_{t+stride}）。原始帧直接暂存到 self，不放进 data，
-        # 这样 transforms（已 drop video）不会碰它们，避免缺 key 报错 / 重复处理。
-        # DINO 不在 worker 里跑，只解码 RGB → 模型 forward 在 GPU 上在线提特征。
-        # decode_video=False：只取 state/action（如启动估协方差），跳过 PyAV 解码。
         if self.online_dino and decode_video:
             self._last_video_frames = {}
             for key in self.modality_keys.get("video", []):
                 self._last_video_frames[key] = self.get_data_by_modality(trajectory_id, "video", key, base_index)
 
-        # 离线模式不解码视频（直接读离线 latent），避免 PyAV/torchvision worker OOM。
         for modality in ("state", "action", "language"):
             for key in self.modality_keys.get(modality, []):
                 data[key] = self.get_data_by_modality(trajectory_id, modality, key, base_index)
         return self._apply_action_mode(data)
 
     def read_action_only(self, trajectory_id: int, base_index: int) -> np.ndarray:
-        """返回单样本归一化 action [H, action_dim]，与 __getitem__ 完全同 transform，但**不解码视频/不读 latent**。
-        中文注释：供启动时估 correlated-noise 协方差用——只读 parquet 里的 state/action（走同一 get_step_data +
-        transforms 路径，只是 decode_video=False），避免逐样本 PyAV 解码在多机 bucket I/O 下挂起/超时。"""
+        """Read one normalized action chunk without video or latent decoding.
+
+        Correlated-noise estimation uses the same state/action transforms as
+        ``__getitem__`` while avoiding expensive distributed PyAV reads.
+        """
         raw = self.get_step_data(trajectory_id, base_index, decode_video=False)
         data = self.transforms(raw)
         action = [_to_numpy(data[k]) for k in self.modality_keys["action"]]
@@ -471,10 +451,6 @@ class JointLiberoDataset(LeRobotSingleDataset):
         }
 
         if self.online_dino:
-            # 中文注释：在线模式返回原始图像。image_0=当前帧（每个 view 第 0 帧）。
-            # decode_future_video=true 时再返回 image_1=未来帧；纯 policy/passive WAM 使用预计算
-            # dino_1 监督，不消费未来 RGB，可关闭该项以省掉三路未来视频解码且不改变模型输入。
-            # 形状 [V,H,W,C] uint8；view 顺序 = self.modality_keys["video"]（LIBERO: primary 在前）。
             source_view_keys = list(self.modality_keys.get("video", []))
             if self._last_video_frames is None:
                 raise RuntimeError("JointLiberoDataset(online) requires get_step_data to decode video first.")
@@ -533,8 +509,6 @@ class JointLiberoDataset(LeRobotSingleDataset):
             if image_layout == FASTWAM_COMPOSITE_LAYOUT:
                 sample["dino_target_view_keys"] = view_keys
             #######
-            # 中文注释：hybrid——在线出 raw 图的同时,再读预存的 DINO latent（已按 store stats 标准化）当 target。
-            # dino_0=当前帧(delta 用)、dino_1=未来帧。wam 优先用它当世界模型 target,省掉在线 DINO 抽取。
             if self._dino_target_latents:
                 target_view_keys = self._dino_target_view_keys()
                 if bool(_cfg_get(self.data_cfg, "load_current_dino_target", True)):
@@ -546,7 +520,6 @@ class JointLiberoDataset(LeRobotSingleDataset):
                 sample["dino_view_keys"] = target_view_keys
             #######
         else:
-            # 中文注释：离线模式读取预计算 + 标准化后的 DINO 特征。
             sample["dino_0"] = self._read_dino(trajectory_id, base_index)
             sample["dino_1"] = self._read_dino(trajectory_id, future_index)
             sample["dino_target_view_keys"] = self._dino_target_view_keys()
@@ -560,10 +533,6 @@ class JointLiberoDataset(LeRobotSingleDataset):
             if state:
                 sample["state"] = np.concatenate(state, axis=1).astype(np.float32)
         #######
-        # 中文注释：episode latent 缓存只为**同一样本内** dino_0→dino_1 复用（同 episode 同 view 文件不二读）。
-        # 随机采样下跨样本命中≈0，但缓存是 per-dataset 的：mixture 有 50-100 个数据集对象 × 每个 2-4 条
-        # × 整集 fp32 latent（~百 MB/条）× 每节点几十个 persistent worker → 常驻内存线性膨胀直至节点 OOM
-        # （表现为某 rank 被 SIGKILL、其余 rank 报 ncclRemoteError）。∴ 样本打包完立即清空。
         if self._episode_latent_cache:
             self._episode_latent_cache.clear()
         #######
@@ -574,9 +543,6 @@ class JointLiberoDataset(LeRobotSingleDataset):
 
 
 ######### // code // ##########
-# 中文注释：构造 JointFlow 专用 dataset，不经 starVLA.dataloader.__init__.build_dataloader。
-# 它临时覆盖 observation_indices：video=[0, future_stride]，language=[0]，state=[0]，action=[0..H-1]。
-# 在线模式下 video 取 [0, future_stride]：第 0 帧=s_t，第 1 帧=s_{t+stride}（与未来动作 / 世界模型目标对齐）。
 def _make_joint_single_dataset(
     dataset_path: Path, robot_type: str, data_cfg, online_dino: bool | None = None
 ) -> JointLiberoDataset:
@@ -584,9 +550,6 @@ def _make_joint_single_dataset(
     modality_config = copy.deepcopy(data_config.modality_config())
 
     action_horizon = int(_cfg_get(data_cfg, "action_horizon", _cfg_get(data_cfg, "future_action_window_size", 8)))
-    # 中文注释：online_dino 由 build_joint_dataset 在"混合级"统一解析后传入（支持 "auto"：
-    # 有 latent 用 latent、没有就在线）。直接调用本函数未传时退回 data_cfg 的 true/false
-    # （"auto" 字符串兜底按在线处理，避免 bool("auto")=True 的歧义恰好也指在线）。
     if online_dino is None:
         raw = _cfg_get(data_cfg, "online_dino", True)
         online_dino = True if (isinstance(raw, str) and raw.strip().lower() == "auto") else bool(raw)
@@ -596,8 +559,6 @@ def _make_joint_single_dataset(
         future_stride = _cfg_get(data_cfg, "future_dino_stride", action_horizon)
     future_stride = max(int(future_stride), 1)
     if "video" in modality_config:
-        # 中文注释：在线且任务需要未来 RGB 时取 [0,stride]；纯 policy/passive + 预计算 dino_1
-        # 可只取 [0]。离线模式不解码视频，delta 取 [0,1] 仅作兼容占位。
         decode_future_video = bool(_cfg_get(data_cfg, "decode_future_video", True))
         video_delta = ([0, future_stride] if decode_future_video else [0]) if online_dino else [0, 1]
         modality_config["video"] = ModalityConfig(
@@ -640,11 +601,6 @@ def _make_joint_single_dataset(
 
 
 ######### // code // ##########
-# 中文注释：online_dino="auto" 的混合级解析（"有 latent 就 latent，没有就在线"）。
-# 规则：混合内"所有"数据集都有离线 latents 且统计维度与 framework.dino（经
-# resolve_dino_spec，含 model_size）期望的 embed_dim 一致 → 离线；任一缺失/维度
-# 不符 → 整个混合在线。必须整混合统一：framework._stack_field 以首样本字段为准，
-# 同一 batch 混出 dino_0 与 image_0 两种字段会崩。
 def _dataset_offline_latents_dim(dataset_path: Path, feature_dir: str) -> int | None:
     root = Path(dataset_path) / str(feature_dir)
     stats_path = root / "dino_v3_stats.json"
@@ -946,8 +902,6 @@ def build_joint_dataloader(cfg, mode: str = "train") -> DataLoader:
 
 
 #######
-# 中文注释：E1.3 correlated noise——从数据集采样归一化动作 chunk，返回
-# beta*M+(1-beta)*I 的 Cholesky。M 默认沿用旧 covariance；Robotwin 新实验显式使用 scale-invariant correlation。
 def compute_action_correlation_cholesky(
     mixture_dataset: LeRobotMixtureDataset,
     num_samples: int = 20000,
@@ -957,10 +911,11 @@ def compute_action_correlation_cholesky(
 ) -> np.ndarray:
     """Estimate the correlated-noise Cholesky from action chunks.
 
-    中文注释：**只读 action，不解码视频**——严格复用 mixture 的 dataset_sampling_weights 与
-    trajectory_sampling_weights，再在选中轨迹内均匀取 step；因此 corrnoise 估计分布与实际训练采样一致。
-    JointFlow 子数据集走 `read_action_only`（同 __getitem__ transform，但跳过 PyAV + latent）；无该接口的
-    原生数据集回退到 mixture __getitem__。逐样本 try/except 跳过坏样本，单个坏轨迹不拖垮启动。
+    Sampling follows the mixture's dataset and trajectory weights, then draws
+    a step uniformly inside the selected trajectory. Dual-query datasets use
+    ``read_action_only``; generic datasets fall back to ``__getitem__``. Bad
+    samples are skipped independently so one damaged trajectory cannot abort
+    startup.
     """
     target = int(num_samples)
     if target < 2:
@@ -1008,12 +963,12 @@ def compute_action_correlation_cholesky(
                     traj_id = int(d.trajectory_ids[trajectory_index])
                     base_index = int(rng.integers(0, int(d.trajectory_lengths[trajectory_index])))
                     a = d.read_action_only(int(traj_id), int(base_index))
-            else:  # 回退：非 jointflow 数据集，走全量 __getitem__
+            else:
                 a = mixture_dataset[int(rng.integers(0, len(mixture_dataset)))].get("action")
         except Exception as exc:
             rejected += 1
             last_error = exc
-            continue  # 坏样本/坏轨迹直接跳过，不拖垮启动
+            continue
         if a is None:
             continue
         a = a.detach().cpu().numpy() if torch.is_tensor(a) else np.asarray(a)
@@ -1039,7 +994,6 @@ def compute_action_correlation_cholesky(
     flat = X.shape[1]
     action_matrix = compute_action_noise_matrix(X, matrix_type=matrix_type)
     Sigma_reg = beta * action_matrix + (1.0 - beta) * np.eye(flat)
-    # 数值稳健：对角加微小抖动后 Cholesky
     L = np.linalg.cholesky(Sigma_reg + 1e-6 * np.eye(flat))
     from starVLA.dataloader.action_correlation import validate_action_correlation_cholesky
 
@@ -1068,11 +1022,11 @@ if __name__ == "__main__":
             "future_stride": int(sample.get("future_stride", -1)),
             "lang": sample["lang"][:80],
         }
-        if "image_0" in sample:  # 在线模式
+        if "image_0" in sample:
             info["image_0"] = np.asarray(sample["image_0"]).shape
             info["image_1"] = np.asarray(sample["image_1"]).shape
             info["dino_view_keys"] = sample.get("dino_view_keys")
-        else:  # 离线模式
+        else:
             info["dino_0"] = np.asarray(sample["dino_0"]).shape
             info["dino_1"] = np.asarray(sample["dino_1"]).shape
         print(info)

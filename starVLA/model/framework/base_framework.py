@@ -207,7 +207,7 @@ class baseframework(PreTrainedModel):
         cls,
         pretrained_checkpoint: str,
         **kwargs,
-    ) -> None:
+    ) -> "baseframework":
         """
         Restore a model instance from a saved checkpoint.
 
@@ -234,8 +234,15 @@ class baseframework(PreTrainedModel):
 
         config = dict_to_namespace(model_config)
         model_config = config
-        model_config.trainer.pretrained_checkpoint = None
-        
+
+        # Preserve the saved construction contract verbatim.  In particular,
+        # a Stage-2 WAM ``gate_ft`` checkpoint records the Stage-1 parent path,
+        # and QwenGR00T validates that provenance before constructing its
+        # modules.  Clearing the field here made a fully trained 20k gate
+        # checkpoint impossible to restore for evaluation.  Framework
+        # constructors don't load ``trainer.pretrained_checkpoint``; only the
+        # trainer consumes it, so retaining the string cannot recursively load
+        # the parent model during inference.
         FrameworkModel = build_framework(cfg=model_config)
         # set for action un-norm
         FrameworkModel.norm_stats = norm_stats
@@ -266,4 +273,3 @@ class baseframework(PreTrainedModel):
         # **ensure model is on GPU**
         FrameworkModel = FrameworkModel
         return FrameworkModel
-

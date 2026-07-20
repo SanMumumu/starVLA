@@ -33,20 +33,20 @@ def save_dataset_statistics(dataset_statistics, run_dir):
 
 
 
-def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here only is get dataset, we need mv dataloader to here
+def build_dataloader(
+    cfg,
+    dataset_py="lerobot_datasets_oxe",
+    *,
+    save_statistics: bool = True,
+): # TODO now here only is get dataset, we need mv dataloader to here
 
     #######
-    # 中文注释：JointFlow 迁移到原生 QwenGR00T 后，训练入口仍调用 build_dataloader。
-    # 这里仅新增显式 dataset_py 分支，复用现有 JointFlow LeRobot wrapper 产出
-    # dino/image_0/image_1/future_valid 字段，
-    # 不改变默认 lerobot_datasets / vlm_datasets 行为。
     if dataset_py in {"jointflow", "jointflow_lerobot"}:
         from starVLA.dataloader.jointflow.joint_dataset import build_joint_dataloader
 
         vla_train_dataloader = build_joint_dataloader(cfg)
         #######
-        # 中文注释：原生训练通常已初始化 distributed；单进程 smoke/debug 时未初始化也应允许保存统计。
-        if (not dist.is_initialized()) or dist.get_rank() == 0:
+        if save_statistics and ((not dist.is_initialized()) or dist.get_rank() == 0):
         #######
             output_dir = Path(cfg.output_dir)
             vla_train_dataloader.dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")
@@ -86,7 +86,7 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             collate_fn=collate_fn,
             **loader_kwargs,
         )
-        if (not dist.is_initialized()) or dist.get_rank() == 0:
+        if save_statistics and ((not dist.is_initialized()) or dist.get_rank() == 0):
             
             output_dir = Path(cfg.output_dir)
             vla_dataset.save_dataset_statistics(output_dir / "dataset_statistics.json")

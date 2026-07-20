@@ -1,15 +1,7 @@
 #######
-# 中文注释：add1 = exp5（2B + tricks + 大 batch + policy-only）**唯一改动：动作头换成 Wan-初始化版**。
-# 其余参数与 starvla_wam_exp5_2b_bigbs_policy_libero.yaml 完全一致 → 单变量对照 exp5：
-#   exp5 = GR00T DiT-B 动作头（随机初始化）；add1 = Wan-DiTBlock 动作头（Wan2.2-TI2V-5B 视频 DiT 骨干
-#   截断前 16 层 + 插值到 768 宽 + α 缩放初始化，参考 FastWAM）。检验视频世界模型先验对动作专家的增益。
-# 动作头尺寸对齐 exp5（hidden 768 / 16 层 / 12×64 → ~158M）。cross-attn 吃 wam 的 [act-query ⊕ Qwen hidden](2048)→ text_dim=2048。
 #
-# 用前准备：
-#   1) 生成骨干 .pt：python Z_ws/wan_init/preprocess_wan_action_backbone.py \
 #        --output Z_ws/wan_init/ckpts/WanActionBackbone_dimB_16L_first.pt \
 #        --num-layers 16 --hidden-dim 768 --ffn-dim 3072 --num-heads 12 --attn-head-dim 64 --text-dim 2048
-#   2) 上传 .pt 到 bucket，并把下面 framework.action_model.wan.init_path 改成 bucket 路径。
 #######
 run_id: starvla_wam_add1_2b_wan_init_policy
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
@@ -32,7 +24,6 @@ framework:
     placeholder_token: "<ACT_PH>"
     dino_loss_weight: 1.0
   #######
-  # 中文注释：add1 同 exp5——只有 policy（trick 作用在 action head，不需要世界模型范式）。
   tasks:
     weights:
       policy: 1.0
@@ -57,9 +48,6 @@ framework:
     action_horizon: 8
     n_action_query: 32
     #######
-    # 中文注释：唯一与 exp5 的差异——动作头骨干切换为 Wan（其余 action_model 参数与 exp5 一致）。
-    # wan.* 给新头维度（默认对齐 DiT-B：hidden 768 / 16 层 / 12×64，~158M）；
-    # 想用 Wan 原生 24×128（迁移更干净但 ~2.5×大）就改 num_heads=24 / attn_head_dim=128 并用对应 .pt。
     backbone: wan
     wan:
       hidden_dim: 768
@@ -72,7 +60,6 @@ framework:
       eps: 1.0e-6
       init_path: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/WanActionBackbone_dimB_16L_first.pt
     #######
-    # 中文注释：exp5 tricks 开——correlated noise（β=0.5）+ multi-step FM（20）。Wan 头同样读这些开关。
     use_correlated_noise: true
     correlation_beta: 0.5
     flow_matching_steps: 20
@@ -86,17 +73,16 @@ framework:
     noise_s: 0.999
     repeated_diffusion_steps: 1
     #######
-    # 中文注释：backbone=wan 时下面 diffusion_model_cfg 不被使用（不构建 GR00T DiT），保留仅为与 exp5 结构对齐。
     diffusion_model_cfg:
       cross_attention_dim: 2048
-      dropout: 0.2    # 与 gr00t baseline 同结构(原 0.1)
+      dropout: 0.2
       final_dropout: true
       interleave_self_attention: true
       norm_type: ada_norm
-      num_layers: 16    # 与 gr00t baseline 同结构(原 24)
+      num_layers: 16
       num_attention_heads: 12
       attention_head_dim: 64
-      output_dim: 1024    # 与 gr00t baseline 同结构(原 768)
+      output_dim: 1024
       positional_embeddings: null
   visual_model:
     d_dino: 384
@@ -124,19 +110,17 @@ datasets:
     include_state: false
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     #######
-    # 中文注释：大 batch——2B 显存富裕，per_device 提到 16（exp2/3 是 8）。
     per_device_batch_size: 16
     #######
     load_all_data_for_training: true
     video_backend: torchvision_av
     online_dino: true
-    dino_target_latents: true    # hybrid: 在线出 raw 图给 Qwen 原生视觉 + 读预存 DINO latent 当世界模型 target(省在线抽取)
+    dino_target_latents: true
     world_model:
       future_stride: 8
 
 trainer:
   #######
-  # 中文注释：大 batch → 等量样本约 50k 步即够；设 60000 多留 ~10k 饱和测试（不强求整除）。
   max_train_steps: 60000
   num_warmup_steps: 3000
   save_interval: 5000
@@ -145,7 +129,7 @@ trainer:
   learning_rate:
     base: 2.5e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 5.0e-05    # 稳定性修复: action head lr 1e-4→5e-5(发散组件是 action head)
+    action_model: 5.0e-05
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
@@ -155,7 +139,7 @@ trainer:
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 100
-  log_grad_norms: true    # 梯度记录总开关(per-task grad_norm_{total,shared,head}/<task>)；不需要看时改 false
+  log_grad_norms: true
   gradient_clipping: 1.0
   gradient_accumulation_steps: 8
   gradient_checkpointing: true

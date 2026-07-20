@@ -158,6 +158,10 @@ class ModelClient:
         execution_horizon = self.replan_steps
 
         if step % execution_horizon == 0 or self.raw_actions is None:
+            # Specialized checkpoint adapters may add model-specific,
+            # per-query controls (for example a deterministic Co-Flow seed).
+            # The standard RoboTwin path remains unchanged.
+            vla_input.update(self._extra_inference_request_kwargs())
             response = self.client.predict_action(vla_input)
             # server already un-normalized via training-time transform
             raw_actions = np.array(response["data"]["actions"][0])  # (chunk, D)
@@ -209,6 +213,9 @@ class ModelClient:
 
     def _prepare_action_for_env(self, action: np.ndarray) -> np.ndarray:
         return action[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]
+
+    def _extra_inference_request_kwargs(self) -> dict:
+        return {}
 
     def _resize_image(self, image: np.ndarray) -> np.ndarray:
         image = cv.resize(image, tuple(self.image_size), interpolation=cv.INTER_AREA)

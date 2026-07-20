@@ -1,23 +1,16 @@
 # Copyright 2025 starVLA community. All rights reserved.
 # Licensed under the MIT License.
-"""WAM World→Action guidance building blocks.
+"""Self-contained building blocks for dual-query World-to-Action guidance.
 
-中文注释：World→Action 引导大计划（M0–M6+）的统一构件库。所有模块都是自包含、可单测的
-nn.Module，不引用 QwenGR00T；由 QwenGR00T 在 ``framework.wam.guidance.enabled=true`` 时
-实例化并编排。默认全关时这里的任何代码都不会被构造/调用，保证旧 WAM/原生 QwenGR00T 行为不变。
+The modules do not import ``QwenGR00T`` and are instantiated only when
+``framework.wam.guidance.enabled=true``. Disabling guidance therefore retains
+legacy WAM and native QwenGR00T behavior.
 
-设计原则（与 plan §2 对齐）：
-  - 保留原始 action 条件 M_a=[h_act; H_qwen-context]，world 信号只「增」不「删」；
-  - 直接 guidance 用 passive world（o_t,l,Q_W→ẑ_{t+H}），不引入需动作输入的 FDM；
-  - 提供双 query 控制组所需的 fusion / 压缩 / pooling / bridge 构件。
-
-各构件与实验的对应关系：
-  WorldTokenAdapter  —— M1.2/M1.3：把 DINO 潜变量(d_dino) 或 h_future(d_model) 投到 action DiT
-                        cross-attn 维度（= Qwen hidden），并做 LN 归一化对齐尺度。
-  CompactSAFusion    —— M2：只对 [h_act; h_future] 做轻量 self-attention 融合，再拼回 Qwen context。
-  WorldQFormer       —— M3：把变长空间 world tokens(如 196 个 DINO patch) 压成 n_query 个 learned token。
-  WorldTokenPooler   —— M6：把空间 world tokens 池化成单个全局向量，喂给 action DiT 的 AdaLN。
-  mix_world_tokens   —— DIAL warm-up：按 oracle_ratio 在 oracle / predicted world 间逐样本混合。
+The original action memory ``[h_act; qwen_context]`` is always retained. World
+features are additive conditions, and the passive predictor avoids an
+action-conditioned ``action -> world -> action`` shortcut. The module provides
+the projection, compact fusion, Q-Former, pooling, and scheduled-bridge
+components used by the M0--M6+ ablations.
 """
 
 from __future__ import annotations
@@ -30,17 +23,14 @@ from torch import nn
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  WorldCondition：QwenGR00T 组装好后传给 action head 的统一容器
 # ──────────────────────────────────────────────────────────────────────
 @dataclass
 class WorldCondition:
-    """统一的 world 条件容器（plan §4.1）。
+    """Canonical world condition passed to the action branch.
 
-    tokens:        [B, N_w, D_cross] 空间 world tokens，作 action DiT 的 cross-attn memory
-                   （M1.x concat 走 action memory 拼接；M4/M5 走 dual/alternate cross-attn）。
-    mask:          [B, N_w] bool，True=有效（与 attention keep-mask 同口径）。None=全有效。
-    global_vector: [B, D_cross] 池化后的全局 world 向量，喂 AdaLN（M6/M6+）。
-    source:        "predicted" | "oracle" | "scheduled" | "none"，仅作日志/调试标记。
+    ``tokens`` are spatial cross-attention memory, ``mask`` is a boolean keep
+    mask, and ``global_vector`` is the pooled AdaLN condition. ``source`` is
+    diagnostic metadata and does not alter computation.
     """
 
     tokens: Optional[torch.Tensor] = None
@@ -53,15 +43,13 @@ class WorldCondition:
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  WorldTokenAdapter —— 投影 world 信号到 action cross-attn 维度（M1.2/M1.3）
 # ──────────────────────────────────────────────────────────────────────
 class WorldTokenAdapter(nn.Module):
-    """把 world 信号投到 action DiT 的 cross-attn 维度。
+    """Normalize and project world features into the action cross-attention space.
 
-    中文注释：world 信号有两种尺度——① DINO 潜变量（d_dino≈384，原始/标准化尺度）；
-    ② h_future（Qwen hidden，d_model）。两者进入 action memory 前都要对齐到 cross_attention_dim
-    （= Qwen hidden）。LN 先把不同来源拉到可比尺度，再两层 MLP 投影。in==out 时仍保留 LN+MLP，
-    让 world 信号与 h_act 的统计量更接近（h_act 来自 Qwen 末层，world 来自 DINO/中间层）。
+    The LayerNorm and MLP remain active even when input and output dimensions
+    match so DINO, intermediate-Qwen, and final-Qwen feature statistics can be
+    aligned explicitly.
     """
 
     def __init__(self, in_dim: int, out_dim: int, hidden_dim: Optional[int] = None, dropout: float = 0.0):
@@ -81,14 +69,12 @@ class WorldTokenAdapter(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  CompactSAFusion —— [h_act; h_future] 轻量自注意力融合（M2）
 # ──────────────────────────────────────────────────────────────────────
 class CompactSAFusion(nn.Module):
-    """对 action query 与 future query 的拼接做轻量 self-attention 融合。
+    """Fuse ``[h_act; h_future]`` with a compact pre-norm attention stack.
 
-    中文注释（plan §5 M2）：只对 [h_act; h_future]（都在 Qwen hidden 维）做几层 SA，让两组 query
-    互通信息，再由调用方与原始 Qwen context 拼成 action memory。**不要**对全部 Qwen hidden +
-    196 个 DINO token 做全量 SA（开销大且偏离「轻量」初衷）。pre-norm 残差结构。
+    Only the two query groups participate; raw Qwen context and dense DINO
+    tokens stay outside this intentionally lightweight fusion module.
     """
 
     def __init__(self, dim: int, num_layers: int = 2, num_heads: int = 8, dropout: float = 0.0):
@@ -107,7 +93,6 @@ class CompactSAFusion(nn.Module):
             )
 
     def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # x: [B, N, dim]; key_padding_mask: [B, N] True=忽略(pad)。返回同形状融合后序列。
         for blk in self.layers:
             xn = blk["norm1"](x)
             attn_out, _ = blk["attn"](xn, xn, xn, key_padding_mask=key_padding_mask, need_weights=False)
@@ -117,13 +102,12 @@ class CompactSAFusion(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  WorldQFormer —— 空间 world tokens 压缩成固定数量 learned token（M3）
 # ──────────────────────────────────────────────────────────────────────
 class WorldQFormer(nn.Module):
-    """用 n_query 个 learned query 通过 cross-attention 压缩变长空间 world tokens。
+    """Compress spatial world tokens with learned cross-attention queries.
 
-    中文注释（plan §5 M3）：Q-Former 只作用于**空间 DINO tokens**（不要作用于已压缩的 h_future）。
-    每层 = (learned query → cross-attn 到 world tokens) + FFN，pre-norm 残差。输出 [B, n_query, out_dim]。
+    The Q-Former operates on dense DINO tokens, not the already compact
+    ``h_future`` representation, and returns ``[B, n_query, out_dim]``.
     """
 
     def __init__(
@@ -154,7 +138,6 @@ class WorldQFormer(nn.Module):
             )
 
     def forward(self, world: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # world: [B, N, in_dim]; key_padding_mask: [B, N] True=忽略。返回 [B, n_query, out_dim]。
         bsz = world.shape[0]
         kv = self.in_proj(world)
         q = self.query.unsqueeze(0).expand(bsz, -1, -1).to(kv.dtype)
@@ -168,13 +151,13 @@ class WorldQFormer(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  WorldTokenPooler —— 空间 world tokens 池化成全局向量（M6 AdaLN）
 # ──────────────────────────────────────────────────────────────────────
 class WorldTokenPooler(nn.Module):
-    """learned-query attention pooling：把空间 world tokens 池化成单个全局向量。
+    """Pool spatial world tokens into one learned-query global vector.
 
-    中文注释（plan §5 M6）：输出向量交给 action DiT 的 world_to_temb，加到 timestep embedding 上
-    驱动 AdaLN。用单 learned query 的 attention pool（比 mean-pool 更能聚焦动态区域）。
+    The action DiT maps this vector into its timestep embedding for AdaLN
+    conditioning. Learned attention can focus on dynamic regions more readily
+    than an unconditional mean.
     """
 
     def __init__(self, dim: int, out_dim: Optional[int] = None, num_heads: int = 8):
@@ -195,7 +178,6 @@ class WorldTokenPooler(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  bridge —— DIAL 风格 oracle/predicted 混合（warm-up Stage 1→3）
 # ──────────────────────────────────────────────────────────────────────
 def mix_world_tokens(
     predicted: Optional[torch.Tensor],
@@ -203,12 +185,11 @@ def mix_world_tokens(
     oracle_ratio: float,
     generator: Optional[torch.Generator] = None,
 ) -> Optional[torch.Tensor]:
-    """逐样本伯努利在 oracle / predicted world 之间选择（plan §6 scheduled bridge）。
+    """Select oracle or predicted world tokens independently per sample.
 
-    中文注释：oracle_ratio=1.0 全用 oracle（Stage 1 decoupled warm-up）；0.0 全用 predicted
-    （Stage 2/3）；中间值按样本独立以 oracle_ratio 概率取 oracle，让 action branch 平滑适应
-    预测误差。要求 predicted 与 oracle 形状一致（M1.2/M1.3 下两者都是 [B, N_patch, d_dino]，
-    天然对齐）。逐样本硬选择（非特征插值），避免造出训练分布外的「半真半假」潜变量。
+    A ratio of one implements decoupled oracle warmup; zero uses predictions
+    exclusively. Intermediate ratios perform hard sample-level selection, not
+    feature interpolation, so no out-of-distribution hybrid latent is created.
     """
     if predicted is None:
         return oracle
@@ -264,16 +245,15 @@ def scale_gradient(x: torch.Tensor, scale: float) -> torch.Tensor:
 
 
 def shuffle_along_batch(x: torch.Tensor, generator: Optional[torch.Generator] = None) -> torch.Tensor:
-    """batch 内打乱（plan §11 因果消融 Shuffled World）。
+    """Shuffle world conditions across samples for the causal-use ablation.
 
-    中文注释：把 world 信号在 batch 维 roll/permute，使每个样本拿到「别人的未来」。若 action 真在
-    用 world，shuffle 后 SR 应明显下降；否则说明 world 被忽略。保证至少错排（避免恒等置换）。
+    The permutation is forced to be non-identity so each sample receives an
+    incorrect future whenever the batch contains more than one sample.
     """
     bsz = x.shape[0]
     if bsz <= 1:
         return x
     perm = torch.randperm(bsz, device=x.device, generator=generator)
-    # 避免恰好恒等置换（小 batch 时概率不可忽略）
     if bool(torch.all(perm == torch.arange(bsz, device=x.device))):
         perm = torch.roll(perm, shifts=1, dims=0)
     return x[perm]

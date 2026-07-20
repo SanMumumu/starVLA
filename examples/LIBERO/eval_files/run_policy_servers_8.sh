@@ -30,7 +30,6 @@ if [[ ! -f "${CKPT}" ]]; then
   exit 1
 fi
 
-# 只过滤一次，避免 8 个 server 同时写 strip ckpt 互相踩。
 if [[ "${STRIP_DINO_KEYS}" == "1" ]]; then
   CKPT_FOR_SERVER="$(
     CKPT="${CKPT}" "${STARVLA_PYTHON}" - <<'PYFILTER'

@@ -376,10 +376,6 @@ DATASET_NAMED_MIXTURES = {
 }
 
 #######
-# 中文注释：robotwin_all_32 —— 与 robotwin_all_50 完全相同的 100 任务集，但 robot_type 换成 "robotwin32"
-# （horizon=32）。RoboTwin 实验统一在 horizon 32 下对照：OFT baseline 走 lerobot_datasets，horizon 由
-# DataConfig.action_indices 决定，必须用 robotwin32 标签；WAM 走 jointflow 用 config.action_horizon 覆盖，
-# 但用同一 mix 名/同一任务集/同一 keys&transforms 保证完全对齐。惰性派生避免 100 行任务清单重复随上游漂移。
 DATASET_NAMED_MIXTURES["robotwin_all_32"] = [
     (path, weight, "robotwin32") for (path, weight, _robot_type) in DATASET_NAMED_MIXTURES["robotwin_all_50"]
 ]

@@ -1,9 +1,4 @@
 #######
-# 中文注释：exp8 = exp5（2B + tricks + 大 batch + policy）+ Passive（预测 **Δdino**,**无语言**,**无动作条件**）。
-# 三组对照 {exp7 / exp8 / exp9}（监督 target 固定 Δdino,不随是否有动作改变——用户意图）:
-#   exp7 = FDM,有 act_ctx → 预测 Δdino;  exp8 = Passive,无动作 → 预测 **Δdino(同 target!)**;  exp9 = 无世界模型(policy only)。
-# exp7 vs exp8 单变量只差「动作条件 act_ctx」→ 干净判断「动作能否塑造更好表征」。
-# Passive = flow-query 单独预测 Δdino(不拼动作)。共同点:2B/bigbs/tricks、Δdino target、世界模型分支去语言、辅助权重 0.2;policy 分支永远带语言。
 #######
 run_id: starvla_wam_exp8_2b_bigbs_policy_passive_nolang
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
@@ -26,13 +21,10 @@ framework:
     placeholder_token: "<ACT_PH>"
     dino_loss_weight: 0.01
     #######
-    # 中文注释：passive 也预测 Δdino（与 exp7 fdm 同 target,只差没有 act_ctx）。fdm_delta_dino 现已对 fdm+passive 都生效(见 _wam_forward)。
     fdm_delta_dino: true
-    # 世界模型分支(passive)去语言:prompt 只 image + flow 占位,不含指令。policy 分支照常带语言。
     world_model_no_language: true
     #######
   #######
-  # 中文注释：exp8 = policy + passive（flow-query 单独预测绝对未来 DINO,无动作条件）。passive 权重 0.2(辅助塑造表征,核心 policy)。
   tasks:
     weights:
       policy: 1.0
@@ -58,7 +50,6 @@ framework:
     action_horizon: 8
     n_action_query: 32
     #######
-    # 中文注释：exp6 tricks 开（与 exp5 一致）——correlated noise（β=0.5）+ multi-step FM（20）。
     use_correlated_noise: true
     correlation_beta: 0.5
     flow_matching_steps: 20
@@ -73,14 +64,14 @@ framework:
     repeated_diffusion_steps: 1
     diffusion_model_cfg:
       cross_attention_dim: 2048
-      dropout: 0.2    # 与 gr00t baseline 同结构(原 0.1)
+      dropout: 0.2
       final_dropout: true
       interleave_self_attention: true
       norm_type: ada_norm
-      num_layers: 16    # 与 gr00t baseline 同结构(原 24)
+      num_layers: 16
       num_attention_heads: 12
       attention_head_dim: 64
-      output_dim: 1024    # 与 gr00t baseline 同结构(原 768)
+      output_dim: 1024
       positional_embeddings: null
   visual_model:
     d_dino: 384
@@ -108,19 +99,17 @@ datasets:
     include_state: false
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     #######
-    # 中文注释：大 batch——与 exp5 一致 per_device=16（2B 显存富裕）。
     per_device_batch_size: 16
     #######
     load_all_data_for_training: true
     video_backend: torchvision_av
     online_dino: true
-    dino_target_latents: true    # hybrid: 在线出 raw 图给 Qwen 原生视觉 + 读预存 DINO latent 当世界模型 target(省在线抽取)
+    dino_target_latents: true
     world_model:
       future_stride: 8
 
 trainer:
   #######
-  # 中文注释：与 exp5 一致——大 batch ~50k 即等量，设 60000 多留 ~10k 饱和测试（不强求整除）。
   max_train_steps: 60000
   num_warmup_steps: 3000
   save_interval: 5000
@@ -129,7 +118,7 @@ trainer:
   learning_rate:
     base: 2.5e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 5.0e-05    # 稳定性修复: action head lr 1e-4→5e-5(发散组件是 action head)
+    action_model: 5.0e-05
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
@@ -139,7 +128,7 @@ trainer:
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 100
-  log_grad_norms: true    # 梯度记录总开关(per-task grad_norm_{total,shared,head}/<task>)；不需要看时改 false
+  log_grad_norms: true
   gradient_clipping: 1.0
   gradient_accumulation_steps: 8
   gradient_checkpointing: true

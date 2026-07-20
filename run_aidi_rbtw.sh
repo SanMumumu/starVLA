@@ -13,7 +13,6 @@ export WANDB_SILENT=${WANDB_SILENT:-true}
 export WANDB__SERVICE_WAIT=${WANDB__SERVICE_WAIT:-300}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Submission-host layout from 执行脚本/集群路径.txt:
 #   starvla_dev/run_aidi_rbtw.sh
 #   starvla_dev/starVLA/{examples,deployment,starVLA,...}
 # Keep repository discovery compatible with an in-repo launcher too, but all
@@ -60,6 +59,14 @@ worker_main() {
   local master_port="${MASTER_PORT:-29600}"
   local gpus_per_node="${GPUS_PER_NODE:-8}"
   local total_gpus=$((num_machines * gpus_per_node))
+  [[ "${num_machines}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "[AIDI][ERROR] invalid NUM_MACHINES=${num_machines}" >&2
+    exit 1
+  }
+  [[ "${machine_rank}" =~ ^[0-9]+$ && "${machine_rank}" -lt "${num_machines}" ]] || {
+    echo "[AIDI][ERROR] invalid MACHINE_RANK=${machine_rank} for NUM_MACHINES=${num_machines}" >&2
+    exit 1
+  }
 
   export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
   export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0}
@@ -100,19 +107,107 @@ resolve_task() {
   fi
 }
 
+infer_num_machines_from_config() {
+  local config_yaml="${1:?missing config yaml}"
+  local gpus_per_node="${2:-8}"
+  python3 - "${config_yaml}" "${gpus_per_node}" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+config_path = Path(sys.argv[1])
+gpus_per_node = int(sys.argv[2])
+config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+trainer = (config or {}).get("trainer") or {}
+declared_global = trainer.get("expected_global_batch_size")
+if declared_global is None:
+    raise SystemExit(0)
+data = ((config or {}).get("datasets") or {}).get("vla_data") or {}
+micro = int(data["per_device_batch_size"])
+accumulation = int(trainer.get("gradient_accumulation_steps", 1))
+declared_global = int(declared_global)
+denominator = micro * accumulation * gpus_per_node
+if min(micro, accumulation, gpus_per_node, declared_global) <= 0:
+    raise SystemExit(
+        f"invalid batch topology: global={declared_global}, micro={micro}, "
+        f"accumulation={accumulation}, gpus_per_node={gpus_per_node}"
+    )
+if declared_global % denominator != 0:
+    raise SystemExit(
+        f"expected_global_batch_size={declared_global} is not divisible by "
+        f"micro({micro})*accumulation({accumulation})*gpus_per_node({gpus_per_node})"
+    )
+print(declared_global // denominator)
+PY
+}
+
 controller_main() {
   local config_arg="${1:?usage: run_aidi_rbtw.sh CONFIG_YAML}"
+  local config_yaml
+  if [[ "${config_arg}" = /* ]]; then
+    config_yaml="${config_arg}"
+  else
+    config_yaml="${REPO_ROOT}/${config_arg}"
+  fi
+  [[ -f "${config_yaml}" ]] || {
+    echo "[AIDI][ERROR] controller cannot find config: ${config_yaml}" >&2
+    exit 1
+  }
   local hostname_now="${HOSTNAME:-$(hostname)}"
   local current_index
   current_index="$(sed -n 's/.*-task-\([0-9]\+\)$/\1/p' <<<"${hostname_now}")"
   [[ -n "${current_index}" ]] || { echo "[AIDI][ERROR] cannot parse task index: ${hostname_now}"; exit 1; }
 
-  local num_machines
-  if [[ -n "${LAST_INDEX:-}" ]]; then
+  local gpus_per_node="${GPUS_PER_NODE:-8}"
+  local config_num_machines
+  if ! config_num_machines="$(infer_num_machines_from_config "${config_yaml}" "${gpus_per_node}")"; then
+    echo "[AIDI][ERROR] failed to infer topology from ${config_yaml}" >&2
+    exit 1
+  fi
+
+  local num_machines topology_source
+  if [[ -n "${EXPECTED_NUM_MACHINES:-}" ]]; then
+    [[ "${EXPECTED_NUM_MACHINES}" =~ ^[1-9][0-9]*$ ]] || {
+      echo "[AIDI][ERROR] EXPECTED_NUM_MACHINES must be a positive integer, got ${EXPECTED_NUM_MACHINES}" >&2
+      exit 1
+    }
+    num_machines="${EXPECTED_NUM_MACHINES}"
+    topology_source="environment"
+    if [[ -n "${config_num_machines}" && "${config_num_machines}" -ne "${num_machines}" ]]; then
+      echo "[AIDI][ERROR] EXPECTED_NUM_MACHINES=${num_machines} disagrees with config-derived machines=${config_num_machines}" >&2
+      exit 1
+    fi
+    if [[ -n "${LAST_INDEX:-}" ]]; then
+      [[ "${LAST_INDEX}" =~ ^[0-9]+$ ]] || {
+        echo "[AIDI][ERROR] invalid LAST_INDEX=${LAST_INDEX}" >&2
+        exit 1
+      }
+      if (( LAST_INDEX + 1 != num_machines )); then
+        echo "[AIDI][WARN] LAST_INDEX=${LAST_INDEX} disagrees with authoritative machines=${num_machines}; probing all expected task pods" >&2
+      fi
+    fi
+    if (( current_index >= num_machines )); then
+      echo "[AIDI][ERROR] controller task index ${current_index} is outside expected ${num_machines} machines" >&2
+      exit 1
+    fi
+  elif [[ -n "${config_num_machines}" ]]; then
+    num_machines="${config_num_machines}"
+    topology_source="training-config"
+    if [[ -n "${LAST_INDEX:-}" && "${LAST_INDEX}" =~ ^[0-9]+$ ]] && (( LAST_INDEX + 1 != num_machines )); then
+      echo "[AIDI][WARN] LAST_INDEX=${LAST_INDEX} disagrees with config-derived machines=${num_machines}; probing all expected task pods" >&2
+    fi
+  elif [[ -n "${LAST_INDEX:-}" ]]; then
+    [[ "${LAST_INDEX}" =~ ^[0-9]+$ ]] || {
+      echo "[AIDI][ERROR] invalid LAST_INDEX=${LAST_INDEX}" >&2
+      exit 1
+    }
     num_machines=$((LAST_INDEX + 1))
+    topology_source="LAST_INDEX"
   else
     # AIDI executes RUN_SCRIPTS on the last task, so its index is N-1.
     num_machines=$((current_index + 1))
+    topology_source="controller-index"
   fi
 
   local prefix="${hostname_now%-task-*}"
@@ -124,16 +219,16 @@ controller_main() {
   master_addr="$(getent hosts "${master_host}" | awk 'NR == 1 {print $1}')"
   local master_port="${MASTER_PORT:-29600}"
 
-  echo "[AIDI] controller host=${hostname_now} machines=${num_machines} master=${master_addr}:${master_port}"
+  echo "[AIDI] controller host=${hostname_now} machines=${num_machines} source=${topology_source} env_expected=${EXPECTED_NUM_MACHINES:-unset} config_expected=${config_num_machines:-unset} master=${master_addr}:${master_port}"
 
   local pids=()
   local index host command
   for ((index = 0; index < num_machines; index++)); do
     host="$(resolve_task "${prefix}" "${namespace}" "${index}")"
     printf -v command \
-      'export WORKING_PATH=%q NUM_MACHINES=%q MACHINE_RANK=%q MASTER_ADDR=%q MASTER_PORT=%q GPUS_PER_NODE=8 DINOV3_WEIGHTS=%q; bash %q --worker %q' \
+      'export WORKING_PATH=%q NUM_MACHINES=%q MACHINE_RANK=%q MASTER_ADDR=%q MASTER_PORT=%q GPUS_PER_NODE=%q DINOV3_WEIGHTS=%q; bash %q --worker %q' \
       "${PACKAGE_ROOT}" "${num_machines}" "${index}" "${master_addr}" "${master_port}" \
-      "${DINOV3_WEIGHTS:-}" "${SCRIPT_PATH}" "${config_arg}"
+      "${gpus_per_node}" "${DINOV3_WEIGHTS:-}" "${SCRIPT_PATH}" "${config_arg}"
 
     echo "[AIDI] launch task-${index}: ${host}"
     if [[ "${index}" -eq "${current_index}" ]]; then
@@ -155,7 +250,16 @@ controller_main() {
   return "${status}"
 }
 
-if [[ "${1:-}" == "--worker" ]]; then
+if [[ "${1:-}" == "--infer-topology" ]]; then
+  shift
+  config_arg="${1:?missing config path}"
+  if [[ "${config_arg}" = /* ]]; then
+    config_yaml="${config_arg}"
+  else
+    config_yaml="${REPO_ROOT}/${config_arg}"
+  fi
+  infer_num_machines_from_config "${config_yaml}" "${GPUS_PER_NODE:-8}"
+elif [[ "${1:-}" == "--worker" ]]; then
   shift
   worker_main "${1:?missing worker config}"
 else

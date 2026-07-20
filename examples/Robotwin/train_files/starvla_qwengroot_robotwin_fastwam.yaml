@@ -45,9 +45,6 @@ framework:
     flow_time_sampling: gr00t
 
     use_correlated_noise: false
-    correlation_beta: 0.5
-    correlation_num_samples: 4096
-    correlation_matrix_type: correlation
     num_target_vision_tokens: 32
 
     diffusion_model_cfg:
@@ -79,21 +76,28 @@ datasets:
     sequential_step_sampling: false
     balance_dataset_weights: false
     balance_trajectory_weights: false
-    per_device_batch_size: 16
+    # 8 machines x 8 GPUs x 12 samples = global batch 768.
+    per_device_batch_size: 12
 
     load_all_data_for_training: true
     # PIL size is [width, height]; the FastWAM composite is exactly 320x384.
     obs_image_size: [320, 384]
     video_backend: pyav
-    num_workers: 8
+    # Four loader workers per rank = 32 processes/node on an 8-GPU node.
+    num_workers: 4
     prefetch_factor: 2
     pin_memory: true
     persistent_workers: false
 
 trainer:
+  # Controlled baseline/WAM ablation: initialize the policy from seed 42
+  # before model construction (the historical trainer seeded only afterward).
+  seed_before_model_init: true
+  expected_global_batch_size: 768
   max_train_steps: 80000
   num_warmup_steps: 2000
   save_interval: 10000
+  action_eval_enabled: true
   eval_interval: 1000
 
   learning_rate:

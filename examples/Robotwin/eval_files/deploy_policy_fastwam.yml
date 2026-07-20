@@ -7,10 +7,16 @@ instruction_type: unseen
 
 # Checkpoint-compatible FastWAM client: one 384x320 composite image,
 # checkpoint-declared optional 14-D proprio, release-order action vectors,
-# and a 24/32 execution horizon.
+# and a checkpoint-valid execution horizon.  The Co-Flow fields are request
+# controls; null preserves every non-Co-Flow/FastWAM checkpoint path.
 host: "127.0.0.1"
 port: 5694
 unnorm_key: "new_embodiment"
 action_mode: "abs"
 normalization_mode: "fastwam_zscore"
 replan_steps: 24
+wam_expected_phase: null
+wam_expected_world_to_action: null
+coflow_inference_mode: null
+coflow_inference_horizon: null
+coflow_inference_seed: null

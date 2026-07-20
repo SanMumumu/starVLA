@@ -1,17 +1,19 @@
 #######
-# Strict Stage 1/2: 80k structured future-DINO predictor warmup, IID only.
+# Corrected WAM experiment: every IID batch jointly optimizes policy + world,
+# while the action loss is strictly detached from the visual world predictor.
 #
-# Shared baseline contract: 50 Hz, z-score, action chunk 32, one 320x384
-# FastWAM composite, current 14-D proprio, release-order actions, 8x8x12 batch,
-# seeded 99/1 split and without-replacement global-frame sampling.
-# Every batch trains action + world prediction.  The action branch calls the
-# exact native IID-baseline Qwen context/action-loss path.  A second, detached
-# dual-query Qwen pass conditions only the future predictor and runs in a
-# forked RNG domain; gates stay closed until Stage 2.
+# Key contracts:
+#   - full FastWAM release, 50 Hz, z-score, H=32, state=true
+#   - IID action/world noise only (no correlation Cholesky)
+#   - one Qwen forward and both losses on every optimizer step
+#   - action consumes predicted future from step 0, but cannot update
+#     wam_visual_head or its future-query conditioning through that prediction
+#   - direct JiT-x clean-DINO + cosine supervision and balanced change weights
+#   - fixed held-out 1% episode split; sampled future-token MSE every 5k steps
 #######
 
-run_id: robotwin_wam_m5_fastwam_baselinepreserve_warmup_rand_state_h32_dinojitx_iid_80k
-run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin_baselinepreserve
+run_id: robotwin_wam_m5_fastwam_joint_detached_iid_state_h32_dinojitx_100k
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin
 seed: 42
 wandb_entity: axi-the-cat
 wandb_project: starVLA_Robotwin
@@ -29,8 +31,7 @@ framework:
 
   wam:
     enabled: true
-    # Match the native baseline Action DiT execution path.
-    action_gradient_checkpointing: false
+    action_gradient_checkpointing: true
     visual_gradient_checkpointing: true
     placeholder_token: "<ACT_PH>"
     dino_loss_weight: 0.1
@@ -42,15 +43,12 @@ framework:
       prompt_mode: dual_query
       exclude_post_query_context: true
       bridge_source: predicted
+      # Predictor and h_future are evaluated under no_grad for the action path.
+      # The independent world loss below still updates them on every batch.
       detach_world: true
+      # Match deployment exactly: the detached action condition is sampled
+      # without visual-head dropout, then train mode is restored for world loss.
       detached_prediction_eval_mode: true
-      action_world_bypass: true
-      # Policy is primary: action loss updates Qwen exactly as in the IID baseline.
-      detach_action_backbone: false
-      # Auxiliary future-DINO loss updates only visual head + state conditioner.
-      detach_world_backbone: true
-      # Policy train/eval uses the exact native baseline Qwen hidden sequence.
-      baseline_action_context: true
       oracle_ratio: 0.0
       n_world_tokens: 64
       qformer_layers: 2
@@ -58,10 +56,13 @@ framework:
       gate_init: 0.0
       log_gate_openness: true
       world_dropout: 0.0
+      # Unlike the historical WAM path, the future-DINO predictor explicitly
+      # receives the same normalized 14-D proprio state as the action head.
       world_condition_on_state: true
       include_context_in_action_memory: true
-      # Stage 2 gated world memory is [predicted-future; Qwen image/language context].
-      include_context_in_world_memory: true
+      # Action already has [h_act; Qwen context]; world memory contains only
+      # projected predicted-future DINO tokens.
+      include_context_in_world_memory: false
       action_world_gradient_ramp:
         enabled: false
         start_step: 0
@@ -80,12 +81,9 @@ framework:
     name: dinov3_vitl16
     model_size: large
     hf_model_id: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO/
-    # Complete HF snapshot of facebook/dinov3-vitl16-pretrain-lvd1689m.
-    # FastWAM does not ship precomputed DINO targets. The future 384x320
-    # three-camera composite is encoded once; the frozen teacher is excluded from checkpoints.
     weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO/
     loader: hf
-    image_size: [384, 320]  # DINO tensor order: [height, width]; preserve the composite exactly.
+    image_size: [384, 320]
     patch_size: 16
     embed_dim: 1024
     future_view_keys: ["video.robotwin_composite"]
@@ -99,11 +97,9 @@ framework:
     hidden_size: 1024
     add_pos_embed: true
     max_seq_len: 1024
-
     action_dim: 14
     state_dim: 14
     action_horizon: 32
-
     repeated_diffusion_steps: 2
     noise_beta_alpha: 1.5
     noise_beta_beta: 1.0
@@ -113,10 +109,9 @@ framework:
     prediction_type: jit_x
     jit_t_eps: 0.05
     flow_time_sampling: gr00t
-
+    # Strict IID-only experiment: no correlation matrix is read or estimated.
     use_correlated_noise: false
     num_target_vision_tokens: 32
-
     diffusion_model_cfg:
       cross_attention_dim: 2048
       dropout: 0.2
@@ -143,10 +138,14 @@ framework:
     noise_beta_beta: 1.0
     noise_s: 0.999
     num_timestep_buckets: 1000
+    # The action-conditioning path, live inference and held-out validation all
+    # use this same 10-step world solver.
     num_inference_timesteps: 10
     prediction_type: jit_x
     jit_t_eps: 0.05
     flow_time_sampling: gr00t
+    # Direct clean-token and semantic-direction targets make structure an
+    # explicit objective rather than relying on velocity MSE alone.
     clean_target_loss_weight: 1.0
     cosine_loss_weight: 0.1
     patch_weighting: change_balanced
@@ -164,57 +163,44 @@ datasets:
     fastwam_split: train
     fastwam_split_seed: 42
     fastwam_direct_frame_sampling: true
-
-    # Decode all three t+32 views, rebuild the exact FastWAM composite, then
-    # encode that single 320x384 future composite with DINO-L.
     fastwam_wam_targets: true
     fastwam_wam_target: composite
     fastwam_future_stride: 32
-
-    # Match the state-conditioned, already-trained 80k checkpoint recorded in
     include_state: true
     action_type: abs_qpos
     action_mode: abs
     sequential_step_sampling: false
     balance_dataset_weights: false
     balance_trajectory_weights: false
-    # 8 machines x 8 GPUs x 12 samples = global batch 768.
-    per_device_batch_size: 12
-
+    per_device_batch_size: 16
     load_all_data_for_training: true
     obs_image_size: [320, 384]
     video_backend: pyav
-    # Bound process fan-out to 32 train-loader workers per 8-GPU node.
-    num_workers: 4
+    num_workers: 8
     prefetch_factor: 2
     pin_memory: true
     persistent_workers: false
 
 trainer:
-  seed_before_model_init: true
-  expected_global_batch_size: 768
-  wam_two_stage_phase: predictor_warmup
-  wam_two_stage_recipe: baseline_preserving_v3
-  max_train_steps: 80000
-  # Match starvla_qwengroot_robotwin_fastwam.yaml exactly.
-  num_warmup_steps: 2000
+  max_train_steps: 100000
+  num_warmup_steps: 4000
   save_interval: 10000
-  # Preserve the baseline's native action-eval cadence and batch/RNG stream.
-  action_eval_enabled: true
-  eval_interval: 1000
+  # Disable the old current-train-batch action MSE hook; use the fixed held-out
+  # world validation below and RoboTwin rollout checkpoints for policy quality.
+  action_eval_enabled: false
+  eval_interval: 5000
   world_validation:
     enabled: true
     interval: 5000
     task: joint_detached
     per_device_batch_size: 2
-    num_workers: 2
+    num_workers: 4
     num_batches: 4
     num_samples: 1
     num_inference_timesteps: 10
     seed: 2027
   pretrained_checkpoint: null
   is_resume: false
-  # Future reruns can resume Adam/DeepSpeed/LR exactly from steps_*_state.
   save_full_training_state: true
 
   learning_rate:
@@ -228,21 +214,19 @@ trainer:
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 5.0e-07
-
   freeze_modules: ''
-
   loss_scale:
     vla: 1.0
-
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 200
+  # One scalar all-reduce every logging step verifies that world reconstruction
+  # really produces gradients on wam_visual_head under ZeRO-2.
   log_grad_norms: true
   log_global_grad_norm: true
   deepspeed_skip_unused_param_anchors: true
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
-
   optimizer:
     name: AdamW
     betas: [0.9, 0.95]

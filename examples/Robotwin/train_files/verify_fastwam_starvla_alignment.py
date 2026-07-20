@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static audit of the IID/corrnoise FastWAM checkpoint contract."""
+"""Static audit of the IID-only FastWAM checkpoint contract."""
 
 from __future__ import annotations
 
@@ -11,10 +11,9 @@ import yaml
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
+RUNBOOK_DIR_NAME = "\u6267\u884c\u811a\u672c"
 IID_PATH = HERE / "starvla_qwengroot_robotwin_fastwam.yaml"
-CORR_PATH = HERE / "starvla_qwengroot_robotwin_fastwam_corrnoise.yaml"
 DEPLOY_PATH = REPO_ROOT / "examples/Robotwin/eval_files/deploy_policy_fastwam.yml"
-DINO_LOCAL_DIR = "/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO/"
 
 
 def _job_path(name: str) -> Path:
@@ -27,7 +26,7 @@ def _job_path(name: str) -> Path:
         [
             REPO_ROOT.parent / "RBT" / name,
             REPO_ROOT / "RBT" / name,
-            REPO_ROOT / "执行脚本" / "RBT" / name,
+            REPO_ROOT / RUNBOOK_DIR_NAME / "RBT" / name,
         ]
     )
     for candidate in candidates:
@@ -38,21 +37,6 @@ def _job_path(name: str) -> Path:
 
 def _load(path: Path) -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
-
-
-def _flatten(value, prefix: str = "") -> dict:
-    if not isinstance(value, dict):
-        return {prefix: value}
-    out = {}
-    for key, child in value.items():
-        path = f"{prefix}.{key}" if prefix else key
-        out.update(_flatten(child, path))
-    return out
-
-
-def _differences(left: dict, right: dict) -> set[str]:
-    lflat, rflat = _flatten(left), _flatten(right)
-    return {key for key in lflat.keys() | rflat.keys() if lflat.get(key) != rflat.get(key)}
 
 
 def _class(tree: ast.Module, name: str) -> ast.ClassDef:
@@ -69,17 +53,12 @@ def _assignment(node: ast.ClassDef, name: str) -> str | None:
 
 
 def main() -> None:
-    iid, corr = _load(IID_PATH), _load(CORR_PATH)
+    iid = _load(IID_PATH)
     deploy = _load(DEPLOY_PATH)
-    job = _load(_job_path("robotwin_qwengroot_fastwam_corrnoise.yaml"))
+    job = _load(_job_path("robotwin_qwengroot_fastwam_iid.yaml"))
     errors = []
 
-    wanted_diff = {"run_id", "framework.action_model.use_correlated_noise"}
-    actual_diff = _differences(iid, corr)
-    if actual_diff != wanted_diff:
-        errors.append(f"IID/corrnoise differences must be {sorted(wanted_diff)}, got {sorted(actual_diff)}")
-
-    data = corr["datasets"]["vla_data"]
+    data = iid["datasets"]["vla_data"]
     expected_data = {
         "dataset_py": "lerobot_datasets",
         "data_mix": "robotwin_fastwam",
@@ -91,26 +70,28 @@ def main() -> None:
         "fastwam_direct_frame_sampling": True,
         "include_state": True,
         "obs_image_size": [320, 384],
-        "per_device_batch_size": 16,
+        "per_device_batch_size": 12,
         "balance_dataset_weights": False,
         "balance_trajectory_weights": False,
-        "num_workers": 8,
+        "num_workers": 4,
         "pin_memory": True,
         "persistent_workers": False,
     }
     for key, expected in expected_data.items():
         if data.get(key) != expected:
             errors.append(f"datasets.vla_data.{key}: expected {expected!r}, got {data.get(key)!r}")
-    action = corr["framework"]["action_model"]
+    action = iid["framework"]["action_model"]
     for key, expected in {
         "action_dim": 14,
         "state_dim": 14,
         "action_horizon": 32,
         "repeated_diffusion_steps": 2,
-        "use_correlated_noise": True,
+        "use_correlated_noise": False,
     }.items():
         if action.get(key) != expected:
             errors.append(f"framework.action_model.{key}: expected {expected!r}, got {action.get(key)!r}")
+    if iid.get("trainer", {}).get("expected_global_batch_size") != 768:
+        errors.append("trainer.expected_global_batch_size must be 768")
 
     for key, expected in {
         "policy_name": "model2robotwin_fastwam_interface",
@@ -122,16 +103,20 @@ def main() -> None:
 
     run_script = job.get("REQUIRED", {}).get("RUN_SCRIPTS")
     expected_run_script = (
-        f"DINOV3_WEIGHTS={DINO_LOCAL_DIR} "
-        "${WORKING_PATH}/run_aidi_rbtw.sh "
-        "examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam_corrnoise.yaml"
+        "EXPECTED_NUM_MACHINES=8 ${WORKING_PATH}/run_aidi_rbtw.sh "
+        "examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam.yaml"
     )
     if run_script != expected_run_script:
         errors.append(f"AIDI job launches the wrong config: {run_script!r}")
     remark = str(job.get("OPTIONAL", {}).get("REMARK", "")).lower()
-    for token in ("composite", "proprio", "h32", "bs16"):
+    for token in ("composite", "state14", "h32", "bs12", "8x8", "iid"):
         if token not in remark:
             errors.append(f"AIDI job remark is missing {token!r}: {remark!r}")
+    required_job = job.get("REQUIRED", {})
+    if required_job.get("WORKER_MIN_NUM") != 8 or required_job.get("WORKER_MAX_NUM") != 8:
+        errors.append("AIDI baseline launcher must request exactly 8 workers")
+    if required_job.get("GPU_PER_WORKER") != 8:
+        errors.append("AIDI baseline launcher must request 8 GPUs per worker")
 
     registry_path = HERE / "data_registry/data_config.py"
     tree = ast.parse(registry_path.read_text(encoding="utf-8"), filename=str(registry_path))
@@ -165,7 +150,7 @@ def main() -> None:
 
     if errors:
         raise SystemExit("FastWAM alignment failed:\n- " + "\n- ".join(errors))
-    print("FastWAM alignment PASS: IID and corrnoise share one composite/proprio checkpoint ABI; replan=24/32.")
+    print("FastWAM alignment PASS: IID-only composite/state checkpoint ABI; replan=24/32.")
 
 
 if __name__ == "__main__":

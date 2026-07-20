@@ -3,7 +3,6 @@ set -euo pipefail
 
 STARVLA_DIR="${STARVLA_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 
-# 自动找 Python；server 镜像不一定有 /usr/local/bin/python3
 if [[ -z "${STARVLA_PYTHON:-}" ]]; then
   if command -v python3 >/dev/null 2>&1; then
     STARVLA_PYTHON="$(command -v python3)"
@@ -15,17 +14,13 @@ if [[ -z "${STARVLA_PYTHON:-}" ]]; then
   fi
 fi
 
-# 默认 ckpt；外部可用 CKPT=xxx 覆盖
 CKPT="${CKPT:-/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_qwenwam/gr00t/0618_libero4in1_qwen3gr00t/final_model/pytorch_model.pt}"
 
-# 外部可覆盖：
 # GPU_ID=1 PORT=6696 CKPT=xxx bash examples/LIBERO/eval_files/run_policy_server.sh
 GPU_ID="${GPU_ID:-0}"
 PORT="${PORT:-6694}"
 USE_BF16="${USE_BF16:-1}"
 
-# WAM checkpoint 里可能混入训练用 dino.* teacher 权重；
-# server 推理不需要 dino，默认过滤。若明确需要保留，设 STRIP_DINO_KEYS=0。
 STRIP_DINO_KEYS="${STRIP_DINO_KEYS:-1}"
 
 cd "${STARVLA_DIR}"
@@ -62,8 +57,6 @@ stat = ckpt.stat()
 tag_src = f"{ckpt}:{stat.st_size}:{int(stat.st_mtime)}"
 tag = hashlib.md5(tag_src.encode()).hexdigest()[:12]
 
-# 关键：过滤后的 ckpt 必须放在原 ckpt 同目录。
-# server 会根据 ckpt 路径反推 run_dir，并读取 run_dir/config.yaml。
 out_path = ckpt.parent / f"{ckpt.stem}_strip_dino_{tag}.pt"
 
 if out_path.exists() and out_path.stat().st_size > 0:

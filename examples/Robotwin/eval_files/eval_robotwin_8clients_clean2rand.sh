@@ -12,7 +12,7 @@ MODES="${MODES:-demo_clean demo_randomized}"
 TASKS="${TASKS:-all}"
 SEED="${SEED:-0}"
 RUN_NAME="${RUN_NAME:-robotwin_full_eval}"
-ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-python3}"
+ROBOTWIN_PYTHON="${ROBOTWIN_PYTHON:-}"
 SERVER_MAX_WAIT="${SERVER_MAX_WAIT:-1800}"
 
 # Final benchmark defaults. Only lower TEST_NUM / disable EXPERT_CHECK for smoke tests.
@@ -64,6 +64,9 @@ fi
     echo "[ERROR] Only ${#GPU_IDS[@]} visible GPUs for ${NUM_CLIENTS} clients" >&2; exit 1;
 }
 GPU_IDS=("${GPU_IDS[@]:0:NUM_CLIENTS}")
+
+source "${SCRIPT_DIR}/robotwin_runtime.sh"
+prepare_robotwin_runtime "${ROBOTWIN_PATH}" "${GPU_IDS[0]}"
 
 # Resolve tasks.
 declare -a SELECTED_TASKS=()

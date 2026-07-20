@@ -1,17 +1,18 @@
 #######
-# FastWAM corrnoise strict ablation: full FastWAM release, predicted gated bridge.
-# Stage 1 oracle warmup is 80k optimizer steps; this Stage 2 gate fine-tune is
-# 20k optimizer steps, so the two-stage budget matches the 100k joint-E2E run.
+# Strict Stage 2/2: load the verified 80k IID predictor and train only the
+# predicted-future -> action consumption path for 20k steps.
+# Qwen, visual predictor and state conditioner are frozen so action updates
+# cannot directly or indirectly drift the learned future-DINO distribution.
 #
 # Shared baseline contract: 50 Hz, z-score, action chunk 32, one 320x384
-# FastWAM composite, no proprio input, release-order actions, batch 16,
+# FastWAM composite, current 14-D proprio, release-order actions, 8x8x12 batch,
 # seeded 99/1 split and without-replacement global-frame sampling.
 # Added components are limited to the future-composite DINO-L prediction head
 # and its gated dual-cross-attention injection into the action DiT.
 #######
 
-run_id: robotwin_wam_m5_fastwam_gate_rand2clean_h32_jitx_corrnoise_20k
-run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin
+run_id: robotwin_wam_m5_fastwam_baselinepreserve_gate_ft_rand_state_h32_dinojitx_iid_20k
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin_baselinepreserve
 seed: 42
 wandb_entity: axi-the-cat
 wandb_project: starVLA_Robotwin
@@ -24,7 +25,7 @@ framework:
   qwenvl:
     base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B-Instruct/
     attn_implementation: flash_attention_2
-    enable_gradient_checkpointing: true
+    enable_gradient_checkpointing: false
     vl_hidden_dim: 2048
 
   wam:
@@ -38,23 +39,41 @@ framework:
       mode: dual_xattn
       signal: z_pred
       prompt_mode: dual_query
+      exclude_post_query_context: true
       bridge_source: predicted
       detach_world: true
-      oracle_ratio: 1.0
+      detached_prediction_eval_mode: true
+      action_world_bypass: false
+      detach_action_backbone: false
+      # Preserve the Stage-1 detached-world gradient ABI (inactive for policy-only FT).
+      detach_world_backbone: true
+      # Preserve native baseline context; world enters only via the explicit gate.
+      baseline_action_context: true
+      oracle_ratio: 0.0
       n_world_tokens: 64
       qformer_layers: 2
       fusion_layers: 2
       gate_init: 0.0
+      # Reapply the closed gate after loading the 80k predictor checkpoint.
       # W&B detached monitoring on both policy and passive log steps.
       log_gate_openness: true
       world_dropout: 0.0
+      world_condition_on_state: true
+      include_context_in_action_memory: true
+      # Let the gated world branch read both predicted future and frozen Qwen context.
       include_context_in_world_memory: true
+      action_world_gradient_ramp:
+        enabled: false
+        start_step: 0
+        end_step: 0
+        start_scale: 0.0
+        end_scale: 0.0
       world_eval_mode: correct
 
   tasks:
     weights:
       policy: 1.0
-      passive: 1.0
+      passive: 0.0
 
   dino:
     name: dinov3_vitl16
@@ -94,12 +113,7 @@ framework:
     jit_t_eps: 0.05
     flow_time_sampling: gr00t
 
-    use_correlated_noise: true
-    correlation_beta: 0.5
-    correlation_num_samples: 4096
-    correlation_matrix_type: correlation
-    # Reuse the exact baseline matrix; fail instead of silently re-estimating.
-    correlation_cholesky_path: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_robotwin/starvla_qwengroot_robotwin_fastwam_jitx_corrnoise/action_correlation_cholesky.npy
+    use_correlated_noise: false
     num_target_vision_tokens: 32
 
     diffusion_model_cfg:
@@ -124,8 +138,18 @@ framework:
     dropout: 0.1
     add_pos_embed: true
     max_seq_len: 480
-    num_inference_timesteps: 6
-    patch_weighting: change
+    noise_beta_alpha: 1.5
+    noise_beta_beta: 1.0
+    noise_s: 0.999
+    num_timestep_buckets: 1000
+    num_inference_timesteps: 10
+    prediction_type: jit_x
+    jit_t_eps: 0.05
+    flow_time_sampling: gr00t
+    clean_target_loss_weight: 1.0
+    cosine_loss_weight: 0.1
+    patch_weighting: change_balanced
+    change_weight_strength: 1.0
 
 datasets:
   vla_data:
@@ -146,41 +170,64 @@ datasets:
     fastwam_wam_target: composite
     fastwam_future_stride: 32
 
-    # Must match the rand warmup checkpoint's inference/training ABI.
-    include_state: false
+    # The actual 80k checkpoint config has include_state=true.  Keep this
+    # contract during fine-tuning and let checkpoint metadata drive inference.
+    include_state: true
     action_type: abs_qpos
     action_mode: abs
     sequential_step_sampling: false
     balance_dataset_weights: false
     balance_trajectory_weights: false
-    per_device_batch_size: 16
+    # 8 machines x 8 GPUs x 12 samples = global batch 768.
+    per_device_batch_size: 12
 
     load_all_data_for_training: true
     obs_image_size: [320, 384]
     video_backend: pyav
-    num_workers: 8
+    # Bound process fan-out to 32 train-loader workers per 8-GPU node.
+    num_workers: 4
     prefetch_factor: 2
     pin_memory: true
     persistent_workers: false
 
 trainer:
+  expected_global_batch_size: 768
+  wam_two_stage_phase: gate_ft
+  wam_two_stage_recipe: baseline_preserving_v3
   max_train_steps: 20000
-  num_warmup_steps: 2000
+  num_warmup_steps: 500
   save_interval: 10000
-  eval_interval: 1000
-  pretrained_checkpoint: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin/robotwin_wam_m5_fastwam_warmup_rand_h32_jitx_corrnoise/final_model/pytorch_model.pt
+  action_eval_enabled: false
+  eval_interval: 5000
+  world_validation:
+    enabled: true
+    interval: 5000
+    task: policy
+    per_device_batch_size: 2
+    num_workers: 2
+    num_batches: 4
+    num_samples: 1
+    num_inference_timesteps: 10
+    seed: 2027
+  pretrained_checkpoint: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin_baselinepreserve/robotwin_wam_m5_fastwam_baselinepreserve_warmup_rand_state_h32_dinojitx_iid_80k/final_model/pytorch_model.pt
+  # First launch: false.  After a preemption, changing only this to true finds
+  # the latest committed steps_*_state and restores Adam + scheduler exactly.
   is_resume: false
+  reset_world_gates_after_pretrained_load: true
+  save_full_training_state: true
 
   learning_rate:
-    base: 1.0e-05
+    base: 2.0e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 1.0e-04
+    action_model: 2.0e-05
+    wam_visual_head: 1.0e-04
+    wam_state_ctx: 1.0e-04
+    world_adapter: 1.0e-04
 
-  lr_scheduler_type: cosine_with_min_lr
-  scheduler_specific_kwargs:
-    min_lr: 5.0e-07
+  lr_scheduler_type: constant_with_warmup
+  scheduler_specific_kwargs: {}
 
-  freeze_modules: ''
+  freeze_modules: 'qwen_vl_interface,wam_visual_head,wam_state_ctx,wam_act_ctx'
 
   loss_scale:
     vla: 1.0
@@ -188,7 +235,8 @@ trainer:
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 200
-  log_grad_norms: false
+  log_grad_norms: true
+  log_global_grad_norm: true
   deepspeed_skip_unused_param_anchors: true
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1

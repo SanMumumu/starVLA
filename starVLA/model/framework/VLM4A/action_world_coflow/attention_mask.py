@@ -1,8 +1,8 @@
-"""Explicit block-causal masks for Action--World Co-Flow.
+"""Explicit context-to-bridge masks for single-bridge Action--World Co-Flow.
 
-SDPA uses ``True`` to mean "this query may read this key".  The block id is
-therefore the only causal coordinate: tokens inside one block are genuinely
-bidirectional, while a token can never read a later block.
+SDPA uses ``True`` to mean "this query may read this key". Context/Z0 use id 0
+and the single action/future bridge uses id 1. Tokens inside the bridge are
+bidirectional; context cannot read the noisy bridge.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ def build_block_causal_attention_mask(
 
     Args:
         block_ids: ``[L]`` or ``[B, L]`` non-negative integer ids.  Context is
-            block 0, the first action/world pair is block 1, and so on.
+            id 0 and the single action/world bridge is id 1.
         key_valid_mask: optional ``[B, L]`` mask used for left-padded Qwen
             context.  Invalid *keys* are hidden.  Invalid context query rows
             still read valid context keys so SDPA never receives an all-False
@@ -50,9 +50,11 @@ def build_block_causal_attention_mask(
         raise TypeError(f"block_ids must be an integer tensor, got {block_ids.dtype}")
     if bool((block_ids < 0).any()):
         raise ValueError("block_ids must be non-negative")
+    if bool((block_ids > 1).any()):
+        raise ValueError("single-bridge Co-Flow only accepts context id 0 and bridge id 1")
 
-    # key_block <= query_block: context only sees context; block 1 sees 0/1;
-    # block 2 sees 0/1/2.  Equality gives full bidirectionality within a block.
+    # Context only sees context; bridge queries see context and the complete
+    # bridge. Equality gives full bidirectionality among action/future tokens.
     allowed = block_ids.unsqueeze(-1) >= block_ids.unsqueeze(-2)
 
     if key_valid_mask is not None:

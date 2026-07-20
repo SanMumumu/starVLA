@@ -1,8 +1,4 @@
 #######
-# 中文注释：官方 QwenGR00T 基线（纯 VLA + 全量FT）——Qwen3-VL-4B + GR00T flow-matching action head 原生路径。
-# 不开 jointflow/wam；单一 LIBERO VLA 数据（dataset_py=lerobot_datasets，原生 GR00T 数据管线）；
-# backbone 不冻结（全量训）+ 梯度检查点。作为 jointflow(query-mask)/wam 的公平对照基线。
-# 与 starvla_cotrain_libero.yaml 的 VLA 部分对齐，去掉 VLM cotrain 与 backbone 冻结。
 #######
 run_id: starvla_qwen4b_gr00t
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_qwen4b_gr00t
@@ -18,8 +14,6 @@ framework:
     base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-4B-Instruct/
     attn_implementation: flash_attention_2
     #######
-    # 中文注释：这是安全默认值；AIDI baseline experiment 会在显存足够时覆盖为 false 以减少重算提速。
-    # trainer.gradient_checkpointing 是 dead flag，真正生效的开关在这里。
     enable_gradient_checkpointing: true
     #######
     vl_hidden_dim: 2048
@@ -29,8 +23,6 @@ framework:
     state_dim: 7
     action_horizon: 8
     #######
-    # 中文注释：显式写出训练采样次数，避免吃 QwenGR00T 默认 8 导致 action DiT batch 被放大 8 倍。
-    # 需要严格对比默认多噪声采样时，可在 AIDI 里 export AIDI_BASELINE_REPEATED_DIFFUSION_STEPS=8。
     repeated_diffusion_steps: 1
     #######
 
@@ -42,8 +34,6 @@ datasets:
     action_type: delta_qpos
     sequential_step_sampling: false
     #######
-    # 中文注释：baseline 训练显式不喂 state，和官方 LIBERO 测评路径保持一致；
-    # server 即使收到 eval client 的 raw state，也会按 config 丢弃，避免 state 分支 train/eval 失配。
     include_state: false
     #######
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
@@ -56,7 +46,6 @@ trainer:
   num_warmup_steps: 5000
   save_interval: 5000
   #######
-  # 中文注释：走独立 LIBERO server 评测，关 in-loop eval。
   eval_interval: 1000000
   #######
   learning_rate:
@@ -67,7 +56,6 @@ trainer:
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
   #######
-  # 中文注释：backbone 不冻结，全量训；VLA-only（无 VLM cotrain，无 vlm loss_scale）。
   freeze_modules: ''
   loss_scale:
     vla: 1.0

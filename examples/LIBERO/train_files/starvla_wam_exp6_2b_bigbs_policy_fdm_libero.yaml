@@ -1,9 +1,4 @@
 #######
-# 中文注释：exp6 = exp5（2B + tricks + 大 batch + policy）再加 FDM 范式（预测 delta-DINO）。
-# 与 exp5 对照：看「加前向动力学监督（act-query 打 action + flow-query 预测动作引起的 DINO 变化）」对 policy 的增益。
-# tasks：policy 1.0 + fdm 0.5（passive/idm 不给权重→不采样）。
-# wam.fdm_delta_dino=true：fdm target = DINO(image_1) - DINO(image_0)（差分，只学动作引起的特征变化），见 QwenGR00T._wam_forward。
-# 其余（2B / 大 batch / tricks / steps+饱和测试）与 exp5 完全一致，保证单变量对照。
 #######
 run_id: starvla_wam_exp6_2b_bigbs_policy_fdm
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
@@ -26,11 +21,9 @@ framework:
     placeholder_token: "<ACT_PH>"
     dino_loss_weight: 1.0
     #######
-    # 中文注释：fdm 预测 delta-DINO（未来-当前），而非绝对未来 DINO。
     fdm_delta_dino: true
     #######
   #######
-  # 中文注释：exp6 = policy + fdm（act-query 打 action；flow-query 在动作条件下预测 delta-DINO）。
   tasks:
     weights:
       policy: 1.0
@@ -56,7 +49,6 @@ framework:
     action_horizon: 8
     n_action_query: 32
     #######
-    # 中文注释：exp6 tricks 开（与 exp5 一致）——correlated noise（β=0.5）+ multi-step FM（20）。
     use_correlated_noise: true
     correlation_beta: 0.5
     flow_matching_steps: 20
@@ -71,14 +63,14 @@ framework:
     repeated_diffusion_steps: 1
     diffusion_model_cfg:
       cross_attention_dim: 2048
-      dropout: 0.2    # 与 gr00t baseline 同结构(原 0.1)
+      dropout: 0.2
       final_dropout: true
       interleave_self_attention: true
       norm_type: ada_norm
-      num_layers: 16    # 与 gr00t baseline 同结构(原 24)
+      num_layers: 16
       num_attention_heads: 12
       attention_head_dim: 64
-      output_dim: 1024    # 与 gr00t baseline 同结构(原 768)
+      output_dim: 1024
       positional_embeddings: null
   visual_model:
     d_dino: 384
@@ -106,19 +98,17 @@ datasets:
     include_state: false
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     #######
-    # 中文注释：大 batch——与 exp5 一致 per_device=16（2B 显存富裕）。
     per_device_batch_size: 16
     #######
     load_all_data_for_training: true
     video_backend: torchvision_av
     online_dino: true
-    dino_target_latents: true    # hybrid: 在线出 raw 图给 Qwen 原生视觉 + 读预存 DINO latent 当世界模型 target(省在线抽取)
+    dino_target_latents: true
     world_model:
       future_stride: 8
 
 trainer:
   #######
-  # 中文注释：与 exp5 一致——大 batch ~50k 即等量，设 60000 多留 ~10k 饱和测试（不强求整除）。
   max_train_steps: 60000
   num_warmup_steps: 3000
   save_interval: 5000
@@ -127,7 +117,7 @@ trainer:
   learning_rate:
     base: 2.5e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 5.0e-05    # 稳定性修复: action head lr 1e-4→5e-5(发散组件是 action head)
+    action_model: 5.0e-05
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
@@ -137,7 +127,7 @@ trainer:
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 100
-  log_grad_norms: true    # 梯度记录总开关(per-task grad_norm_{total,shared,head}/<task>)；不需要看时改 false
+  log_grad_norms: true
   gradient_clipping: 1.0
   gradient_accumulation_steps: 8
   gradient_checkpointing: true

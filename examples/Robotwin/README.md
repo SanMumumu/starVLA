@@ -403,19 +403,18 @@ bash examples/Robotwin/eval_files/eval_robotwin_8clients_replan.sh
 
 The default is `24`, matching FastWAM's RoboTwin execution horizon. For a 50-action StarVLA checkpoint, `REPLAN_STEPS=50` executes the full predicted chunk and preserves the previous behavior. Values larger than the checkpoint action horizon are rejected.
 
-### FastWAM 50 Hz data-only baseline
+### FastWAM 50 Hz IID baseline
 
 Use this config for the controlled FastWAM data experiment:
 
 ```text
-examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam_corrnoise.yaml
+examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam.yaml
 ```
 
-It reads the full global 50 Hz LeRobot v2.1 release, applies its global z-score (`std + 1e-8`, clamp to
-`[-5, 5]`), and predicts 32-step absolute-action chunks. All remaining behavior follows the completed
-`starvla_qwengroot_robotwin_corrnoise.yaml` baseline: correlated noise, standard StarVLA sampling, no proprioceptive
-input, three independent 224x224 camera views, the standard action order, and the standard RoboTwin inference
-interface. No FastWAM composite-image or special inference preprocessing is used.
+It reads the full global 50 Hz LeRobot release, applies its global z-score
+(`std + 1e-8`, clamp to `[-5, 5]`), and predicts 32-step absolute-action
+chunks with IID action noise. The policy consumes the current 14-D state and
+the exact 320x384 FastWAM head+wrist composite in release action order.
 
 Run evaluation for these checkpoints through:
 

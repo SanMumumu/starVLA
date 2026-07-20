@@ -1,10 +1,4 @@
 #######
-# 中文注释：exp5 = WAM policy + tricks，换 Qwen3-VL-2B + 大 batch（消融小模型 + 大批量的 policy 上限）。
-# 与 exp3(4B policy+tricks) 对照：看「2B + 大 batch」在等量 trick 下相对 4B 的 SR/速度权衡。
-# tasks 只给 policy；tricks 开（correlated noise β=0.5 + multi-step FM=20，Σ-Cholesky 由 trainer 启动估计注入）。
-# 大 batch：per_device_batch_size=16（2B 比 4B 省显存，吃得下）；grad_accum=8 → 有效 batch 翻倍。
-# steps：60000（比 exp3 的 100k 略少——大 batch 每步样本翻倍，~50k 即等量；多留 ~10k 做饱和测试，不强求整除）。
-# save_interval=5000：频繁存档，方便挑饱和点对照 SR。
 #######
 run_id: starvla_wam_exp5_2b_bigbs_policy
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
@@ -27,7 +21,6 @@ framework:
     placeholder_token: "<ACT_PH>"
     dino_loss_weight: 1.0
   #######
-  # 中文注释：exp5 同样只有 policy（trick 作用在 action head，不需要世界模型范式）。
   tasks:
     weights:
       policy: 1.0
@@ -52,7 +45,6 @@ framework:
     action_horizon: 8
     n_action_query: 32
     #######
-    # 中文注释：exp5 tricks 开——correlated noise（β=0.5）+ multi-step FM（20）。
     use_correlated_noise: true
     correlation_beta: 0.5
     flow_matching_steps: 20
@@ -67,14 +59,14 @@ framework:
     repeated_diffusion_steps: 1
     diffusion_model_cfg:
       cross_attention_dim: 2048
-      dropout: 0.2    # 与 gr00t baseline 同结构(原 0.1)
+      dropout: 0.2
       final_dropout: true
       interleave_self_attention: true
       norm_type: ada_norm
-      num_layers: 16    # 与 gr00t baseline 同结构(原 24)
+      num_layers: 16
       num_attention_heads: 12
       attention_head_dim: 64
-      output_dim: 1024    # 与 gr00t baseline 同结构(原 768)
+      output_dim: 1024
       positional_embeddings: null
   visual_model:
     d_dino: 384
@@ -102,19 +94,17 @@ datasets:
     include_state: false
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
     #######
-    # 中文注释：大 batch——2B 显存富裕，per_device 提到 16（exp2/3 是 8）。
     per_device_batch_size: 16
     #######
     load_all_data_for_training: true
     video_backend: torchvision_av
     online_dino: true
-    dino_target_latents: true    # hybrid: 在线出 raw 图给 Qwen 原生视觉 + 读预存 DINO latent 当世界模型 target(省在线抽取)
+    dino_target_latents: true
     world_model:
       future_stride: 8
 
 trainer:
   #######
-  # 中文注释：大 batch → 等量样本约 50k 步即够；设 60000 多留 ~10k 饱和测试（不强求整除）。
   max_train_steps: 60000
   num_warmup_steps: 3000
   save_interval: 5000
@@ -123,7 +113,7 @@ trainer:
   learning_rate:
     base: 2.5e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 5.0e-05    # 稳定性修复: action head lr 1e-4→5e-5(发散组件是 action head)
+    action_model: 5.0e-05
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
@@ -133,7 +123,7 @@ trainer:
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 100
-  log_grad_norms: true    # 梯度记录总开关(per-task grad_norm_{total,shared,head}/<task>)；不需要看时改 false
+  log_grad_norms: true
   gradient_clipping: 1.0
   gradient_accumulation_steps: 8
   gradient_checkpointing: true

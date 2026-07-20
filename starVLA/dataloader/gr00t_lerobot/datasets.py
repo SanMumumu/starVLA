@@ -946,7 +946,6 @@ class LeRobotSingleDataset(Dataset):
 
                     # TODO auto map key 
                     # Collect video file indices for each video key
-                    #已修改的lerobotv3.0的视频索引（提取视频和文件的索引）
                     video_file_indices = {}
                     for col in timestamp_cols:
                         video_key = str(col)[len("videos/") : -len("/from_timestamp")]
@@ -1628,7 +1627,6 @@ class LeRobotSingleDataset(Dataset):
 
             video_file_indices = episode_meta.get("videos/file_indices", {})
             # print(f"{video_file_indices=}")
-            #已修改的lerobotv3.0的视频索引
             if original_key in video_file_indices:
                 video_chunk_index = video_file_indices[original_key]["chunk_index"]
                 video_file_index = video_file_indices[original_key]["file_index"]

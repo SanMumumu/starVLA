@@ -14,12 +14,6 @@ JOINTFLOW_NAMED_MIXTURES = {
 
 
 ######### // code // ##########
-# 中文注释：RoboTwin 按 split 的派生混合。examples/Robotwin data_registry 注册的
-# robotwin_all 用 "Clean/<task>"、"Randomized/<task>" 前缀（data_root 指 RoboTwin 根，
-# 与本仓配置一致）；而无前缀的 robotwin/robotwin_task1 需要 root 指到单个 split 目录。
-# 这里从 robotwin_all 惰性派生（避免硬编码 50 任务清单随上游漂移）：
-#   robotwin_clean / robotwin_randomized   单 split 全部 50 任务
-#   robotwin_clean_task1                   单任务调试用
 def _derived_robotwin_mixtures() -> dict:
     base = DATASET_NAMED_MIXTURES.get("robotwin_all", [])
     clean = [entry for entry in base if str(entry[0]).startswith("Clean/")]
@@ -37,9 +31,9 @@ def _derived_robotwin_mixtures() -> dict:
 def register_jointflow_mixtures() -> None:
     """Expose JointFlow-local aliases to code that only reads the global registry.
 
-    中文注释：派生的 robotwin_clean/randomized/clean_task1 也注册进全局表——
-    eval server 的 _resolve_robot_type 只查 DATASET_NAMED_MIXTURES，不走本模块的
-    resolve_data_mix 兜底。
+    Derived RoboTwin clean/randomized aliases must also be registered globally
+    because deployment resolves robot types through ``DATASET_NAMED_MIXTURES``
+    rather than this module's fallback resolver.
     """
     for name, mixture in JOINTFLOW_NAMED_MIXTURES.items():
         DATASET_NAMED_MIXTURES.setdefault(name, mixture)

@@ -9,8 +9,6 @@ export NCCL_TIMEOUT=10000  # timeout set to 1 hour (unit: seconds)
 export NCCL_SOCKET_TIMEOUT_MS=360000
 export WANDB_MODE=offline
 ###########################################################################################
-# exp4 = WAM 四范式一起（policy + passive + fdm + idm，创新点1，无 trick）。
-# 与官方 run_libero_train.sh(exp1) 同结构，只换 config_yaml / run_id。base_vlm 用 4B 与 exp1 对齐。
 Framework_name=QwenGR00T
 freeze_module_list=''
 base_vlm=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-4B-Instruct/

@@ -1,20 +1,10 @@
-"""Wan-initialized action head (flow-matching) for QwenGR00T WAM.
+"""Wan-initialized flow-matching action head for QwenGR00T WAM.
 
-动机：把 Wan2.2-TI2V-5B 视频 DiT 的骨干（transformer blocks + text/time 嵌入）当作动作专家的初始化
-（参考 Third_github/FastWAM 的 ActionDiT + preprocess_action_dit_backbone.py）。
-
-要点：
-- 本头的 transformer 内核 **就是 Wan 的 DiTBlock**（RMSNorm 的 q/k + RoPE 自注意 + cross-attn 到 context
-  + 每块 6 路 modulation 调制 + ffn），所以预处理脚本能把 Wan 权重按 key 截断(前 N 层)+插值装进来。
-  内部模块/参数名与 FastWAM `ActionDiT` 一致（action_encoder / text_embedding / time_embedding /
-  time_projection / blocks / head），骨干 = 除 `action_encoder.`/`head.` 外的全部键。
-- 对外接口与 `FlowmatchingActionHead` 一致：`forward(vl_embs, actions, state, encoder_attention_mask)->loss`、
-  `predict_action(...)`、`set_action_correlation(...)`，因此 QwenGR00T 的 wam 路径**不需要改调用**。
-- 维度由 config 给（默认对齐 DiT-B：hidden=768/16 层；注意力保持 Wan 的 24×128 以便干净迁移；
-  text_dim=2048 直接条件在 Qwen hidden 上）。时间走 Wan 式 t_mod 调制（非旧头的 concat-time），
-  以便 Wan 的 time_embedding/time_projection 权重可装。
-
-Wan 内核函数/类移植自 FastWAM `wan_video_dit.py`（无 FastWAM 运行时依赖）。
+The transformer core follows the Wan DiT block layout: RMS-normalized Q/K,
+RoPE self-attention, context cross-attention, six-way modulation, and an FFN.
+Its parameter names match FastWAM ActionDiT so a preprocessed Wan backbone can
+be loaded by key. The public API matches ``FlowmatchingActionHead`` and has no
+runtime dependency on the external FastWAM repository.
 """
 from __future__ import annotations
 
@@ -28,7 +18,6 @@ from torch.distributions import Beta
 from torch.utils.checkpoint import checkpoint as _ckpt
 
 
-# ============================ Wan 内核（移植自 FastWAM）============================
 def flash_attention(q, k, v, num_heads, ctx_mask=None):
     q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
     k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
@@ -138,7 +127,6 @@ class DiTBlock(nn.Module):
         return x
 
 
-# ============================ 骨干（key 名对齐 FastWAM ActionDiT）============================
 class WanActionBackbone(nn.Module):
     ACTION_BACKBONE_SKIP_PREFIXES = ("action_encoder.", "head.")
 
@@ -167,8 +155,7 @@ class WanActionBackbone(nn.Module):
         return {k for k in keys if not any(k.startswith(p) for p in cls.ACTION_BACKBONE_SKIP_PREFIXES)}
 
     def forward(self, action_tokens, timestep, context, context_mask=None):
-        """action_tokens [B,T,action_dim]; timestep [B] 离散桶; context [B,L,text_dim]; context_mask [B,L] bool(keep)。
-        返回 velocity [B,T,action_dim]。"""
+        """Predict velocity from action tokens, discrete timesteps, and context."""
         B, T, _ = action_tokens.shape
         t = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, timestep).to(action_tokens.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.hidden_dim))           # [B,6,hidden]
@@ -189,23 +176,22 @@ class WanActionBackbone(nn.Module):
         return self.head(x)
 
     def load_backbone_payload(self, payload: dict, strict_meta: bool = True) -> None:
-        """装载 preprocess 产出的骨干 payload（{backbone_state_dict, meta, policy}）。只覆盖骨干键。"""
+        """Load a preprocessed backbone payload without replacing action I/O layers."""
         bsd = payload["backbone_state_dict"]
         state = self.state_dict()
         expected = self.backbone_key_set(state.keys())
         provided = set(bsd.keys())
         missing, unexpected = sorted(expected - provided), sorted(provided - expected)
         if missing or unexpected:
-            raise ValueError(f"[wan-init] 骨干键不匹配 missing={missing[:6]} unexpected={unexpected[:6]}")
+            raise ValueError(f"[wan-init] backbone keys mismatch: missing={missing[:6]} unexpected={unexpected[:6]}")
         for k in expected:
             v = bsd[k]
             if tuple(v.shape) != tuple(state[k].shape):
-                raise ValueError(f"[wan-init] `{k}` 形状不符 expect {tuple(state[k].shape)} got {tuple(v.shape)}")
+                raise ValueError(f"[wan-init] `{k}` shape mismatch: expected {tuple(state[k].shape)}, got {tuple(v.shape)}")
             state[k] = v.to(state[k].dtype)
         self.load_state_dict(state, strict=True)
 
 
-# ============================ flow-matching 包装（接口同 FlowmatchingActionHead）============================
 class WanFlowMatchingActionHead(nn.Module):
     def __init__(self, full_config):
         super().__init__()
@@ -223,8 +209,6 @@ class WanFlowMatchingActionHead(nn.Module):
             text_dim=text_dim,
             freq_dim=int(wan.get("freq_dim", 256)),
             eps=float(wan.get("eps", 1e-6)),
-            # 默认对齐我的 DiT-B 动作头(12×64)→新头与旧头同尺寸(~150M)；Wan 原生 24×128 迁移更干净但~2.5×大,
-            # 想要后者就在 config 里设 num_heads=24/attn_head_dim=128。
             num_heads=int(wan.get("num_heads", 12)),
             attn_head_dim=int(wan.get("attn_head_dim", 64)),
             num_layers=int(wan.get("num_layers", 16)),
@@ -232,12 +216,10 @@ class WanFlowMatchingActionHead(nn.Module):
             use_grad_ckpt=bool(full_config.framework.qwenvl.get("enable_gradient_checkpointing", False)),
         )
 
-        # flow-matching 噪声调度（与 FlowmatchingActionHead 同口径）
         self.num_timestep_buckets = int(cfg.get("num_timestep_buckets", 1000))
         self.num_inference_timesteps = int(cfg.get("num_inference_timesteps", 10) or 10)
         self.noise_s = float(cfg.get("noise_s", 0.999))
         self.beta_dist = Beta(float(cfg.get("noise_beta_alpha", 1.5)), float(cfg.get("noise_beta_beta", 1.0)))
-        # correlated noise / multi-step FM（与旧头一致的 trick 兼容）
         self.use_correlated_noise = bool(cfg.get("use_correlated_noise", False))
         self.flow_matching_steps = int(cfg.get("flow_matching_steps", 1))
         self.register_buffer(
@@ -255,9 +237,8 @@ class WanFlowMatchingActionHead(nn.Module):
                 self.backbone.load_backbone_payload(payload)
                 print(f"[wan-init] loaded Wan backbone <- {init_path}", flush=True)
             else:
-                print(f"[wan-init] init_path 不存在，随机初始化: {init_path}", flush=True)
+                print(f"[wan-init] init_path does not exist; using random initialization: {init_path}", flush=True)
 
-    # ----- flow-matching 工具（copy 自 FlowmatchingActionHead） -----
     def sample_time(self, batch_size, device, dtype):
         s = self.beta_dist.sample([batch_size]).to(device, dtype=dtype).clamp(max=self.noise_s)
         return (self.noise_s - s) / self.noise_s

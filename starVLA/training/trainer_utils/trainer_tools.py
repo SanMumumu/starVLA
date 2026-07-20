@@ -555,16 +555,8 @@ def _is_safetensors_path(path):
 
 
 # ============================================================================
-# 中文注释：多任务梯度范数日志辅助（配合 train_starvla 的 per-task loss/grad 日志）。
 #
-# 关键事实：WAM 训练是**一任务/优化步**（trainer 每步采一个 task → 模型只返回该 task 一个 *_loss →
-# 单 task backward）。因此 backward 后共享骨干上的梯度**就是该任务的单任务梯度**，不是多任务合并梯度。
-# 这里的在线 grad_norm 全部是「当前步那个任务」的单任务梯度范数；不存在需要从合并梯度里分离每任务的情况。
 #
-# 模块分组（去重、互不相交、只取可训练参数）：
-#   shared            = qwen_vl_interface（共享表征骨干）
-#   policy_head       = action_model (+ action_queries)         —— policy / idm 任务用
-#   world_model_head  = wam_visual_head + wam_act_ctx (+ future_dino_queries) —— fdm / passive 任务用
 # ============================================================================
 def _module_trainable_params(model, path):
     m = model
@@ -578,10 +570,12 @@ def _module_trainable_params(model, path):
 
 
 def build_task_grad_groups(model):
-    """构 {组名: [param,...]}（按模块子树、去重、只取可训练）。返回 (groups, task_head, task_logname)。
+    """Build disjoint trainable parameter groups from model subtrees.
 
-    task_head: task -> 该任务实际产生非零梯度的 head 组名；task_logname: task -> 日志用名（idm→inverse）。
-    只收录实际存在的模块；不存在的组不创建（避免无意义零值日志）。
+    Returns ``(groups, task_head, task_logname)``. ``task_head`` identifies the
+    head with non-zero gradients for each task, while ``task_logname`` maps
+    internal names such as ``idm`` to stable dashboard labels. Missing modules
+    do not create empty groups.
     """
     seen = set()
 
@@ -599,15 +593,14 @@ def build_task_grad_groups(model):
     shared = collect(["qwen_vl_interface"])
     if shared:
         groups["shared"] = shared
-    # 中文注释：World→Action guidance 的 world 注入子模块(adapter/fusion/qformer/pooler)只在 policy/idm 步
-    # 受梯度(passive/fdm 步被 anchor 置零),归入 policy_head；不存在时 _module_trainable_params 返回[]，
-    # 故对非 guidance 运行无影响。world_attn/world_to_temb 在 action_model.* 内，已被 "action_model" 覆盖。
     policy_head = collect(
         ["action_model", "action_queries", "world_adapter", "world_fusion", "world_qformer", "world_pooler"]
     )
     if policy_head:
         groups["policy_head"] = policy_head
-    world_model_head = collect(["wam_visual_head", "wam_act_ctx", "future_dino_queries"])
+    world_model_head = collect(
+        ["wam_visual_head", "wam_state_ctx", "wam_act_ctx", "future_dino_queries"]
+    )
     if world_model_head:
         groups["world_model_head"] = world_model_head
 
@@ -616,9 +609,12 @@ def build_task_grad_groups(model):
         "idm": "policy_head",
         "fdm": "world_model_head",
         "passive": "world_model_head",
-        # Joint E2E activates both heads, so the single-head decomposition used
-        # by legacy alternating tasks is intentionally disabled for this task.
-        "joint_e2e": None,
+        # Joint objectives activate both heads.  Select the world head here so
+        # the trainer can explicitly prove that the reconstruction objective
+        # produces non-zero world gradients; it deliberately won't infer a
+        # shared-only norm for these tasks.
+        "joint_e2e": "world_model_head",
+        "joint_detached": "world_model_head",
     }
     task_logname = {
         "policy": "policy",
@@ -626,13 +622,17 @@ def build_task_grad_groups(model):
         "fdm": "fdm",
         "passive": "passive",
         "joint_e2e": "joint_e2e",
+        "joint_detached": "joint_detached",
     }
     return groups, task_head, task_logname
 
 
 def _full_grad(p, prefer_ds: bool):
-    """取参数的**完整(全局)**梯度：ZeRO-2/3 下 p.grad 是分片/None → 用 deepspeed.safe_get_full_grad
-    （collective all-gather，所有 rank 必须一致调用）；非 DeepSpeed 时 p.grad 已是全局梯度。返回 tensor 或 None。"""
+    """Return a full gradient, gathering ZeRO shards when requested.
+
+    ``safe_get_full_grad`` is collective and therefore must be called
+    consistently on every rank. Non-DeepSpeed gradients are already global.
+    """
     if prefer_ds:
         try:
             from deepspeed.utils import safe_get_full_grad
@@ -647,9 +647,12 @@ def _full_grad(p, prefer_ds: bool):
 
 @torch.no_grad()
 def group_grad_sqnorm(params, prefer_ds: bool):
-    """该组参数梯度的 L2 平方和（GPU 标量 tensor）。无任何梯度返回 None。
-    用 _full_grad 取全局梯度 → 各 rank 结果一致（DeepSpeed 路径含 collective，须所有 rank 同调）。
-    全程在 GPU 聚合，不逐参数 .item()（调用方最后只对最终标量同步一次）。"""
+    """Return the group's global squared L2 gradient norm on-device.
+
+    The DeepSpeed path is collective. Aggregation remains on the GPU and only
+    the final scalar needs host synchronization. Returns ``None`` if no
+    parameter has a gradient.
+    """
     total = None
     for p in params:
         g = _full_grad(p, prefer_ds)
@@ -662,12 +665,13 @@ def group_grad_sqnorm(params, prefer_ds: bool):
 
 @torch.no_grad()
 def group_grad_local_sqnorm(params):
-    """该组参数梯度的**本地分片**平方和（GPU 标量，**零 collective**）。
+    """Return the local-shard squared L2 gradient norm without a collective.
 
-    ZeRO-2 下梯度 reduce-scatter 进各 rank 分片：用 deepspeed `safe_get_local_grad(p)` 取本 rank 那一片
-    （不通信），各 param 本地分片平方和累加。调用方对该标量做**1 次** `all_reduce(SUM)`（各分片不相交 → 求和即全局）。
-    非 DeepSpeed 时退回 p.grad（已是全局，调用方不要再 reduce）。
-    始终返回**张量**（无任何梯度时返回 0 张量），保证调用方的 all_reduce 在各 rank 一致可调（不会失同步）。
+    Under ZeRO-2, ``safe_get_local_grad`` reads each rank's disjoint shard. One
+    caller-side ``all_reduce(SUM)`` then recovers the global squared norm.
+    Non-DeepSpeed execution falls back to ``p.grad`` and must not reduce it
+    again. A tensor is always returned so every rank can follow one control
+    path even when no gradients exist.
     """
     try:
         from deepspeed.utils import safe_get_local_grad

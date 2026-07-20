@@ -1,8 +1,4 @@
 #######
-# 中文注释：exp2 = WAM 只有 policy（消融：原生视觉 + act-query metaquery 单独打 action，无世界模型监督）。
-# 与 exp1 官方 baseline 对照：看「换成 wam 的 metaquery 动作头」本身相对原生 GR00T 的差异。
-# base_vlm 用 Qwen3-VL-4B 与 exp1 对齐（dims 运行时自动对齐）。tasks 只给 policy；tricks 关。
-# policy-only 多卡安全：_wam_unused_anchor 会给未用的 DINO 头/act_ctx 加零梯度 anchor。
 #######
 run_id: starvla_wam_exp2_policy
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
@@ -25,7 +21,6 @@ framework:
     placeholder_token: "<ACT_PH>"
     dino_loss_weight: 1.0
   #######
-  # 中文注释：exp2 只有 policy（passive/fdm/idm 不给权重→trainer 不采样→只训 policy）。
   tasks:
     weights:
       policy: 1.0
@@ -50,7 +45,6 @@ framework:
     action_horizon: 8
     n_action_query: 32
     #######
-    # 中文注释：exp2 tricks 全关。
     use_correlated_noise: false
     correlation_beta: 0.5
     flow_matching_steps: 1
@@ -65,14 +59,14 @@ framework:
     repeated_diffusion_steps: 1
     diffusion_model_cfg:
       cross_attention_dim: 2048
-      dropout: 0.2    # 与 gr00t baseline 同结构(原 0.1)
+      dropout: 0.2
       final_dropout: true
       interleave_self_attention: true
       norm_type: ada_norm
-      num_layers: 16    # 与 gr00t baseline 同结构(原 24)
+      num_layers: 16
       num_attention_heads: 12
       attention_head_dim: 64
-      output_dim: 1024    # 与 gr00t baseline 同结构(原 768)
+      output_dim: 1024
       positional_embeddings: null
   visual_model:
     d_dino: 384
@@ -103,7 +97,7 @@ datasets:
     load_all_data_for_training: true
     video_backend: torchvision_av
     online_dino: true
-    dino_target_latents: true    # hybrid: 在线出 raw 图给 Qwen 原生视觉 + 读预存 DINO latent 当世界模型 target(省在线抽取)
+    dino_target_latents: true
     world_model:
       future_stride: 8
 
@@ -115,7 +109,7 @@ trainer:
   learning_rate:
     base: 2.5e-05
     qwen_vl_interface: 1.0e-05
-    action_model: 5.0e-05    # 稳定性修复: action head lr 1e-4→5e-5(发散组件是 action head)
+    action_model: 5.0e-05
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 1.0e-06
@@ -125,7 +119,7 @@ trainer:
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 100
-  log_grad_norms: true    # 梯度记录总开关(per-task grad_norm_{total,shared,head}/<task>)；不需要看时改 false
+  log_grad_norms: true
   gradient_clipping: 1.0
   gradient_accumulation_steps: 8
   gradient_checkpointing: true

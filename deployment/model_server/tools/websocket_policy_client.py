@@ -53,11 +53,6 @@ class WebsocketClientPolicy:
                     ping_interval=None,
                     ping_timeout=60,
                 )
-                # 中文注释：websockets 各版本 sync.client.connect 支持的参数不同。
-                # 例如 Python 3.8 只能装到 websockets 13.x，其 sync connect 没有 ping_interval/
-                # ping_timeout 这两个显式参数，会把它们当未知 kwarg 透传给 socket.create_connection
-                # 而抛 TypeError。这里按当前安装版本的“显式具名参数”过滤掉不支持的 ping_* 参数
-                # （ping_interval=None 本就是禁用心跳，丢弃不影响语义）。对新版本（参数齐全）无影响。
                 _named = {
                     n
                     for n, p in inspect.signature(websockets.sync.client.connect).parameters.items()

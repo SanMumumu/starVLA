@@ -52,9 +52,47 @@ policy_host="${8:-${ROBOTWIN_POLICY_HOST:-127.0.0.1}}"
 robotwin_python="${ROBOTWIN_PYTHON:-python}"
 deploy_policy_template="${DEPLOY_POLICY_TEMPLATE_PATH:-${SCRIPT_DIR}/deploy_policy.yml}"
 replan_steps="${ROBOTWIN_REPLAN_STEPS:-${REPLAN_STEPS:-}}"
+wam_expected_phase="${WAM_EXPECTED_PHASE:-}"
+wam_expected_world_to_action="${WAM_EXPECTED_WORLD_TO_ACTION:-}"
+coflow_inference_mode="${COFLOW_INFERENCE_MODE:-}"
+coflow_inference_horizon="${COFLOW_INFERENCE_HORIZON:-}"
+coflow_inference_seed="${COFLOW_INFERENCE_SEED:-}"
 
 if [[ -n "${replan_steps}" && ! "${replan_steps}" =~ ^[1-9][0-9]*$ ]]; then
     echo "REPLAN_STEPS must be a positive integer, got: ${replan_steps}" >&2
+    exit 1
+fi
+if [[ -n "${wam_expected_phase}" && \
+      "${wam_expected_phase}" != "predictor_warmup" && \
+      "${wam_expected_phase}" != "gate_ft" ]]; then
+    echo "WAM_EXPECTED_PHASE must be predictor_warmup or gate_ft, got: ${wam_expected_phase}" >&2
+    exit 1
+fi
+if [[ -n "${wam_expected_world_to_action}" && \
+      "${wam_expected_world_to_action}" != "enabled" && \
+      "${wam_expected_world_to_action}" != "disabled" ]]; then
+    echo "WAM_EXPECTED_WORLD_TO_ACTION must be enabled or disabled, got: ${wam_expected_world_to_action}" >&2
+    exit 1
+fi
+if [[ -n "${coflow_inference_mode}" && "${coflow_inference_mode}" != "policy" && "${coflow_inference_mode}" != "diagonal" ]]; then
+    echo "COFLOW_INFERENCE_MODE must be policy or diagonal, got: ${coflow_inference_mode}" >&2
+    exit 1
+fi
+if [[ -n "${coflow_inference_horizon}" && ! "${coflow_inference_horizon}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "COFLOW_INFERENCE_HORIZON must be a positive integer, got: ${coflow_inference_horizon}" >&2
+    exit 1
+fi
+if [[ -n "${coflow_inference_seed}" && ! "${coflow_inference_seed}" =~ ^[0-9]+$ ]]; then
+    echo "COFLOW_INFERENCE_SEED must be a non-negative integer, got: ${coflow_inference_seed}" >&2
+    exit 1
+fi
+if [[ -n "${coflow_inference_mode}" && -z "${coflow_inference_horizon}" ]] || \
+   [[ -z "${coflow_inference_mode}" && -n "${coflow_inference_horizon}" ]]; then
+    echo "COFLOW_INFERENCE_MODE and COFLOW_INFERENCE_HORIZON must be set together" >&2
+    exit 1
+fi
+if [[ -n "${coflow_inference_seed}" && -z "${coflow_inference_mode}" ]]; then
+    echo "COFLOW_INFERENCE_SEED requires COFLOW_INFERENCE_MODE/HORIZON" >&2
     exit 1
 fi
 
@@ -70,10 +108,24 @@ cleanup() {
 trap cleanup EXIT
 
 runtime_replan_steps="${replan_steps:-null}"
+runtime_wam_expected_phase="${wam_expected_phase:-null}"
+case "${wam_expected_world_to_action}" in
+    enabled) runtime_wam_expected_world_to_action=true ;;
+    disabled) runtime_wam_expected_world_to_action=false ;;
+    *) runtime_wam_expected_world_to_action=null ;;
+esac
+runtime_coflow_mode="${coflow_inference_mode:-null}"
+runtime_coflow_horizon="${coflow_inference_horizon:-null}"
+runtime_coflow_seed="${coflow_inference_seed:-null}"
 sed \
     -e "s/^host:.*/host: \"${policy_host}\"/" \
     -e "s/^port:.*/port: ${policy_port}/" \
     -e "s/^replan_steps:.*/replan_steps: ${runtime_replan_steps}/" \
+    -e "s/^wam_expected_phase:.*/wam_expected_phase: ${runtime_wam_expected_phase}/" \
+    -e "s/^wam_expected_world_to_action:.*/wam_expected_world_to_action: ${runtime_wam_expected_world_to_action}/" \
+    -e "s/^coflow_inference_mode:.*/coflow_inference_mode: ${runtime_coflow_mode}/" \
+    -e "s/^coflow_inference_horizon:.*/coflow_inference_horizon: ${runtime_coflow_horizon}/" \
+    -e "s/^coflow_inference_seed:.*/coflow_inference_seed: ${runtime_coflow_seed}/" \
     "${deploy_policy_template}" > "${runtime_deploy_policy}"
 
 export CUDA_VISIBLE_DEVICES="${gpu_id}"
@@ -94,6 +146,10 @@ echo "task_config: ${task_config}"
 echo "ckpt_setting: ${ckpt_setting}"
 echo "policy_port: ${policy_port}"
 echo "replan_steps: ${replan_steps:-full model chunk}"
+echo "wam_expected_phase: ${wam_expected_phase:-unchecked}"
+echo "wam_expected_world_to_action: ${wam_expected_world_to_action:-unchecked}"
+echo "coflow_inference: ${coflow_inference_mode:-checkpoint default}/${coflow_inference_horizon:-checkpoint chunk}"
+echo "coflow_seed: ${coflow_inference_seed:-stochastic}"
 
 PYTHONWARNINGS=ignore::UserWarning \
 "${robotwin_python}" script/eval_policy.py --config "${runtime_deploy_policy}" \
