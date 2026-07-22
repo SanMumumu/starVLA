@@ -76,7 +76,13 @@ def verify(checkpoint_path: str) -> dict:
     _expect(int(action.get("action_dim", -1)), 14, "framework.action_model.action_dim")
     _expect(int(action.get("state_dim", -1)), 14, "framework.action_model.state_dim")
     _expect(int(action.get("action_horizon", -1)), 16, "framework.action_model.action_horizon")
-    _expect(data.get("data_mix"), "robodojo_v21", "datasets.vla_data.data_mix")
+    data_mix = data.get("data_mix")
+    allowed_data_mixes = {"robodojo_v21", "robodojo_v21_language_optional"}
+    if data_mix not in allowed_data_mixes:
+        raise ValueError(
+            "RoboDojo checkpoint datasets.vla_data.data_mix="
+            f"{data_mix!r}; expected one of {sorted(allowed_data_mixes)!r}."
+        )
     _expect(bool(data.get("include_state", False)), True, "datasets.vla_data.include_state")
     _expect(data.get("image_layout"), "fastwam_composite", "datasets.vla_data.image_layout")
     _expect(
@@ -122,6 +128,7 @@ def verify(checkpoint_path: str) -> dict:
         "run_dir": str(run_dir),
         "contract_config": str(config_path),
         "include_state": True,
+        "data_mix": data_mix,
         "state_action_normalization": "fastwam_zscore via new_embodiment statistics",
         "image": "head+left_wrist+right_wrist -> FastWAM 320x384 composite",
         "action_chunk": [16, 14],

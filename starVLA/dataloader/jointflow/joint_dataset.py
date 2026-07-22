@@ -48,6 +48,42 @@ def _cfg_get(cfg, key: str, default=None):
     return getattr(cfg, key, default)
 
 
+def _optional_text_value(value: Any) -> str:
+    """Normalize one optional parquet text cell without inventing a label."""
+
+    if value is None:
+        return ""
+    try:
+        if bool(np.asarray(value).ndim == 0 and np.asarray(value).dtype.kind == "f" and np.isnan(value)):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def optional_text_annotation_from_row(row, config) -> dict[str, Any]:
+    """Read optional current/completed-subtask labels from one parquet row."""
+
+    fields = _cfg_get(
+        config,
+        "fields",
+        {"subtask_text": "subtask_text", "completed_subtask_text": "complete_text"},
+    )
+    fields = dict(fields) if hasattr(fields, "items") else {}
+    result = {
+        output_name: _optional_text_value(row.get(str(column_name), ""))
+        for output_name, column_name in fields.items()
+    }
+    missing_values = {
+        str(value).strip().lower()
+        for value in _cfg_get(config, "missing_values", [""])
+    }
+    result["text_annotation_available"] = any(
+        value.strip().lower() not in missing_values for value in result.values()
+    )
+    return result
+
+
 def _safe_view_name(key: str) -> str:
     return str(key).replace("/", "__").replace(".", "_")
 
@@ -147,9 +183,22 @@ class JointLiberoDataset(LeRobotSingleDataset):
         self._last_video_frames = None
         data_cfg = kwargs.get("data_cfg")
         self._action_pack_dtype = np.dtype(str(_cfg_get(data_cfg, "action_pack_dtype", "float32")))
+        self._optional_text_config = _cfg_get(data_cfg, "optional_text_annotations", {})
         if self._action_pack_dtype not in {np.dtype("float16"), np.dtype("float32")}:
             raise ValueError(f"action_pack_dtype must be float16 or float32, got {self._action_pack_dtype}")
         super().__init__(*args, **kwargs)
+
+        if bool(_cfg_get(self._optional_text_config, "enabled", False)) and bool(
+            _cfg_get(self._optional_text_config, "require_columns", True)
+        ):
+            fields = dict(_cfg_get(self._optional_text_config, "fields", {}))
+            available = set(self.lerobot_info_meta.get("features", {}))
+            missing = sorted(str(column) for column in fields.values() if str(column) not in available)
+            if missing:
+                raise ValueError(
+                    "Optional text supervision requires parquet columns declared in meta/info.json; "
+                    f"missing={missing}, dataset={self.dataset_path}"
+                )
 
     @property
     def dino_dir(self) -> Path:
@@ -449,6 +498,10 @@ class JointLiberoDataset(LeRobotSingleDataset):
             "future_valid_steps": np.int64(future_steps),
             "future_stride": np.int64(future_stride),
         }
+
+        if bool(_cfg_get(self._optional_text_config, "enabled", False)):
+            row = self.curr_traj_data.iloc[int(self._last_base_index)]
+            sample.update(optional_text_annotation_from_row(row, self._optional_text_config))
 
         if self.online_dino:
             source_view_keys = list(self.modality_keys.get("video", []))

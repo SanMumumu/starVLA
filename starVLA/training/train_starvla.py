@@ -470,6 +470,18 @@ class VLATrainer(TrainerUtils):
                     "world_condition_on_state is enabled but wam_state_ctx has no trainable parameters"
                 )
             world_params.extend(state_params)
+        current_dino_projector = getattr(self.model, "wam_current_dino_proj", None)
+        if isinstance(current_dino_projector, torch.nn.Module):
+            projector_params = [
+                parameter
+                for parameter in current_dino_projector.parameters()
+                if parameter.requires_grad
+            ]
+            if not projector_params:
+                raise RuntimeError(
+                    "concat_current_dino is enabled but wam_current_dino_proj has no trainable parameters"
+                )
+            world_params.extend(projector_params)
         config = getattr(self, "config", None)
         trainer_cfg = getattr(config, "trainer", None) if config is not None else None
         recipe = str(
@@ -477,7 +489,7 @@ class VLATrainer(TrainerUtils):
             if trainer_cfg is not None
             else "legacy_v1"
         ).lower()
-        if recipe in {"isolated_queries_v4", "shared_qwen_queries_v5"}:
+        if recipe in {"isolated_queries_v4", "causal_action_world_queries_v1"}:
             world_queries = getattr(self.model, "future_dino_queries", None)
             if not isinstance(world_queries, torch.nn.Module):
                 raise RuntimeError(
@@ -522,7 +534,7 @@ class VLATrainer(TrainerUtils):
                 "World-predictor optimizer LR must be positive "
                 f"(scheduler initial/base LR), got {bad_groups}"
             )
-        if recipe == "shared_qwen_queries_v5":
+        if recipe == "causal_action_world_queries_v1":
             action_modules = {
                 "qwen_vl_interface": getattr(self.model, "qwen_vl_interface", None),
                 "action_queries": getattr(self.model, "action_queries", None),
@@ -545,7 +557,7 @@ class VLATrainer(TrainerUtils):
                         action_params.append(parameter)
             if empty_modules:
                 raise RuntimeError(
-                    "shared_qwen_queries_v5 requires trainable action-path modules: "
+                    "causal_action_world_queries_v1 requires trainable action-path modules: "
                     + ",".join(empty_modules)
                 )
             missing_action = [
@@ -711,13 +723,19 @@ class VLATrainer(TrainerUtils):
             max_gate = 0.0
 
         if phase == "predictor_warmup":
-            if not trainable("wam_visual_head") or not trainable("wam_state_ctx"):
-                raise RuntimeError("predictor_warmup requires trainable visual head and state conditioner")
+            if not trainable("wam_visual_head"):
+                raise RuntimeError("predictor_warmup requires a trainable visual head")
+            if bool(guidance.get("world_condition_on_state", False)) and not trainable(
+                "wam_state_ctx"
+            ):
+                raise RuntimeError(
+                    "state-conditioned predictor_warmup requires a trainable state conditioner"
+                )
             if recipe in {
                 "policy_first_v2",
                 "baseline_preserving_v3",
                 "isolated_queries_v4",
-                "shared_qwen_queries_v5",
+                "causal_action_world_queries_v1",
             }:
                 if not trainable("qwen_vl_interface"):
                     raise RuntimeError(
@@ -727,7 +745,7 @@ class VLATrainer(TrainerUtils):
                     raise RuntimeError(
                         f"{recipe} predictor_warmup requires a trainable action model"
                     )
-            if recipe in {"isolated_queries_v4", "shared_qwen_queries_v5"}:
+            if recipe in {"isolated_queries_v4", "causal_action_world_queries_v1"}:
                 if not trainable("action_queries"):
                     raise RuntimeError(
                         f"{recipe} warmup requires a trainable action query bank"
@@ -757,7 +775,7 @@ class VLATrainer(TrainerUtils):
                     "wam_act_ctx",
                     (
                         "future_dino_queries"
-                        if recipe in {"isolated_queries_v4", "shared_qwen_queries_v5"}
+                        if recipe in {"isolated_queries_v4", "causal_action_world_queries_v1"}
                         else ""
                     ),
                 )
@@ -770,7 +788,7 @@ class VLATrainer(TrainerUtils):
                 )
             if not trainable("action_model") or not trainable("world_adapter"):
                 raise RuntimeError("gate_ft requires trainable action_model and world_adapter")
-            if recipe in {"isolated_queries_v4", "shared_qwen_queries_v5"} and not trainable(
+            if recipe in {"isolated_queries_v4", "causal_action_world_queries_v1"} and not trainable(
                 "action_queries"
             ):
                 raise RuntimeError(
@@ -779,23 +797,25 @@ class VLATrainer(TrainerUtils):
         else:
             raise RuntimeError(f"Unsupported wam_two_stage_phase={phase!r}")
 
-        if recipe == "shared_qwen_queries_v5":
+        if recipe == "causal_action_world_queries_v1":
             if phase == "predictor_warmup":
+                warmup_modules = [
+                    "qwen_vl_interface",
+                    "action_queries",
+                    "action_model",
+                    "future_dino_queries",
+                    "wam_visual_head",
+                ]
+                if bool(guidance.get("world_condition_on_state", False)):
+                    warmup_modules.append("wam_state_ctx")
                 validate_optimizer_coverage(
-                    (
-                        "qwen_vl_interface",
-                        "action_queries",
-                        "action_model",
-                        "future_dino_queries",
-                        "wam_visual_head",
-                        "wam_state_ctx",
-                    ),
-                    label="causal shared-query warmup",
+                    tuple(warmup_modules),
+                    label="causal action/world query warmup",
                 )
             else:
                 validate_optimizer_coverage(
                     ("action_queries", "action_model", "world_adapter"),
-                    label="causal shared-query gate FT",
+                    label="causal action/world query gate FT",
                 )
 
         if self.accelerator.is_main_process:
@@ -1399,6 +1419,7 @@ class VLATrainer(TrainerUtils):
         """
         if task in {"joint_e2e", "joint_detached"}:
             action = output_dict["action_loss"]
+            action_raw = output_dict.get("action_loss_raw", action)
             world = output_dict["world_loss"]
             world_raw = output_dict.get("world_loss_raw", world)
             ratio = world.detach().abs() / action.detach().abs().clamp_min(1.0e-12)
@@ -1407,7 +1428,7 @@ class VLATrainer(TrainerUtils):
                 "train/loss_total": float(total_loss.detach()),
                 "train/loss_policy": float(action.detach()),
                 "train/loss_policy_weighted": float(action.detach()),
-                "train/loss_policy_raw": float(action.detach()),
+                "train/loss_policy_raw": float(action_raw.detach()),
                 "train/loss_world": float(world.detach()),
                 "train/loss_world_weighted": float(world.detach()),
                 "train/loss_world_raw": float(world_raw.detach()),
@@ -1441,6 +1462,19 @@ class VLATrainer(TrainerUtils):
                 value = output_dict.get(source_key)
                 if value is not None:
                     metrics[log_key] = float(value.detach())
+            text_loss = output_dict.get("text_loss")
+            if text_loss is not None:
+                metrics["train/loss_text"] = float(text_loss.detach())
+                metrics["train/loss_text_weighted"] = float(text_loss.detach())
+                metrics["train/loss_text_raw"] = float(
+                    output_dict.get("text_loss_raw", text_loss).detach()
+                )
+                metrics["train/text_annotated_samples"] = float(
+                    output_dict.get(
+                        "text_annotated_samples",
+                        text_loss.new_zeros(()),
+                    ).detach()
+                )
             return metrics
         logname = cls._TASK_LOGNAME.get(task, task)
         loss_key = cls._TASK_LOSS_KEY.get(task, f"{task}_loss")

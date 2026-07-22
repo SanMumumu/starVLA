@@ -24,7 +24,7 @@ framework:
     vl_hidden_dim: 2048
 
   action_model:
-    action_model_type: DiT-LAWAM
+    action_model_type: DiT-M
     action_hidden_dim: 1024
     hidden_size: 1024
     add_pos_embed: true

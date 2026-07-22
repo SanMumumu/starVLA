@@ -120,4 +120,9 @@ DATASET_NAMED_MIXTURES = {
     "robodojo_v21": [
         ("RoboDojo_lerobot_v21_video", 1.0, "robodojo_arx_x5"),
     ],
+    # One dataset contains both annotated and unannotated tasks. Optional
+    # per-frame subtask fields are masked sample-by-sample by the joint loader.
+    "robodojo_v21_language_optional": [
+        ("RoboDojo_lerobot_v21_language_v1", 1.0, "robodojo_arx_x5"),
+    ],
 }

@@ -143,6 +143,7 @@ def build_param_lr_groups(model, cfg):
                 (
                     "wam_visual_head.",
                     "wam_state_ctx.",
+                    "wam_current_dino_proj.",
                     "wam_act_ctx.",
                     "future_dino_queries.",
                 )

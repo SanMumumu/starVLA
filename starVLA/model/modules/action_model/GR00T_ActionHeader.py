@@ -245,7 +245,7 @@ class FlowmatchingActionHeadConfig(PretrainedConfig):
 
 DiTConfig = {
     "DiT-B": {"input_embedding_dim": 768, "attention_head_dim": 64, "num_attention_heads": 12},
-    "DiT-LAWAM": {"input_embedding_dim": 1024, "attention_head_dim": 64, "num_attention_heads": 16},
+    "DiT-M": {"input_embedding_dim": 1024, "attention_head_dim": 64, "num_attention_heads": 16},
     "DiT-L": {"input_embedding_dim": 1536, "attention_head_dim": 48, "num_attention_heads": 32},
 }
 
@@ -272,9 +272,9 @@ class FlowmatchingActionHead(nn.Module):
 
         # ------------------------------------------------------------------
         # DiT architecture selection
-        #   action_model_type: "DiT-B" | "DiT-LAWAM" | "DiT-L"
+        #   action_model_type: "DiT-B" | "DiT-M" | "DiT-L"
         #     DiT-B → input_embedding_dim=768,  heads=12, head_dim=64
-        #     DiT-LAWAM → input_embedding_dim=1024, heads=16, head_dim=64
+        #     DiT-M → input_embedding_dim=1024, heads=16, head_dim=64
         #     DiT-L → input_embedding_dim=1536, heads=32, head_dim=48
         #   diffusion_model_cfg overrides/extends the base DiT shape.
         #   In particular, diffusion_model_cfg.cross_attention_dim MUST be

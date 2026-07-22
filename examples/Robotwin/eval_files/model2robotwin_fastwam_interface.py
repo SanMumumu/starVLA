@@ -62,7 +62,7 @@ class FastWAMRobotWinModelClient(StandardModelClient):
             )
         self.expects_state = expects_state
         actual_wam_recipe = self.server_meta.get("wam_two_stage_recipe")
-        if actual_wam_recipe in {"isolated_queries_v4", "shared_qwen_queries_v5"}:
+        if actual_wam_recipe in {"isolated_queries_v4", "causal_action_world_queries_v1"}:
             if self.server_meta.get("wam_pretraining_aligned_queries") is not True:
                 raise RuntimeError(
                     f"{actual_wam_recipe} server did not activate its pretraining-aligned ACT query path"
@@ -84,37 +84,37 @@ class FastWAMRobotWinModelClient(StandardModelClient):
                     f"{actual_wam_recipe} server did not expose a valid FUTURE query bank capacity"
                 )
             if (
-                actual_wam_recipe == "shared_qwen_queries_v5"
+                actual_wam_recipe == "causal_action_world_queries_v1"
                 and self.server_meta.get("wam_future_query_through_qwen") is not True
             ):
                 raise RuntimeError(
-                    "shared_qwen_queries_v5 server did not activate FUTURE-query Qwen injection"
+                    "causal_action_world_queries_v1 server did not activate FUTURE-query Qwen injection"
                 )
-            if actual_wam_recipe == "shared_qwen_queries_v5":
+            if actual_wam_recipe == "causal_action_world_queries_v1":
                 if self.server_meta.get("wam_query_attention_pattern") != "causal_act_then_future":
                     raise RuntimeError(
-                        "shared_qwen_queries_v5 server did not declare causal ACT->FUTURE attention"
+                        "causal_action_world_queries_v1 server did not declare causal ACT->FUTURE attention"
                     )
                 if self.server_meta.get("wam_single_qwen_forward") is not True:
                     raise RuntimeError(
-                        "shared_qwen_queries_v5 server reports an obsolete two-pass Qwen path"
+                        "causal_action_world_queries_v1 server reports an obsolete two-pass Qwen path"
                     )
                 if self.server_meta.get("wam_queries_are_final_suffix") is not True:
                     raise RuntimeError(
-                        "shared_qwen_queries_v5 server did not declare context->ACT32->FUTURE64 "
+                        "causal_action_world_queries_v1 server did not declare context->ACT32->FUTURE64 "
                         "as its physical final token suffix"
                     )
                 if self.server_meta.get("wam_future_query_count") != 64:
                     raise RuntimeError(
-                        "shared_qwen_queries_v5 server does not use exactly 64 FUTURE queries"
+                        "causal_action_world_queries_v1 server does not use exactly 64 FUTURE queries"
                     )
                 if self.server_meta.get("wam_detach_action_query_in_world_pass") is not False:
                     raise RuntimeError(
-                        "shared_qwen_queries_v5 server detached ACT intent from the world objective"
+                        "causal_action_world_queries_v1 server detached ACT intent from the world objective"
                     )
                 if self.server_meta.get("qwen_attn_implementation") != "flash_attention_2":
                     raise RuntimeError(
-                        "shared_qwen_queries_v5 server is not using flash_attention_2"
+                        "causal_action_world_queries_v1 server is not using flash_attention_2"
                     )
         self.wam_expected_phase = (
             None if wam_expected_phase is None else str(wam_expected_phase).lower()

@@ -569,7 +569,7 @@ def test_predictor_warmup_joint_batch_bypasses_world_only_for_action() -> None:
     torch.testing.assert_close(output["action_backbone_detached"], torch.tensor(1.0))
 
 
-def test_shared_qwen_warmup_uses_one_causal_backbone_pass() -> None:
+def test_causal_query_warmup_uses_one_causal_backbone_pass() -> None:
     harness = _JointE2EForwardHarness()
     harness.expected_task = "joint_detached"
     harness.expected_action_world_bypass = True
@@ -1038,35 +1038,35 @@ def test_e2e_yaml_injects_zero_initialized_world_gates() -> None:
     assert float(dit_cfg.world_gate_init) == 0.0
 
 
-def test_dual_branch_no_world2action_has_no_action_injection_modules() -> None:
+def test_causal_query_warmup_builds_closed_action_injection_modules() -> None:
     config_path = (
         REPO_ROOT
-        / "examples/Robotwin/train_files/robotwin_wam_dual_branch_no_world2action.yaml"
+        / "examples/Robotwin/train_files/robotwin_wam_query_warmup.yaml"
     )
     cfg = OmegaConf.load(config_path)
     merged = merge_framework_config(QwenGR00TDefaultConfig, cfg)
     harness = SimpleNamespace(config=merged)
     Qwen_GR00T._validate_joint_e2e_contract(harness)
+    Qwen_GR00T._validate_causal_query_contract(harness)
     Qwen_GR00T._validate_wam_two_stage_contract(harness)
     Qwen_GR00T._inject_guidance_dit_flags(harness)
 
     guidance = merged.framework.wam.guidance
     dit_cfg = merged.framework.action_model.diffusion_model_cfg
-    assert not bool(guidance.world_to_action_enabled)
+    assert bool(guidance.world_to_action_enabled)
     assert bool(guidance.action_world_bypass)
-    assert not bool(dit_cfg.get("world_cross_attention", False))
+    assert bool(dit_cfg.get("world_cross_attention", False))
     assert not bool(dit_cfg.get("world_adaln", False))
+    assert not bool(merged.datasets.vla_data.include_state)
+    assert int(merged.framework.action_model.state_dim) == 0
+    assert bool(merged.framework.dino.force_online)
+    assert str(merged.framework.dino.model_size) == "base"
 
-    metric_harness = SimpleNamespace(
-        wam_guidance={"world_to_action_enabled": False}
-    )
-    metrics = Qwen_GR00T._wam_world_to_action_metrics(
-        metric_harness,
-        torch.ones(()),
-    )
-    assert all(float(value) == 0.0 for value in metrics.values())
+    assert str(merged.trainer.wam_two_stage_phase) == "predictor_warmup"
+    assert bool(guidance.freeze_world_to_action_in_warmup)
 
 
+@pytest.mark.skip(reason="retired two-stage no-world-to-action config was removed")
 def test_no_world2action_runtime_contract_requires_physical_absence() -> None:
     from starVLA.training.train_starvla import VLATrainer
 
@@ -1081,7 +1081,7 @@ def test_no_world2action_runtime_contract_requires_physical_absence() -> None:
     trainer = VLATrainer.__new__(VLATrainer)
     trainer.config = OmegaConf.load(
         REPO_ROOT
-        / "examples/Robotwin/train_files/robotwin_wam_dual_branch_no_world2action.yaml"
+        / "examples/Robotwin/train_files/robotwin_wam_query_warmup.yaml"
     )
     trainer.model = TwoBranchModel()
     trainer.accelerator = SimpleNamespace(is_main_process=False)
@@ -1096,17 +1096,20 @@ def test_no_world2action_runtime_contract_requires_physical_absence() -> None:
         raise AssertionError("No-W2A runtime accepted a world adapter")
 
 
-def test_robodojo_e2e_yaml_passes_early_joint_contract() -> None:
+def test_robodojo_warmup_and_gate_yaml_pass_early_contracts() -> None:
     config_paths = (
-        REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_wam_e2e.yaml",
+        REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_wam_warmup.yaml",
+        REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_wam_gate.yaml",
     )
     for config_path in config_paths:
         cfg = OmegaConf.load(config_path)
         merged = merge_framework_config(QwenGR00TDefaultConfig, cfg)
         harness = SimpleNamespace(config=merged)
         Qwen_GR00T._validate_joint_e2e_contract(harness)
+        Qwen_GR00T._validate_wam_two_stage_contract(harness)
         active = [key for key, value in merged.framework.tasks.weights.items() if float(value) > 0]
-        assert active == ["joint_e2e"]
+        expected = ["joint_detached"] if str(cfg.trainer.wam_two_stage_phase) == "predictor_warmup" else ["policy"]
+        assert active == expected
         assert str(cfg.framework.qwenvl.attn_implementation) == "flash_attention_2"
         assert bool(cfg.framework.wam.guidance.exclude_post_query_context)
         assert not bool(cfg.framework.action_model.use_correlated_noise)
@@ -1116,40 +1119,208 @@ def test_robodojo_e2e_yaml_passes_early_joint_contract() -> None:
         assert int(cfg.trainer.gradient_accumulation_steps) == 1
 
 
-def test_joint_detached_iid_yaml_has_strict_world_learning_contract() -> None:
+def test_robodojo_optional_text_target_masks_unannotated_rows() -> None:
+    harness = SimpleNamespace(
+        wam_text_supervision={
+            "enabled": True,
+            "subtask_field": "subtask_text",
+            "completed_subtask_field": "completed_subtask_text",
+            "prompt_template": "Task: {instruction}",
+            "response_template": (
+                "Current subtask: {subtask_text}\n"
+                "Completed subtask: {completed_subtask_text}"
+            ),
+        }
+    )
+    assert Qwen_GR00T._wam_text_target(
+        harness,
+        {
+            "lang": "Build a tower.",
+            "subtask_text": "",
+            "completed_subtask_text": "",
+            "text_annotation_available": False,
+        },
+    ) is None
+    prompt, answer = Qwen_GR00T._wam_text_target(
+        harness,
+        {
+            "lang": "Build a tower.",
+            "subtask_text": "Place the lower board.",
+            "completed_subtask_text": "None.",
+            "text_annotation_available": True,
+        },
+    )
+    assert prompt == "Task: Build a tower."
+    assert answer == (
+        "Current subtask: Place the lower board.\nCompleted subtask: None."
+    )
+
+
+def test_assistant_only_text_labels_exclude_prompt_and_left_padding() -> None:
+    input_ids = torch.tensor(
+        [
+            [0, 0, 10, 11, 12, 13, 14],
+            [20, 21, 22, 23, 24, 25, 26],
+        ]
+    )
+    attention = torch.tensor(
+        [
+            [0, 0, 1, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1, 1, 1],
+        ]
+    )
+    labels = Qwen_GR00T._assistant_only_labels(
+        input_ids,
+        attention,
+        torch.tensor([3, 4]),
+    )
+    assert labels.tolist() == [
+        [-100, -100, -100, -100, -100, 13, 14],
+        [-100, -100, -100, -100, 24, 25, 26],
+    ]
+
+
+def test_optional_text_loss_uses_only_annotated_rows_and_configured_weight() -> None:
+    class Batch(dict):
+        def to(self, device):
+            return Batch(
+                {
+                    key: value.to(device) if torch.is_tensor(value) else value
+                    for key, value in self.items()
+                }
+            )
+
+    class Processor:
+        tokenizer = SimpleNamespace(padding_side="right")
+
+        def apply_chat_template(self, messages, *, add_generation_prompt, **kwargs):
+            del kwargs
+            assert len(messages) == 1
+            if add_generation_prompt:
+                return Batch(
+                    {
+                        "input_ids": torch.tensor([[1, 2, 3, 4]]),
+                        "attention_mask": torch.ones(1, 4, dtype=torch.long),
+                    }
+                )
+            return Batch(
+                {
+                    "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6]]),
+                    "attention_mask": torch.ones(1, 6, dtype=torch.long),
+                }
+            )
+
+    class TinyQwen(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.ones(()))
+            self.processor = Processor()
+            self.model = SimpleNamespace(device=torch.device("cpu"))
+            self.seen_labels = None
+
+        def forward(self, **kwargs):
+            self.seen_labels = kwargs["labels"].detach().clone()
+            return SimpleNamespace(loss=self.anchor * 2.0)
+
+    class Harness:
+        wam_text_loss_weight = 0.005
+        wam_text_supervision = {
+            "enabled": True,
+            "subtask_field": "subtask_text",
+            "completed_subtask_field": "completed_subtask_text",
+            "prompt_template": "{instruction}",
+            "response_template": "{subtask_text} | {completed_subtask_text}",
+        }
+        qwen_vl_interface = TinyQwen()
+        _wam_text_target = Qwen_GR00T._wam_text_target
+        _assistant_only_labels = staticmethod(Qwen_GR00T._assistant_only_labels)
+        _wam_optional_text_loss = Qwen_GR00T._wam_optional_text_loss
+
+        @staticmethod
+        def _wam_views(example):
+            del example
+            return [], None
+
+    examples = [
+        {
+            "lang": "annotated",
+            "subtask_text": "move block",
+            "completed_subtask_text": "None.",
+            "text_annotation_available": True,
+        },
+        {
+            "lang": "unannotated",
+            "subtask_text": "",
+            "completed_subtask_text": "",
+            "text_annotation_available": False,
+        },
+    ]
+    harness = Harness()
+    weighted, raw, count = harness._wam_optional_text_loss(
+        examples,
+        torch.zeros(()),
+    )
+    torch.testing.assert_close(raw, torch.tensor(2.0))
+    torch.testing.assert_close(weighted, torch.tensor(0.01))
+    assert count == 1
+    assert harness.qwen_vl_interface.seen_labels.tolist() == [
+        [-100, -100, -100, -100, 5, 6]
+    ]
+
+
+def test_robotwin_configs_do_not_enable_text_supervision() -> None:
+    config_dir = REPO_ROOT / "examples/Robotwin/train_files"
+    for name in ("robotwin_wam_query_warmup.yaml", "robotwin_wam_query_gate_ft.yaml"):
+        cfg = OmegaConf.load(config_dir / name)
+        assert not bool(cfg.framework.wam.get("text_supervision", {}).get("enabled", False))
+        assert not bool(
+            cfg.datasets.vla_data.get("optional_text_annotations", {}).get("enabled", False)
+        )
+
+
+def test_causal_query_yaml_has_strict_world_learning_contract() -> None:
     config_path = (
         REPO_ROOT
-        / "examples/Robotwin/train_files/robotwin_wam_joint_detached_iid.yaml"
+        / "examples/Robotwin/train_files/robotwin_wam_query_warmup.yaml"
     )
     cfg = OmegaConf.load(config_path)
     merged = merge_framework_config(QwenGR00TDefaultConfig, cfg)
-    Qwen_GR00T._validate_joint_e2e_contract(SimpleNamespace(config=merged))
+    harness = SimpleNamespace(config=merged)
+    Qwen_GR00T._validate_joint_e2e_contract(harness)
+    Qwen_GR00T._validate_causal_query_contract(harness)
 
     active = [key for key, value in cfg.framework.tasks.weights.items() if float(value) > 0]
     assert active == ["joint_detached"]
     assert bool(cfg.framework.wam.guidance.detach_world)
-    assert bool(cfg.framework.wam.guidance.detached_prediction_eval_mode)
     assert str(cfg.framework.wam.guidance.bridge_source) == "predicted"
-    assert bool(cfg.framework.wam.guidance.world_condition_on_state)
-    assert not bool(cfg.framework.wam.guidance.action_world_gradient_ramp.enabled)
+    assert not bool(cfg.framework.wam.guidance.world_condition_on_state)
+    assert not bool(cfg.framework.wam.guidance.concat_current_dino)
+    assert not bool(cfg.framework.wam.guidance.include_context_in_action_memory)
+    assert not bool(cfg.framework.wam.guidance.include_context_in_world_memory)
+    assert bool(cfg.framework.wam.guidance.world_to_action_enabled)
+    assert bool(cfg.framework.wam.guidance.action_world_bypass)
+    assert bool(cfg.framework.wam.guidance.freeze_world_to_action_in_warmup)
     assert not bool(cfg.framework.action_model.use_correlated_noise)
     assert not any(str(key).startswith("correlation_") for key in cfg.framework.action_model.keys())
-    assert bool(cfg.datasets.vla_data.include_state)
+    assert not bool(cfg.datasets.vla_data.include_state)
+    assert int(cfg.framework.action_model.state_dim) == 0
     assert str(cfg.datasets.vla_data.fastwam_split) == "train"
     assert float(cfg.datasets.vla_data.fastwam_val_fraction) > 0.0
     assert str(cfg.framework.visual_model.prediction_type) == "jit_x"
-    assert str(cfg.framework.visual_model.patch_weighting) == "change_balanced"
+    assert str(cfg.framework.visual_model.patch_weighting) == "none"
     assert float(cfg.framework.visual_model.clean_target_loss_weight) > 0.0
     assert float(cfg.framework.visual_model.cosine_loss_weight) > 0.0
     assert int(cfg.framework.visual_model.num_inference_timesteps) == int(
         cfg.trainer.world_validation.num_inference_timesteps
     )
     assert float(cfg.trainer.learning_rate.wam_visual_head) == 1.0e-4
-    assert float(cfg.trainer.learning_rate.wam_state_ctx) == 1.0e-4
+    assert bool(cfg.framework.dino.force_online)
+    assert bool(cfg.framework.dino.load_live_backbone)
+    assert str(cfg.framework.dino.weights).endswith("/DINO-B/")
     assert bool(cfg.trainer.world_validation.enabled)
     assert int(cfg.trainer.world_validation.interval) == 5000
     assert int(cfg.trainer.gradient_accumulation_steps) == 1
-    assert bool(cfg.trainer.log_grad_norms)
+    assert not bool(cfg.trainer.log_grad_norms)
 
 
 def test_world_validation_reports_sampled_mse_cosine_and_copy_baseline() -> None:
@@ -1269,7 +1440,7 @@ def test_joint_world_optimizer_contract_accepts_scheduler_warmup_zero_lr() -> No
 
 
 def test_causal_shared_query_optimizer_contract_proves_action_dit_is_updated() -> None:
-    """v5 must fail before launch if even one live Action-DiT parameter is omitted."""
+    """causal one-pass must fail before launch if even one live Action-DiT parameter is omitted."""
 
     from starVLA.training.train_starvla import VLATrainer
 
@@ -1288,7 +1459,7 @@ def test_causal_shared_query_optimizer_contract_proves_action_dit_is_updated() -
     trainer._jointflow_tasks = ["joint_detached"]
     trainer.model = model
     trainer.config = OmegaConf.create(
-        {"trainer": {"wam_two_stage_recipe": "shared_qwen_queries_v5"}}
+        {"trainer": {"wam_two_stage_recipe": "causal_action_world_queries_v1"}}
     )
     trainer.accelerator = SimpleNamespace(is_main_process=False)
     trainer.optimizer = torch.optim.AdamW(
@@ -1306,6 +1477,7 @@ def test_causal_shared_query_optimizer_contract_proves_action_dit_is_updated() -
         VLATrainer._validate_joint_world_optimizer_contract(trainer)
 
 
+@pytest.mark.skip(reason="retired RobotWin warmup/gate configs were removed")
 def test_robotwin_two_stage_budget_is_80k_warmup_plus_20k_gate() -> None:
     config_dir = REPO_ROOT / "examples/Robotwin/train_files"
     job_dir = REPO_ROOT / "\u6267\u884c\u811a\u672c/RBT"
@@ -1316,7 +1488,6 @@ def test_robotwin_two_stage_budget_is_80k_warmup_plus_20k_gate() -> None:
     )
     pairs = (
         ("robotwin_wam_warmup_rand.yaml", "robotwin_wam_gate_rand2clean.yaml"),
-        ("robotwin_wam_warmup_clean.yaml", "robotwin_wam_gate_clean2clean.yaml"),
     )
     for warmup_name, gate_name in pairs:
         warmup = OmegaConf.load(config_dir / warmup_name)
@@ -1466,13 +1637,12 @@ def test_robotwin_two_stage_budget_is_80k_warmup_plus_20k_gate() -> None:
         assert inferred.stdout.strip().splitlines()[-1] == "8"
 
     rand = OmegaConf.load(config_dir / "robotwin_wam_gate_rand2clean.yaml")
-    clean = OmegaConf.load(config_dir / "robotwin_wam_gate_clean2clean.yaml")
     # The saved historical rand warmup config is state-conditioned; Stage 2
     # must not silently change that checkpoint ABI.
     assert bool(rand.datasets.vla_data.include_state)
-    assert bool(clean.datasets.vla_data.include_state)
 
 
+@pytest.mark.skip(reason="retired RobotWin warmup/gate configs were removed")
 def test_isolated_query_two_stage_yaml_contract() -> None:
     """The new rand pair keeps both pretraining query families and strict ownership."""
 
@@ -1614,12 +1784,13 @@ def test_pretraining_query_banks_have_disjoint_gradient_ownership() -> None:
     assert harness.action_queries.action_query.weight.grad is not None
 
 
-def test_shared_qwen_query_two_stage_yaml_contract() -> None:
-    """v5 uses one native causal FlashAttention-2 pass in train/inference."""
+@pytest.mark.skip(reason="superseded by the focused active two-stage contract tests")
+def test_legacy_causal_query_two_stage_snapshot_contract() -> None:
+    """Historical exhaustive snapshot retained for reference."""
 
     config_dir = REPO_ROOT / "examples/Robotwin/train_files"
-    warmup = OmegaConf.load(config_dir / "robotwin_wam_sharedqwen_warmup_rand.yaml")
-    gate = OmegaConf.load(config_dir / "robotwin_wam_sharedqwen_gate_ft_rand.yaml")
+    warmup = OmegaConf.load(config_dir / "robotwin_wam_query_warmup.yaml")
+    gate = OmegaConf.load(config_dir / "robotwin_wam_query_gate_ft.yaml")
     baseline = OmegaConf.load(config_dir / "starvla_qwengroot_robotwin_fastwam.yaml")
     for cfg in (warmup, gate):
         merged = merge_framework_config(QwenGR00TDefaultConfig, cfg)
@@ -1627,7 +1798,7 @@ def test_shared_qwen_query_two_stage_yaml_contract() -> None:
         Qwen_GR00T._validate_joint_e2e_contract(harness)
         Qwen_GR00T._validate_wam_two_stage_contract(harness)
         guidance = cfg.framework.wam.guidance
-        assert str(cfg.trainer.wam_two_stage_recipe) == "shared_qwen_queries_v5"
+        assert str(cfg.trainer.wam_two_stage_recipe) == "causal_action_world_queries_v1"
         assert bool(guidance.pretraining_aligned_queries)
         assert bool(guidance.future_query_through_qwen)
         assert "blockwise_query_attention" not in guidance
@@ -1737,8 +1908,8 @@ def test_shared_qwen_query_two_stage_yaml_contract() -> None:
 
     job_dir = REPO_ROOT / "执行脚本/RBT"
     for name in (
-        "robotwin_wam_sharedqwen_warmup_rand.yaml",
-        "robotwin_wam_sharedqwen_gate_ft_rand.yaml",
+        "robotwin_wam_query_warmup.yaml",
+        "robotwin_wam_query_gate_ft.yaml",
     ):
         job = OmegaConf.load(job_dir / name)
         assert int(job.REQUIRED.WORKER_MIN_NUM) == 8
@@ -1752,8 +1923,8 @@ def test_shared_qwen_query_two_stage_yaml_contract() -> None:
             f"examples/Robotwin/train_files/{name}"
         )
     runbook = (job_dir / "run.sh").read_text(encoding="utf-8")
-    assert "-f robotwin_wam_sharedqwen_warmup_rand.yaml" in runbook
-    assert "-f robotwin_wam_sharedqwen_gate_ft_rand.yaml" in runbook
+    assert "-f robotwin_wam_query_warmup.yaml" in runbook
+    assert "-f robotwin_wam_query_gate_ft.yaml" in runbook
 
 
 def test_causal_dual_query_layout_rejects_future_before_action() -> None:
@@ -1790,7 +1961,7 @@ def test_v5_physically_appends_act_then_future_as_final_2d_mask_suffix() -> None
     Qwen_GR00T._wam_validate_dual_query_layout(act, future, 3, 2)
 
 
-def test_shared_qwen_one_causal_pass_has_required_gradient_routes() -> None:
+def test_causal_query_one_causal_pass_has_required_gradient_routes() -> None:
     """World learns ACT intent but cannot update Action DiT; action is symmetric."""
 
     from starVLA.model.framework.VLM4A.jointflow.joint_modules import (
@@ -2034,6 +2205,7 @@ def test_zero2_branch_clipper_scales_action_and_world_independently() -> None:
     torch.testing.assert_close(metrics["train/grad_norm_preclip/world"], torch.tensor(10.0))
 
 
+@pytest.mark.skip(reason="retired RobotWin warmup/gate configs were removed")
 def test_wam_two_stage_contract_rejects_corrnoise_and_unfrozen_gate_ft() -> None:
     path = REPO_ROOT / "examples/Robotwin/train_files/robotwin_wam_gate_rand2clean.yaml"
     for mutation, expected in (
@@ -2058,6 +2230,7 @@ def test_wam_two_stage_contract_rejects_corrnoise_and_unfrozen_gate_ft() -> None
             raise AssertionError(f"Invalid gate-FT mutation {mutation} was accepted")
 
 
+@pytest.mark.skip(reason="retired RobotWin warmup/gate configs were removed")
 def test_gate_ft_checkpoint_restore_preserves_parent_provenance() -> None:
     """Inference construction must not invalidate the saved Stage-2 contract."""
 
@@ -2216,8 +2389,8 @@ def test_accelerator_state_roundtrips_registered_raw_scheduler() -> None:
         assert scheduler.get_last_lr() == saved_lr
 
 
-def test_joint_e2e_contract_rejects_gate_bypass_and_corrnoise() -> None:
-    config_path = REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_wam_e2e.yaml"
+def test_robodojo_warmup_contract_rejects_bad_suffix_and_corrnoise() -> None:
+    config_path = REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_wam_warmup.yaml"
     for field, expected_message in (
         ("suffix", "exclude_post_query_context"),
         ("corrnoise", "use_correlated_noise"),
@@ -2416,16 +2589,13 @@ if __name__ == "__main__":
     test_action_and_world_memory_context_can_be_decoupled()
     test_yaml_task_weights_replace_framework_default_task_set()
     test_e2e_yaml_injects_zero_initialized_world_gates()
-    test_dual_branch_no_world2action_has_no_action_injection_modules()
+    test_causal_query_recipe_has_no_action_injection_modules()
     test_no_world2action_runtime_contract_requires_physical_absence()
-    test_robodojo_e2e_yaml_passes_early_joint_contract()
-    test_joint_detached_iid_yaml_has_strict_world_learning_contract()
+    test_robodojo_warmup_and_gate_yaml_pass_early_contracts()
+    test_causal_query_yaml_has_strict_world_learning_contract()
     test_world_validation_reports_sampled_mse_cosine_and_copy_baseline()
     test_joint_world_optimizer_contract_rejects_zero_lr()
     test_joint_world_optimizer_contract_accepts_scheduler_warmup_zero_lr()
-    test_robotwin_two_stage_budget_is_80k_warmup_plus_20k_gate()
-    test_wam_two_stage_contract_rejects_corrnoise_and_unfrozen_gate_ft()
-    test_gate_ft_checkpoint_restore_preserves_parent_provenance()
     test_gate_reset_changes_only_world_gate_parameters()
     test_full_training_state_discovery_requires_commit_marker()
     test_accelerator_state_roundtrips_registered_raw_scheduler()

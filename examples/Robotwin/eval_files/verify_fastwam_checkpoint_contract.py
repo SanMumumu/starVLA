@@ -50,7 +50,6 @@ def verify(
     expected = {
         "framework.name": "QwenGR00T",
         "framework.action_model.action_dim": 14,
-        "framework.action_model.state_dim": 14,
         "framework.action_model.action_horizon": 32,
         "datasets.vla_data.dataset_py": "lerobot_datasets",
         "datasets.vla_data.data_mix": "robotwin_fastwam",
@@ -72,6 +71,13 @@ def verify(
             errors.append(f"{path}: expected {wanted!r}, got {actual!r}")
 
     expects_state, state_contract_source = resolve_config_expects_state(config)
+    expected_state_dim = 14 if expects_state else 0
+    actual_state_dim = config.get("framework", {}).get("action_model", {}).get("state_dim")
+    if actual_state_dim != expected_state_dim:
+        errors.append(
+            "framework.action_model.state_dim: expected "
+            f"{expected_state_dim!r} for expects_state={expects_state}, got {actual_state_dim!r}"
+        )
     if replan_steps != 24:
         errors.append(f"replan_steps must be 24 for this FastWAM evaluation, got {replan_steps}")
     if not 1 <= replan_steps <= 32:
@@ -123,11 +129,11 @@ def verify(
         "policy_first_v2",
         "baseline_preserving_v3",
         "isolated_queries_v4",
-        "shared_qwen_queries_v5",
+        "causal_action_world_queries_v1",
     }:
         errors.append(
             "trainer.wam_two_stage_recipe must be legacy_v1, policy_first_v2, "
-            "baseline_preserving_v3, isolated_queries_v4, or shared_qwen_queries_v5, got "
+            "baseline_preserving_v3, isolated_queries_v4, or causal_action_world_queries_v1, got "
             f"{actual_wam_recipe!r}"
         )
     if expected_wam_phase is not None:
@@ -145,11 +151,16 @@ def verify(
             "framework.wam.guidance.bridge_source": "predicted",
             "framework.wam.guidance.detach_world": True,
             "framework.wam.guidance.detached_prediction_eval_mode": True,
-            "framework.wam.guidance.world_condition_on_state": True,
-            "framework.wam.guidance.include_context_in_action_memory": True,
-            "framework.wam.guidance.include_context_in_world_memory": True,
             "framework.wam.guidance.world_eval_mode": "correct",
         }
+        query_only = actual_wam_recipe == "causal_action_world_queries_v1"
+        common_wam_expected.update(
+            {
+                "framework.wam.guidance.world_condition_on_state": not query_only,
+                "framework.wam.guidance.include_context_in_action_memory": not query_only,
+                "framework.wam.guidance.include_context_in_world_memory": not query_only,
+            }
+        )
         for path, wanted in common_wam_expected.items():
             try:
                 actual = _get(config, path)
@@ -197,18 +208,18 @@ def verify(
                         errors.append(
                             "isolated_queries_v4 gate_ft is missing pretraining-aligned queries"
                         )
-            if actual_wam_recipe == "shared_qwen_queries_v5":
+            if actual_wam_recipe == "causal_action_world_queries_v1":
                 if bool(guidance_cfg.get("detach_action_backbone", False)):
                     errors.append(
-                        "shared_qwen_queries_v5 gate_ft must keep detach_action_backbone=false"
+                        "causal_action_world_queries_v1 gate_ft must keep detach_action_backbone=false"
                     )
                 if bool(guidance_cfg.get("detach_world_backbone", False)):
                     errors.append(
-                        "shared_qwen_queries_v5 gate_ft must preserve detach_world_backbone=false"
+                        "causal_action_world_queries_v1 gate_ft must preserve detach_world_backbone=false"
                     )
                 if bool(guidance_cfg.get("baseline_action_context", False)):
                     errors.append(
-                        "shared_qwen_queries_v5 gate_ft must use the explicit ACT query path"
+                        "causal_action_world_queries_v1 gate_ft must use the explicit ACT query path"
                     )
                 for key in (
                     "pretraining_aligned_queries",
@@ -216,7 +227,7 @@ def verify(
                 ):
                     if not bool(guidance_cfg.get(key, False)):
                         errors.append(
-                            f"shared_qwen_queries_v5 gate_ft requires guidance.{key}=true"
+                            f"causal_action_world_queries_v1 gate_ft requires guidance.{key}=true"
                         )
                 for obsolete_key in (
                     "separate_world_backbone_pass",
@@ -224,17 +235,17 @@ def verify(
                 ):
                     if bool(guidance_cfg.get(obsolete_key, False)):
                         errors.append(
-                            "shared_qwen_queries_v5 gate_ft is one-pass and requires "
+                            "causal_action_world_queries_v1 gate_ft is one-pass and requires "
                             f"guidance.{obsolete_key}=false"
                         )
                 if str(framework_cfg.get("qwenvl", {}).get("attn_implementation", "")).lower() != "flash_attention_2":
                     errors.append(
-                        "shared_qwen_queries_v5 gate_ft requires "
+                        "causal_action_world_queries_v1 gate_ft requires "
                         "qwenvl.attn_implementation=flash_attention_2"
                     )
                 if not bool(framework_cfg.get("qwenvl", {}).get("require_attn_implementation", False)):
                     errors.append(
-                        "shared_qwen_queries_v5 gate_ft requires "
+                        "causal_action_world_queries_v1 gate_ft requires "
                         "qwenvl.require_attn_implementation=true"
                     )
         elif expected_wam_phase == "predictor_warmup":
@@ -272,18 +283,18 @@ def verify(
                         errors.append(
                             "isolated_queries_v4 predictor_warmup is missing pretraining-aligned queries"
                         )
-            elif actual_wam_recipe == "shared_qwen_queries_v5":
+            elif actual_wam_recipe == "causal_action_world_queries_v1":
                 if bool(guidance_cfg.get("detach_action_backbone", False)):
                     errors.append(
-                        "shared_qwen_queries_v5 predictor_warmup must let action loss update Qwen"
+                        "causal_action_world_queries_v1 predictor_warmup must let action loss update Qwen"
                     )
                 if bool(guidance_cfg.get("detach_world_backbone", False)):
                     errors.append(
-                        "shared_qwen_queries_v5 predictor_warmup must let world loss update Qwen"
+                        "causal_action_world_queries_v1 predictor_warmup must let world loss update Qwen"
                     )
                 if bool(guidance_cfg.get("baseline_action_context", False)):
                     errors.append(
-                        "shared_qwen_queries_v5 predictor_warmup must use the explicit ACT query path"
+                        "causal_action_world_queries_v1 predictor_warmup must use the explicit ACT query path"
                     )
                 for key in (
                     "pretraining_aligned_queries",
@@ -292,7 +303,7 @@ def verify(
                 ):
                     if not bool(guidance_cfg.get(key, False)):
                         errors.append(
-                            f"shared_qwen_queries_v5 predictor_warmup requires guidance.{key}=true"
+                            f"causal_action_world_queries_v1 predictor_warmup requires guidance.{key}=true"
                         )
                 for obsolete_key in (
                     "separate_world_backbone_pass",
@@ -300,22 +311,22 @@ def verify(
                 ):
                     if bool(guidance_cfg.get(obsolete_key, False)):
                         errors.append(
-                            "shared_qwen_queries_v5 predictor_warmup is one-pass and requires "
+                            "causal_action_world_queries_v1 predictor_warmup is one-pass and requires "
                             f"guidance.{obsolete_key}=false"
                         )
                 if str(framework_cfg.get("qwenvl", {}).get("attn_implementation", "")).lower() != "flash_attention_2":
                     errors.append(
-                        "shared_qwen_queries_v5 predictor_warmup requires "
+                        "causal_action_world_queries_v1 predictor_warmup requires "
                         "qwenvl.attn_implementation=flash_attention_2"
                     )
                 if not bool(framework_cfg.get("qwenvl", {}).get("require_attn_implementation", False)):
                     errors.append(
-                        "shared_qwen_queries_v5 predictor_warmup requires "
+                        "causal_action_world_queries_v1 predictor_warmup requires "
                         "qwenvl.require_attn_implementation=true"
                     )
                 if int(trainer_cfg.get("num_warmup_steps", 0)) != 2000:
                     errors.append(
-                        "shared_qwen_queries_v5 predictor_warmup must use 2000 LR warmup steps"
+                        "causal_action_world_queries_v1 predictor_warmup must use 2000 LR warmup steps"
                     )
             elif not bool(guidance_cfg.get("detach_action_backbone", False)):
                 errors.append("legacy predictor_warmup checkpoint must detach the action backbone")
@@ -326,20 +337,20 @@ def verify(
             if int(trainer_cfg.get("max_train_steps", 0)) != 80000:
                 errors.append("predictor_warmup checkpoint must record max_train_steps=80000")
 
-        if actual_wam_recipe == "shared_qwen_queries_v5":
+        if actual_wam_recipe == "causal_action_world_queries_v1":
             if str(guidance_cfg.get("prompt_mode", "")).lower() != "dual_query":
-                errors.append("shared_qwen_queries_v5 requires guidance.prompt_mode=dual_query")
+                errors.append("causal_action_world_queries_v1 requires guidance.prompt_mode=dual_query")
             if not bool(guidance_cfg.get("exclude_post_query_context", False)):
                 errors.append(
-                    "shared_qwen_queries_v5 requires guidance.exclude_post_query_context=true"
+                    "causal_action_world_queries_v1 requires guidance.exclude_post_query_context=true"
                 )
             if int(action_cfg.get("action_horizon", 0)) != 32:
-                errors.append("shared_qwen_queries_v5 requires action_horizon=32")
+                errors.append("causal_action_world_queries_v1 requires action_horizon=32")
             if int(action_cfg.get("n_action_query", 0)) != 32:
-                errors.append("shared_qwen_queries_v5 requires n_action_query=32")
+                errors.append("causal_action_world_queries_v1 requires n_action_query=32")
             visual_cfg = framework_cfg.get("visual_model", {})
             if int(visual_cfg.get("n_flow_query", 0)) != 64:
-                errors.append("shared_qwen_queries_v5 requires n_flow_query=64")
+                errors.append("causal_action_world_queries_v1 requires n_flow_query=64")
 
     actual_world_to_action = bool(guidance_cfg.get("world_to_action_enabled", True))
     if (
@@ -411,7 +422,7 @@ def verify(
         "state_contract_source": state_contract_source,
         "action": "14-D release order",
         "wam_two_stage_phase": actual_wam_phase or None,
-        "wam_two_stage_recipe": actual_wam_recipe if actual_wam_phase else None,
+        "wam_two_stage_recipe": actual_wam_recipe if bool(guidance_cfg.get("enabled", False)) else None,
         "wam_guidance_enabled": bool(guidance_cfg.get("enabled", False)),
         "wam_action_world_bypass": bool(guidance_cfg.get("action_world_bypass", False)),
         "wam_world_to_action_enabled": actual_world_to_action,
@@ -429,17 +440,17 @@ def verify(
         ).lower() or None,
         "wam_query_attention_pattern": (
             "causal_act_then_future"
-            if actual_wam_recipe == "shared_qwen_queries_v5" and actual_wam_phase
+            if actual_wam_recipe == "causal_action_world_queries_v1"
             else None
         ),
         "wam_single_qwen_forward": (
             not bool(guidance_cfg.get("separate_world_backbone_pass", False))
-            if actual_wam_recipe == "shared_qwen_queries_v5" and actual_wam_phase
+            if actual_wam_recipe == "causal_action_world_queries_v1"
             else None
         ),
         "wam_queries_are_final_suffix": (
             True
-            if actual_wam_recipe == "shared_qwen_queries_v5" and actual_wam_phase
+            if actual_wam_recipe == "causal_action_world_queries_v1"
             else None
         ),
         "wam_separate_world_backbone_pass": bool(

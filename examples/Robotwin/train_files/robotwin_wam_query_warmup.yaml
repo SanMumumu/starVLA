@@ -1,17 +1,17 @@
 #######
-# Stage 1/2 (rand/full): one-Qwen-forward causal shared-query warmup.
+# RobotWin causal action/world query predictor warmup (Stage 1/2).
 #
-# Every batch optimizes L_action + 0.1 * L_world. Both objectives update the
-# same Qwen weights in one native FlashAttention-2 causal forward:
-#   context -> ACT queries -> FUTURE queries.
-# L_action updates Qwen + ACT query + Action DiT and cannot see FUTURE.
-# L_world updates Qwen + ACT query + FUTURE query + World DiT/conditioner,
-# treating ACT states as latent policy intent; it never calls Action DiT.
-# Adapter/gate/world-attention remain frozen. Shared Qwen uses one global clip.
+# One causal Qwen pass produces:
+#   context -> ACTION query x32 -> WORLD query x64
+# Action DiT is conditioned only on hidden states at ACTION indices.
+# World DiT is conditioned only on hidden states at WORLD indices.
+# Neither branch receives proprio state. The world->action modules are created
+# with closed gates, physically frozen, and bypassed throughout this stage.
+# The optional current-frame DINO-B ablation is disabled by default.
 #######
 
-run_id: robotwin_wam_m5_fastwam_causalq_warmup_rand_state_h32_dinojitx_iid_80k
-run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin_causal
+run_id: robotwin_wam_causal_query_warmup_dinob_online_iid_80k
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin_causal_queries
 seed: 42
 wandb_entity: axi-the-cat
 wandb_project: starVLA_Robotwin
@@ -30,7 +30,7 @@ framework:
 
   wam:
     enabled: true
-    action_gradient_checkpointing: false
+    action_gradient_checkpointing: true
     visual_gradient_checkpointing: true
     placeholder_token: "<ACT_PH>"
     dino_loss_weight: 0.1
@@ -40,38 +40,37 @@ framework:
       mode: dual_xattn
       signal: z_pred
       prompt_mode: dual_query
+      causal_query_suffix: true
       exclude_post_query_context: true
+
+      # Stage 1 learns action/world query representations without letting the
+      # newly initialized world->action path perturb the policy.
+      action_world_bypass: true
+      world_to_action_enabled: true
+      freeze_world_to_action_in_warmup: true
       bridge_source: predicted
       detach_world: true
       detached_prediction_eval_mode: true
-      action_world_bypass: true
-      world_to_action_enabled: true
       detach_action_backbone: false
-      # World loss intentionally shapes the shared Qwen representation.
       detach_world_backbone: false
-      # Use the dual-query action path, not the query-free native baseline path.
       baseline_action_context: false
       pretraining_aligned_queries: true
       future_query_through_qwen: true
       separate_world_backbone_pass: false
       detach_action_query_in_world_pass: false
-      freeze_world_to_action_in_warmup: true
-      oracle_ratio: 0.0
-      n_world_tokens: 64
-      qformer_layers: 2
-      fusion_layers: 2
+
+      # Exact causal action/world query condition ABI: indexed query hidden states only.
+      world_condition_on_state: false
+      include_context_in_action_memory: false
+      include_context_in_world_memory: false
+
+      # Ablation only: append projected online DINO-B(current) patch tokens to
+      # the WORLD query condition.  Keep false for the primary experiment.
+      concat_current_dino: false
+      world_dropout: 0.0
       gate_init: 0.0
       log_gate_openness: true
-      world_dropout: 0.0
-      world_condition_on_state: true
-      include_context_in_action_memory: true
-      include_context_in_world_memory: true
-      action_world_gradient_ramp:
-        enabled: false
-        start_step: 0
-        end_step: 0
-        start_scale: 0.0
-        end_scale: 0.0
+      oracle_ratio: 0.0
       world_eval_mode: correct
 
   tasks:
@@ -81,27 +80,28 @@ framework:
       joint_detached: 1.0
 
   dino:
-    name: dinov3_vitl16
-    model_size: large
-    hf_model_id: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO/
-    weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO/
+    name: dinov3_vitb16
+    model_size: base
+    hf_model_id: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO-B/
+    weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO-B/
     loader: hf
     image_size: [384, 320]
     patch_size: 16
-    embed_dim: 1024
+    embed_dim: 768
     future_view_keys: ["video.robotwin_composite"]
     stats_path: null
-    load_live_backbone: false
+    load_live_backbone: true
+    force_online: true
     dino_pool: 1
 
   action_model:
-    action_model_type: DiT-LAWAM
+    action_model_type: DiT-M
     action_hidden_dim: 1024
     hidden_size: 1024
     add_pos_embed: true
     max_seq_len: 1024
     action_dim: 14
-    state_dim: 14
+    state_dim: 0
     action_horizon: 32
     n_action_query: 32
     repeated_diffusion_steps: 2
@@ -126,7 +126,7 @@ framework:
       positional_embeddings: null
 
   visual_model:
-    d_dino: 1024
+    d_dino: 768
     n_flow_query: 64
     max_image_queries: 64
     max_target_tokens: 480
@@ -148,8 +148,10 @@ framework:
     flow_time_sampling: gr00t
     clean_target_loss_weight: 1.0
     cosine_loss_weight: 0.1
-    patch_weighting: change_balanced
-    change_weight_strength: 1.0
+    # Keep the primary condition/target path minimal.  Current DINO is encoded
+    # only when concat_current_dino is enabled for the explicit ablation.
+    patch_weighting: none
+    change_weight_strength: 0.0
 
 datasets:
   vla_data:
@@ -166,13 +168,14 @@ datasets:
     fastwam_wam_targets: true
     fastwam_wam_target: composite
     fastwam_future_stride: 32
-    include_state: true
+    include_state: false
     action_type: abs_qpos
     action_mode: abs
     sequential_step_sampling: false
     balance_dataset_weights: false
     balance_trajectory_weights: false
-    per_device_batch_size: 12
+    # 8 machines x 8 GPUs x 16 samples = global batch 1024.
+    per_device_batch_size: 16
     load_all_data_for_training: true
     obs_image_size: [320, 384]
     video_backend: pyav
@@ -183,10 +186,11 @@ datasets:
 
 trainer:
   seed_before_model_init: true
-  expected_global_batch_size: 768
   wam_two_stage_phase: predictor_warmup
-  wam_two_stage_recipe: shared_qwen_queries_v5
+  wam_two_stage_recipe: causal_action_world_queries_v1
+  expected_global_batch_size: 1024
   max_train_steps: 80000
+  # "80k" denotes total training steps; retain the established 2k LR ramp.
   num_warmup_steps: 2000
   save_interval: 10000
   action_eval_enabled: true
@@ -195,7 +199,7 @@ trainer:
     enabled: true
     interval: 5000
     task: joint_detached
-    per_device_batch_size: 2
+    per_device_batch_size: 1
     num_workers: 2
     num_batches: 4
     num_samples: 1
@@ -212,13 +216,10 @@ trainer:
     action_model: 1.0e-04
     future_dino_queries: 1.0e-04
     wam_visual_head: 1.0e-04
-    wam_state_ctx: 1.0e-04
 
   lr_scheduler_type: cosine_with_min_lr
   scheduler_specific_kwargs:
     min_lr: 5.0e-07
-
-  # The action-conditioned FDM encoder is unused by this passive world branch.
   freeze_modules: 'wam_act_ctx'
   loss_scale:
     vla: 1.0
@@ -228,11 +229,8 @@ trainer:
   log_grad_norms: false
   log_global_grad_norm: true
   deepspeed_skip_unused_param_anchors: true
-  # Qwen is intentionally shared by both objectives, so a branch-wise clip
-  # would assign one parameter to two incompatible partitions.
   gradient_clipping: 1.0
   gradient_accumulation_steps: 1
-
   optimizer:
     name: AdamW
     betas: [0.9, 0.95]

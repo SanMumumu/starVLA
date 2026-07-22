@@ -226,14 +226,14 @@ def test_fastwam_client_verifies_isolated_recipe_action_query_abi() -> None:
             adapter.FastWAMRobotWinModelClient(policy_ckpt_path=requested)
 
 
-def test_fastwam_client_verifies_shared_qwen_query_abi() -> None:
+def test_fastwam_client_verifies_causal_query_query_abi() -> None:
     sys.path.insert(0, str(EVAL_DIR))
     try:
         import model2robotwin_fastwam_interface as adapter
     finally:
         sys.path.pop(0)
 
-    requested = "/models/sharedqwen/checkpoints/steps_20000_pytorch_model.pt"
+    requested = "/models/causal_queries/checkpoints/steps_20000_pytorch_model.pt"
 
     def fake_standard_init(self, *args, **kwargs):
         self.action_chunk_size = 32
@@ -241,7 +241,7 @@ def test_fastwam_client_verifies_shared_qwen_query_abi() -> None:
         self.server_meta = {
             "ckpt_path": kwargs.get("policy_ckpt_path"),
             "expects_state": True,
-            "wam_two_stage_recipe": "shared_qwen_queries_v5",
+            "wam_two_stage_recipe": "causal_action_world_queries_v1",
             "wam_pretraining_aligned_queries": True,
             "wam_future_query_through_qwen": True,
             "qwen_attn_implementation": "flash_attention_2",

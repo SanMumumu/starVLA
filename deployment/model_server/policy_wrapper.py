@@ -249,9 +249,9 @@ class PolicyServerWrapper:
             if qwen_interface is not None
             else ""
         )
-        if phase is not None and recipe in {
+        if guidance_enabled and recipe in {
             "isolated_queries_v4",
-            "shared_qwen_queries_v5",
+            "causal_action_world_queries_v1",
         }:
             expected_action_queries = int(getattr(framework, "action_horizon", 0))
             if not pretraining_aligned_queries or action_query_count != expected_action_queries:
@@ -265,40 +265,42 @@ class PolicyServerWrapper:
                 raise RuntimeError(
                     f"{recipe} checkpoint did not restore its FUTURE query bank"
                 )
-            if recipe == "shared_qwen_queries_v5" and not bool(
+            if recipe == "causal_action_world_queries_v1" and not bool(
                 runtime_guidance.get("future_query_through_qwen", False)
             ):
                 raise RuntimeError(
-                    "shared_qwen_queries_v5 checkpoint did not restore FUTURE-query Qwen injection"
+                    "causal_action_world_queries_v1 checkpoint did not restore FUTURE-query Qwen injection"
                 )
-            if recipe == "shared_qwen_queries_v5":
+            if recipe == "causal_action_world_queries_v1":
                 if action_query_count != 32 or int(getattr(framework, "action_horizon", 0)) != 32:
                     raise RuntimeError(
-                        "shared_qwen_queries_v5 server requires ACT32/H32, got "
+                        "causal_action_world_queries_v1 server requires ACT32/H32, got "
                         f"queries={action_query_count}, horizon={getattr(framework, 'action_horizon', None)}"
                     )
                 if future_query_count != 64 or future_query_capacity != 64:
                     raise RuntimeError(
-                        "shared_qwen_queries_v5 server requires FUTURE64, got "
+                        "causal_action_world_queries_v1 server requires FUTURE64, got "
                         f"active={future_query_count}, capacity={future_query_capacity}"
                     )
                 if bool(runtime_guidance.get("separate_world_backbone_pass", False)):
                     raise RuntimeError(
-                        "shared_qwen_queries_v5 checkpoint requests the obsolete two-pass Qwen path"
+                        "causal_action_world_queries_v1 checkpoint requests the obsolete two-pass Qwen path"
                     )
                 if bool(runtime_guidance.get("detach_action_query_in_world_pass", False)):
                     raise RuntimeError(
-                        "shared_qwen_queries_v5 checkpoint unexpectedly detaches ACT query from world loss"
+                        "causal_action_world_queries_v1 checkpoint unexpectedly detaches ACT query from world loss"
                     )
                 if qwen_attn_implementation != "flash_attention_2":
                     raise RuntimeError(
-                        "shared_qwen_queries_v5 server requires active flash_attention_2, got "
+                        "causal_action_world_queries_v1 server requires active flash_attention_2, got "
                         f"{qwen_attn_implementation!r}"
                     )
         metadata: Dict[str, Any] = {
             "wam_enabled": wam_enabled,
             "wam_two_stage_phase": phase,
-            "wam_two_stage_recipe": recipe if phase is not None else None,
+            # Standalone query-conditioned checkpoints reuse the same proven
+            # causal-query recipe without declaring a warmup/gate phase.
+            "wam_two_stage_recipe": recipe if guidance_enabled else None,
             "wam_guidance_enabled": guidance_enabled,
             "wam_action_world_bypass": (
                 bool(runtime_guidance.get("action_world_bypass", False))
@@ -346,17 +348,17 @@ class PolicyServerWrapper:
             "qwen_attn_implementation": qwen_attn_implementation or None,
             "wam_query_attention_pattern": (
                 "causal_act_then_future"
-                if guidance_enabled and recipe == "shared_qwen_queries_v5"
+                if guidance_enabled and recipe == "causal_action_world_queries_v1"
                 else None
             ),
             "wam_single_qwen_forward": (
                 not bool(runtime_guidance.get("separate_world_backbone_pass", False))
-                if guidance_enabled and recipe == "shared_qwen_queries_v5"
+                if guidance_enabled and recipe == "causal_action_world_queries_v1"
                 else None
             ),
             "wam_queries_are_final_suffix": (
                 True
-                if guidance_enabled and recipe == "shared_qwen_queries_v5"
+                if guidance_enabled and recipe == "causal_action_world_queries_v1"
                 else None
             ),
             "wam_separate_world_backbone_pass": (

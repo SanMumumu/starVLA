@@ -618,49 +618,40 @@ def test_correlated_noise_artifact_is_a_strict_train_deploy_contract() -> None:
         assert framework.injected is None
 
 
-def test_robotwin_active_two_stage_and_coflow_yaml_contracts() -> None:
-    """Only strict two-stage WAM and context-conditioned Co-Flow stay active."""
+def test_robotwin_causal_query_and_coflow_yaml_contracts() -> None:
+    """The active WAM warmup is state-free, online DINO-B, and gate-ready."""
 
     from starVLA.dataloader.gr00t_lerobot.registry import ROBOT_TYPE_CONFIG_MAP
     from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
 
     config_dir = REPO_ROOT / "examples/Robotwin/train_files"
-    pairs = (
-        ("robotwin_wam_warmup_rand.yaml", "robotwin_wam_gate_rand2clean.yaml"),
-        ("robotwin_wam_warmup_clean.yaml", "robotwin_wam_gate_clean2clean.yaml"),
+    cfg = yaml.safe_load(
+        (config_dir / "robotwin_wam_query_warmup.yaml").read_text(encoding="utf-8")
     )
-    for warmup_name, gate_name in pairs:
-        warmup = yaml.safe_load((config_dir / warmup_name).read_text(encoding="utf-8"))
-        gate = yaml.safe_load((config_dir / gate_name).read_text(encoding="utf-8"))
-        for cfg in (warmup, gate):
-            action_cfg = cfg["framework"]["action_model"]
-            data_cfg = cfg["datasets"]["vla_data"]
-            guidance = cfg["framework"]["wam"]["guidance"]
-            assert action_cfg["use_correlated_noise"] is False
-            assert not any(str(key).startswith("correlation_") for key in action_cfg)
-            assert action_cfg["action_horizon"] == 32
-            assert data_cfg["include_state"] is True
-            assert data_cfg["obs_image_size"] == [320, 384]
-            assert data_cfg["per_device_batch_size"] == 12
-            assert data_cfg["num_workers"] == 4
-            assert cfg["trainer"]["gradient_accumulation_steps"] == 1
-            assert cfg["trainer"]["expected_global_batch_size"] == 768
-            assert guidance["include_context_in_action_memory"] is True
-            assert guidance["include_context_in_world_memory"] is True
-        assert warmup["trainer"]["wam_two_stage_phase"] == "predictor_warmup"
-        assert warmup["trainer"]["wam_two_stage_recipe"] == "baseline_preserving_v3"
-        assert warmup["trainer"]["max_train_steps"] == 80000
-        assert warmup["trainer"]["num_warmup_steps"] == 2000
-        assert warmup["framework"]["wam"]["guidance"]["action_world_bypass"] is True
-        assert warmup["framework"]["wam"]["guidance"]["detach_action_backbone"] is False
-        assert warmup["framework"]["wam"]["guidance"]["detach_world_backbone"] is True
-        assert warmup["framework"]["wam"]["guidance"]["baseline_action_context"] is True
-        assert gate["trainer"]["wam_two_stage_phase"] == "gate_ft"
-        assert gate["trainer"]["wam_two_stage_recipe"] == "baseline_preserving_v3"
-        assert gate["trainer"]["max_train_steps"] == 20000
-        assert gate["framework"]["wam"]["guidance"]["action_world_bypass"] is False
-        assert gate["framework"]["wam"]["guidance"]["detach_world_backbone"] is True
-        assert gate["framework"]["wam"]["guidance"]["baseline_action_context"] is True
+    action_cfg = cfg["framework"]["action_model"]
+    dino_cfg = cfg["framework"]["dino"]
+    data_cfg = cfg["datasets"]["vla_data"]
+    guidance = cfg["framework"]["wam"]["guidance"]
+    assert action_cfg["use_correlated_noise"] is False
+    assert action_cfg["action_horizon"] == action_cfg["n_action_query"] == 32
+    assert action_cfg["state_dim"] == 0
+    assert data_cfg["include_state"] is False
+    assert data_cfg["per_device_batch_size"] == 16
+    assert cfg["trainer"]["expected_global_batch_size"] == 1024
+    assert cfg["trainer"]["max_train_steps"] == 80000
+    assert cfg["trainer"]["wam_two_stage_phase"] == "predictor_warmup"
+    assert guidance["causal_query_suffix"] is True
+    assert guidance["include_context_in_action_memory"] is False
+    assert guidance["include_context_in_world_memory"] is False
+    assert guidance["world_condition_on_state"] is False
+    assert guidance["concat_current_dino"] is False
+    assert guidance["world_to_action_enabled"] is True
+    assert guidance["action_world_bypass"] is True
+    assert guidance["freeze_world_to_action_in_warmup"] is True
+    assert dino_cfg["model_size"] == "base"
+    assert dino_cfg["weights"].endswith("/DINO-B/")
+    assert dino_cfg["load_live_backbone"] is True
+    assert dino_cfg["force_online"] is True
 
     assert not (config_dir / "robotwin_action_world_coflow.yaml").exists()
     coflow = yaml.safe_load(
@@ -746,7 +737,6 @@ def test_robodojo_train_and_deploy_contracts() -> None:
             "starvla_qwengroot_robodojo_baseline.yaml",
             "starvla_qwengroot_robodojo_wam_warmup.yaml",
             "starvla_qwengroot_robodojo_wam_gate.yaml",
-            "starvla_qwengroot_robodojo_wam_e2e.yaml",
         )
     }
     source_views = ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
@@ -756,7 +746,6 @@ def test_robodojo_train_and_deploy_contracts() -> None:
         assert action_cfg["action_dim"] == action_cfg["state_dim"] == 14
         assert action_cfg["action_horizon"] == 16
         assert data_cfg["data_root_dir"] == "/horizon-bucket/robot_lab/users/sen.wang-labs/RoboDojo"
-        assert data_cfg["data_mix"] == "robodojo_v21"
         assert data_cfg["include_state"] is True
         assert data_cfg["video_backend"] == "pyav"
         assert data_cfg["image_layout"] == "fastwam_composite"
@@ -767,10 +756,12 @@ def test_robodojo_train_and_deploy_contracts() -> None:
     baseline = configs["starvla_qwengroot_robodojo_baseline.yaml"]
     warmup = configs["starvla_qwengroot_robodojo_wam_warmup.yaml"]
     gate = configs["starvla_qwengroot_robodojo_wam_gate.yaml"]
-    e2e = configs["starvla_qwengroot_robodojo_wam_e2e.yaml"]
+    assert baseline["datasets"]["vla_data"]["data_mix"] == "robodojo_v21"
+    assert warmup["datasets"]["vla_data"]["data_mix"] == "robodojo_v21_language_optional"
+    assert gate["datasets"]["vla_data"]["data_mix"] == "robodojo_v21_language_optional"
     assert baseline["datasets"]["vla_data"]["dataset_py"] == "lerobot_datasets"
     assert "correlation_cholesky_path" not in baseline["framework"]["action_model"]
-    for cfg in (warmup, gate, e2e):
+    for cfg in (warmup, gate):
         assert cfg["datasets"]["vla_data"]["dataset_py"] == "jointflow"
         assert cfg["datasets"]["vla_data"]["action_horizon"] == 16
         assert cfg["datasets"]["vla_data"]["world_model"]["future_stride"] == 16
@@ -778,45 +769,26 @@ def test_robodojo_train_and_deploy_contracts() -> None:
         assert cfg["framework"]["dino"]["image_size"] == [384, 320]
         assert cfg["framework"]["dino"]["future_view_keys"] == ["video.fastwam_composite"]
         assert cfg["framework"]["visual_model"]["max_target_tokens"] == 480
+        assert cfg["framework"]["dino"]["force_online"] is True
+        assert cfg["framework"]["dino"]["weights"].endswith("/DINO-B/")
+        assert cfg["framework"]["action_model"]["use_correlated_noise"] is False
+        assert not any(
+            str(key).startswith("correlation_")
+            for key in cfg["framework"]["action_model"]
+        )
 
-    warm_corr = warmup["framework"]["action_model"]["correlation_cholesky_path"]
-    gate_corr = gate["framework"]["action_model"]["correlation_cholesky_path"]
-    assert baseline["run_id"] in warm_corr
-    assert warmup["run_id"] in gate_corr
-    assert "robotwin" not in warm_corr.lower() and "robotwin" not in gate_corr.lower()
     assert gate["trainer"]["pretrained_checkpoint"].startswith(
         f"{gate['run_root_dir']}/{warmup['run_id']}/"
     )
-    assert warmup["framework"]["wam"]["guidance"]["bridge_source"] == "oracle"
-    assert warmup["framework"]["wam"]["guidance"]["oracle_ratio"] == 1.0
+    assert warmup["trainer"]["wam_two_stage_phase"] == "predictor_warmup"
+    assert gate["trainer"]["wam_two_stage_phase"] == "gate_ft"
+    assert warmup["framework"]["wam"]["guidance"]["bridge_source"] == "predicted"
+    assert warmup["framework"]["wam"]["guidance"]["oracle_ratio"] == 0.0
     assert gate["framework"]["wam"]["guidance"]["bridge_source"] == "predicted"
     assert gate["framework"]["wam"]["guidance"]["oracle_ratio"] == 0.0
-
-    e2e_weights = e2e["framework"]["tasks"]["weights"]
-    assert [name for name, weight in e2e_weights.items() if float(weight) > 0] == ["joint_e2e"]
-    e2e_guidance = e2e["framework"]["wam"]["guidance"]
-    assert e2e_guidance["bridge_source"] == "predicted"
-    assert e2e_guidance["detach_world"] is False
-    assert e2e_guidance["oracle_ratio"] == 0.0
-    assert e2e_guidance["gate_init"] == 0.0
-    assert e2e_guidance["exclude_post_query_context"] is True
-    assert e2e_guidance["action_world_gradient_ramp"] == {
-        "enabled": True,
-        "start_step": 10000,
-        "end_step": 30000,
-        "start_scale": 0.0,
-        "end_scale": 1.0,
-    }
-    assert e2e["framework"]["wam"]["dino_loss_weight"] == 0.01
-    assert e2e["framework"]["action_model"]["use_correlated_noise"] is False
-    assert not any(
-        str(key).startswith("correlation_") for key in e2e["framework"]["action_model"]
-    )
-    assert e2e["datasets"]["vla_data"]["per_device_batch_size"] == 16
-    assert e2e["trainer"]["gradient_accumulation_steps"] == 1
-    assert e2e["trainer"]["max_train_steps"] == 100000
-    assert e2e["trainer"]["pretrained_checkpoint"] is None
-    assert "iidnoise" in e2e["run_id"] and "corrnoise" not in e2e["run_id"]
+    assert warmup["framework"]["wam"]["guidance"]["action_world_bypass"] is True
+    assert gate["framework"]["wam"]["guidance"]["action_world_bypass"] is False
+    assert gate["trainer"]["reset_world_gates_after_pretrained_load"] is True
 
     data_config = ROBOT_TYPE_CONFIG_MAP["robodojo_arx_x5"]
     expected_state = [
@@ -832,6 +804,9 @@ def test_robodojo_train_and_deploy_contracts() -> None:
     assert DATASET_NAMED_MIXTURES["robodojo_v21"] == [
         ("RoboDojo_lerobot_v21_video", 1.0, "robodojo_arx_x5")
     ]
+    assert DATASET_NAMED_MIXTURES["robodojo_v21_language_optional"] == [
+        ("RoboDojo_lerobot_v21_language_v1", 1.0, "robodojo_arx_x5")
+    ]
     normalization = [
         transform
         for transform in data_config.transform().transforms
@@ -846,24 +821,10 @@ def test_robodojo_train_and_deploy_contracts() -> None:
     eval_dir = REPO_ROOT / "examples/RoboDojo/eval_files"
     eval_script = (eval_dir / "eval_robodojo.sh").read_text(encoding="utf-8")
     model_script = (eval_dir / "robodojo_model.py").read_text(encoding="utf-8")
-    runbook_root = REPO_ROOT / RUNBOOK_DIR_NAME / "RBT"
-    run_notes = (runbook_root / "run.sh").read_text(encoding="utf-8")
-    client_job = yaml.safe_load((runbook_root / "job_client_robodojo.yaml").read_text(encoding="utf-8"))
-    e2e_job = yaml.safe_load((runbook_root / "robodojo_wam_e2e.yaml").read_text(encoding="utf-8"))
     assert "build_robotwin_composite" in model_script
     assert "task_instruction" in model_script
     assert '"state": state' in model_script
-    assert "XPolicyLab/policy/starVLA/eval.sh" not in run_notes
-    assert "examples/RoboDojo/eval_files/run_aidi_robodojo_fast_full.sh" in run_notes
-    assert "examples/RoboDojo/eval_files/run_aidi_robodojo_visualize.sh" in run_notes
-    assert "aidi-inf-cli job submit -f robodojo_wam_e2e.yaml" in run_notes
-    assert "starvla_qwengroot_robodojo_wam_e2e.yaml" in e2e_job["REQUIRED"]["RUN_SCRIPTS"]
     assert "Third_github" not in eval_script
-    # The client job intentionally opens the clean interactive 8-GPU shell;
-    # run.sh contains the selectable fast-full / visualize commands entered
-    # after startup.
-    assert client_job["REQUIRED"]["RUN_SCRIPTS"].endswith("/run_aidi.sh")
-    assert "ppu" not in client_job["OPTIONAL"]["DOCKER_IMAGE"].lower()
 
 
 def test_robodojo_checkpoint_preflight() -> None:
@@ -923,7 +884,7 @@ if __name__ == "__main__":
     test_fastwam_real_cluster_config_snapshots()
     test_fastwam_cluster_preflight_fixture()
     test_correlated_noise_artifact_is_a_strict_train_deploy_contract()
-    test_robotwin_active_two_stage_and_coflow_yaml_contracts()
+    test_robotwin_causal_query_and_coflow_yaml_contracts()
     test_coflow_checkpoint_verifier_accepts_only_h16_single_bridge()
     test_robodojo_train_and_deploy_contracts()
     test_robodojo_checkpoint_preflight()

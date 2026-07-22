@@ -11,7 +11,7 @@ from starVLA.model.modules.action_model.GR00T_ActionHeader import (
 
 
 def _minimal_head_config(prediction_type=None, action_model_type="DiT-B"):
-    embedding_dim = 1024 if action_model_type == "DiT-LAWAM" else 768
+    embedding_dim = 1024 if action_model_type == "DiT-M" else 768
     action_model = {
         "action_model_type": action_model_type,
         "hidden_size": 16,
@@ -42,8 +42,8 @@ def _minimal_head_config(prediction_type=None, action_model_type="DiT-B"):
     return OmegaConf.create({"framework": {"action_model": action_model}})
 
 
-def test_lawam_dit_shape_is_consistent():
-    head = FlowmatchingActionHead(_minimal_head_config(action_model_type="DiT-LAWAM"))
+def test_medium_dit_shape_is_consistent():
+    head = FlowmatchingActionHead(_minimal_head_config(action_model_type="DiT-M"))
 
     assert head.input_embedding_dim == 1024
     assert head.model.inner_dim == 1024
@@ -193,7 +193,7 @@ def test_correlated_noise_never_silently_falls_back_to_iid():
 
 
 if __name__ == "__main__":
-    test_lawam_dit_shape_is_consistent()
+    test_medium_dit_shape_is_consistent()
     test_velocity_parameterization_is_identity()
     test_jit_x_parameterization_matches_reference()
     test_jit_t_eps_caps_late_time_weight()

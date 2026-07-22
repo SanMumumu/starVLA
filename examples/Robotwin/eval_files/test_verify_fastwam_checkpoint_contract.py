@@ -36,7 +36,7 @@ def test_verifier_does_not_import_training_dataloader(tmp_path, monkeypatch) -> 
     checkpoint.touch()
     config = (
         REPO_ROOT
-        / "examples/Robotwin/train_files/robotwin_wam_dual_branch_no_world2action.yaml"
+        / "examples/Robotwin/train_files/robotwin_wam_query_warmup.yaml"
     ).read_text(encoding="utf-8")
     (run_dir / "config.yaml").write_text(config, encoding="utf-8")
     (run_dir / "config.full.yaml").write_text(config, encoding="utf-8")
@@ -51,19 +51,21 @@ def test_verifier_does_not_import_training_dataloader(tmp_path, monkeypatch) -> 
         "q99": zeros,
         "mask": [True] * 14,
     }
-    stats = {"new_embodiment": {"state": modality, "action": modality}}
+    stats = {"new_embodiment": {"action": modality}}
     (run_dir / "dataset_statistics.json").write_text(json.dumps(stats), encoding="utf-8")
 
     summary = verifier.verify(
         checkpoint,
         replan_steps=24,
         expected_wam_phase="predictor_warmup",
-        expected_world_to_action=False,
+        expected_world_to_action=True,
     )
     assert summary["normalization"] == "fastwam_zscore"
     assert summary["unnorm_key"] == "new_embodiment"
-    assert summary["expects_state"] is True
-    assert summary["wam_world_to_action_enabled"] is False
+    assert summary["expects_state"] is False
+    assert summary["wam_world_to_action_enabled"] is True
+    assert summary["wam_two_stage_phase"] == "predictor_warmup"
+    assert summary["wam_two_stage_recipe"] == "causal_action_world_queries_v1"
 
 
 def test_verifier_distinguishes_gate_ft_from_warmup(tmp_path) -> None:
@@ -77,7 +79,7 @@ def test_verifier_distinguishes_gate_ft_from_warmup(tmp_path) -> None:
     checkpoint.parent.mkdir(parents=True)
     checkpoint.touch()
     config = (
-        REPO_ROOT / "examples/Robotwin/train_files/robotwin_wam_gate_rand2clean.yaml"
+        REPO_ROOT / "examples/Robotwin/train_files/robotwin_wam_query_gate_ft.yaml"
     ).read_text(encoding="utf-8")
     (run_dir / "config.yaml").write_text(config, encoding="utf-8")
     (run_dir / "config.full.yaml").write_text(config, encoding="utf-8")
@@ -105,7 +107,7 @@ def test_verifier_distinguishes_gate_ft_from_warmup(tmp_path) -> None:
     assert summary["wam_two_stage_phase"] == "gate_ft"
     assert summary["wam_guidance_enabled"] is True
     assert summary["wam_action_world_bypass"] is False
-    assert summary["wam_baseline_action_context"] is True
+    assert summary["wam_baseline_action_context"] is False
     assert summary["wam_bridge_source"] == "predicted"
     assert summary["wam_world_eval_mode"] == "correct"
 
@@ -120,18 +122,18 @@ def test_verifier_distinguishes_gate_ft_from_warmup(tmp_path) -> None:
 @pytest.mark.parametrize(
     ("config_name", "phase", "step"),
     [
-        ("robotwin_wam_sharedqwen_warmup_rand.yaml", "predictor_warmup", 80000),
-        ("robotwin_wam_sharedqwen_gate_ft_rand.yaml", "gate_ft", 20000),
+        ("robotwin_wam_query_warmup.yaml", "predictor_warmup", 80000),
+        ("robotwin_wam_query_gate_ft.yaml", "gate_ft", 20000),
     ],
 )
-def test_verifier_accepts_shared_qwen_two_stage_contract(
+def test_verifier_accepts_causal_query_two_stage_contract(
     tmp_path,
     config_name: str,
     phase: str,
     step: int,
 ) -> None:
     spec = importlib.util.spec_from_file_location(
-        f"_fastwam_shared_qwen_{phase}", VERIFIER_PATH
+        f"_fastwam_causal_query_{phase}", VERIFIER_PATH
     )
     assert spec is not None and spec.loader is not None
     verifier = importlib.util.module_from_spec(spec)
@@ -167,7 +169,7 @@ def test_verifier_accepts_shared_qwen_two_stage_contract(
         replan_steps=24,
         expected_wam_phase=phase,
     )
-    assert summary["wam_two_stage_recipe"] == "shared_qwen_queries_v5"
+    assert summary["wam_two_stage_recipe"] == "causal_action_world_queries_v1"
     assert summary["wam_future_query_through_qwen"] is True
     assert summary["qwen_attn_implementation"] == "flash_attention_2"
     assert summary["wam_query_attention_pattern"] == "causal_act_then_future"
@@ -177,3 +179,50 @@ def test_verifier_accepts_shared_qwen_two_stage_contract(
     assert summary["wam_future_query_count"] == 64
     assert summary["wam_separate_world_backbone_pass"] is False
     assert summary["wam_detach_action_query_in_world_pass"] is False
+
+
+def test_verifier_accepts_causal_query_warmup_contract(tmp_path) -> None:
+    spec = importlib.util.spec_from_file_location("_fastwam_causal_query", VERIFIER_PATH)
+    assert spec is not None and spec.loader is not None
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+
+    run_dir = tmp_path / "causal_query"
+    checkpoint = run_dir / "checkpoints" / "steps_80000_pytorch_model.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.touch()
+    config = (
+        REPO_ROOT
+        / "examples/Robotwin/train_files/robotwin_wam_query_warmup.yaml"
+    ).read_text(encoding="utf-8")
+    (run_dir / "config.yaml").write_text(config, encoding="utf-8")
+    (run_dir / "config.full.yaml").write_text(config, encoding="utf-8")
+
+    zeros = [0.0] * 14
+    action = {
+        "min": zeros,
+        "max": zeros,
+        "mean": zeros,
+        "std": [1.0] * 14,
+        "q01": zeros,
+        "q99": zeros,
+        "mask": [True] * 14,
+    }
+    (run_dir / "dataset_statistics.json").write_text(
+        json.dumps({"new_embodiment": {"action": action}}),
+        encoding="utf-8",
+    )
+
+    summary = verifier.verify(
+        checkpoint,
+        replan_steps=24,
+        expected_wam_phase="predictor_warmup",
+        expected_world_to_action=True,
+    )
+    assert summary["expects_state"] is False
+    assert summary["wam_two_stage_phase"] == "predictor_warmup"
+    assert summary["wam_two_stage_recipe"] == "causal_action_world_queries_v1"
+    assert summary["wam_query_attention_pattern"] == "causal_act_then_future"
+    assert summary["wam_queries_are_final_suffix"] is True
+    assert summary["wam_action_query_count"] == 32
+    assert summary["wam_future_query_count"] == 64
