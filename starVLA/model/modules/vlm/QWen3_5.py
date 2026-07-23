@@ -8,15 +8,9 @@ from typing import Optional
 import torch
 from starVLA.model.tools import has_flash_attn  # unified flash-attn detection (GPU / NPU)
 from starVLA.training.trainer_utils import initialize_overwatch
+import transformers
 from transformers import AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
-try:
-    from transformers import Qwen3_5ForConditionalGeneration
-except ImportError as import_error:
-    raise ImportError(
-        "Qwen3.5 model class is unavailable. Please install transformers >= 5.2.0 or check your transformers version."
-    ) from import_error
 
 logger = initialize_overwatch(__name__)
 
@@ -58,27 +52,53 @@ class _QWen3_5_VL_Interface(nn.Module):
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-VL-4B-Instruct")
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
-
-        attn_implementation = "sdpa"
-        # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
+        require_attn_implementation = bool(
+            qwenvl_config.get("require_attn_implementation", False)
+        )
         if attn_implementation == "flash_attention_2":
             if not has_flash_attn():
+                if require_attn_implementation:
+                    raise RuntimeError(
+                        "Qwen3.5 was configured with required flash_attention_2, but flash-attn "
+                        "is unavailable."
+                    )
                 print("[WARNING] flash_attn not installed, falling back to sdpa")
                 attn_implementation = "sdpa"
 
-        model = Qwen3_5ForConditionalGeneration.from_pretrained(
+        model_cls = getattr(transformers, "Qwen3_5ForConditionalGeneration", None)
+        if model_cls is None:
+            raise RuntimeError(
+                "RynnBrain1.1 requires Qwen3.5 support from transformers>=5.2.0; "
+                f"the active version is {transformers.__version__}. Upgrade the cluster image/environment "
+                "before loading this checkpoint."
+            )
+
+        model = model_cls.from_pretrained(
             model_id,
             attn_implementation=attn_implementation,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
         )
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
+        if bool(qwenvl_config.get("enable_gradient_checkpointing", False)):
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+            print("[Qwen3.5] gradient_checkpointing ENABLED (use_reentrant=False)", flush=True)
+
         self.model = model
         self.processor = processor
         self.config = config
+        self.attn_implementation = str(attn_implementation)
 
-        # alin qwen3.5 with qwen2.5
+        if str(getattr(self.model.config, "model_type", "")) != "qwen3_5":
+            raise ValueError(
+                f"Qwen3.5 interface received model_type={self.model.config.model_type!r}"
+            )
+        # Align the shared StarVLA interface with Qwen2.5/Qwen3.
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
 
         # only for fast base model
@@ -148,7 +168,15 @@ class _QWen3_5_VL_Interface(nn.Module):
         # Preparation for inference
 
         batch_inputs = self.processor.apply_chat_template(
-            messages, tokenize=True, padding=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
+            messages,
+            tokenize=True,
+            padding=True,
+            add_generation_prompt=True,
+            enable_thinking=bool(
+                self.config.framework.qwenvl.get("enable_thinking", False)
+            ),
+            return_dict=True,
+            return_tensors="pt",
         )
 
         # if solutions, mask out the solution tokens in labels

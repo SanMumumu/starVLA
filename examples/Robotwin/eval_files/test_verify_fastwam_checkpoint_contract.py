@@ -171,8 +171,9 @@ def test_verifier_accepts_causal_query_two_stage_contract(
     )
     assert summary["wam_two_stage_recipe"] == "causal_action_world_queries_v1"
     assert summary["wam_future_query_through_qwen"] is True
+    assert summary["wam_action_query_last"] is True
     assert summary["qwen_attn_implementation"] == "flash_attention_2"
-    assert summary["wam_query_attention_pattern"] == "causal_act_then_future"
+    assert summary["wam_query_attention_pattern"] == "causal_future_then_act"
     assert summary["wam_single_qwen_forward"] is True
     assert summary["wam_queries_are_final_suffix"] is True
     assert summary["wam_action_query_count"] == 32
@@ -222,7 +223,8 @@ def test_verifier_accepts_causal_query_warmup_contract(tmp_path) -> None:
     assert summary["expects_state"] is False
     assert summary["wam_two_stage_phase"] == "predictor_warmup"
     assert summary["wam_two_stage_recipe"] == "causal_action_world_queries_v1"
-    assert summary["wam_query_attention_pattern"] == "causal_act_then_future"
+    assert summary["wam_action_query_last"] is True
+    assert summary["wam_query_attention_pattern"] == "causal_future_then_act"
     assert summary["wam_queries_are_final_suffix"] is True
     assert summary["wam_action_query_count"] == 32
     assert summary["wam_future_query_count"] == 64

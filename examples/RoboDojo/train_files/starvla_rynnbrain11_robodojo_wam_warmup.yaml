@@ -1,11 +1,9 @@
 #######
-# RoboDojo WAM predictor warmup (Stage 1/2).
+# RynnBrain1.1-2B RoboDojo WAM predictor warmup (Stage 1/2).
 # H=16 at 25 Hz; online DINO-B targets use the FastWAM composite view.
-# The native policy context is preserved while world->action modules remain
-# closed, frozen, and bypassed for the full 80k warmup.
 #######
 
-run_id: starvla_qwengroot_robodojo_wam_text_warmup_h16_dinob_online_iid_80k
+run_id: starvla_rynnbrain11_robodojo_wam_text_warmup_h16_dinob_online_iid_80k
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_robodojo
 seed: 42
 wandb_entity: axi-the-cat
@@ -16,9 +14,11 @@ version_id: "0.21"
 framework:
   name: QwenGR00T
   qwenvl:
-    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B-Instruct/
-    attn_implementation: flash_attention_2
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/rynnbrain1.1-2B/
+    # Qwen3.5 alternates linear/full attention; SDPA is its portable path.
+    attn_implementation: sdpa
     enable_gradient_checkpointing: true
+    enable_thinking: false
     vl_hidden_dim: 2048
 
   wam:
@@ -69,8 +69,6 @@ framework:
       policy: 0.0
       passive: 0.0
       joint_detached: 1.0
-    # Every batch trains action + world; annotated rows additionally train
-    # assistant-only text tokens. Empty annotation rows remain valid samples.
     loss_weights:
       action: 1.0
       world: 0.1
@@ -191,7 +189,6 @@ trainer:
   save_interval: 10000
   eval_interval: 1000
   world_validation:
-    # RoboDojo uses every episode for training; do not reserve a holdout.
     enabled: false
     interval: 5000
     task: joint_detached

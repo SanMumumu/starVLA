@@ -224,6 +224,7 @@ def verify(
                 for key in (
                     "pretraining_aligned_queries",
                     "future_query_through_qwen",
+                    "action_query_last",
                 ):
                     if not bool(guidance_cfg.get(key, False)):
                         errors.append(
@@ -300,6 +301,7 @@ def verify(
                     "pretraining_aligned_queries",
                     "future_query_through_qwen",
                     "freeze_world_to_action_in_warmup",
+                    "action_query_last",
                 ):
                     if not bool(guidance_cfg.get(key, False)):
                         errors.append(
@@ -435,11 +437,18 @@ def verify(
         "wam_future_query_through_qwen": bool(
             guidance_cfg.get("future_query_through_qwen", False)
         ),
+        "wam_action_query_last": bool(
+            guidance_cfg.get("action_query_last", False)
+        ),
         "qwen_attn_implementation": str(
             framework_cfg.get("qwenvl", {}).get("attn_implementation", "")
         ).lower() or None,
         "wam_query_attention_pattern": (
-            "causal_act_then_future"
+            (
+                "causal_future_then_act"
+                if bool(guidance_cfg.get("action_query_last", False))
+                else "causal_act_then_future"
+            )
             if actual_wam_recipe == "causal_action_world_queries_v1"
             else None
         ),

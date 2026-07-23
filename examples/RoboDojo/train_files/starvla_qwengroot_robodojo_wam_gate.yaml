@@ -35,6 +35,8 @@ framework:
       mode: dual_xattn
       signal: z_pred
       prompt_mode: dual_query
+      causal_query_suffix: true
+      action_query_last: true
       exclude_post_query_context: true
       action_world_bypass: false
       world_to_action_enabled: true
@@ -175,7 +177,8 @@ trainer:
   save_interval: 5000
   eval_interval: 1000
   world_validation:
-    enabled: true
+    # Match Stage 1: retain every RoboDojo episode for Gate finetuning.
+    enabled: false
     interval: 5000
     task: joint_detached
     per_device_batch_size: 1

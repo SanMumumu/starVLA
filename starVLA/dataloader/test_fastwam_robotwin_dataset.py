@@ -283,6 +283,40 @@ def test_fastwam_split_domain_and_wam_composite_target() -> None:
         assert "state" not in no_state_sample
 
 
+def test_fastwam_wam_current_frame_dino_stride0() -> None:
+    """stride=0 packs image_1 == image_0 for the current-DINO reconstruction ablation."""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_fixture(root)
+        dataset = get_vla_dataset(
+            _config(
+                root,
+                fastwam_domain="clean",
+                fastwam_expected_domain_episodes=2,
+                fastwam_wam_targets=True,
+                fastwam_wam_target="composite",
+                fastwam_future_stride=0,
+            )
+        )
+        _mock_video(dataset)
+        assert dataset.delta_indices["video.cam_high"].tolist() == [0, 0]
+        sample = dataset._pack_sample(dataset.transforms(dataset.get_step_data(0, 0)))
+        assert sample["future_valid"] == 1
+        current = np.asarray(sample["image_0"][0])
+        target = np.asarray(sample["image_1"][0])
+        np.testing.assert_array_equal(current, target)
+
+        with pytest.raises(ValueError, match="must be >= 0"):
+            get_vla_dataset(
+                _config(
+                    root,
+                    fastwam_wam_targets=True,
+                    fastwam_future_stride=-1,
+                )
+            )
+
+
 def test_fastwam_action_world_coflow_h16_single_future_contract() -> None:
     """The closed-loop recipe loads exactly t/t+16 and a 16-step action chunk."""
 

@@ -42,6 +42,12 @@ logger = initialize_overwatch(__name__)
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
 
+
+def _qwen_enable_thinking(config) -> bool:
+    framework = getattr(config, "framework", None) if config is not None else None
+    qwenvl = framework.get("qwenvl", {}) if framework is not None else {}
+    return bool(qwenvl.get("enable_thinking", False))
+
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import merge_framework_config
 from starVLA.model.modules.action_model.GR00T_ActionHeader import FlowmatchingActionHead, get_action_model
@@ -666,8 +672,8 @@ class Qwen_GR00T(baseframework):
             problems.append("guidance.detached_prediction_eval_mode must be true")
         if not causal_query_recipe and not bool(guidance.get("include_context_in_world_memory", False)):
             problems.append("guidance.include_context_in_world_memory must be true")
-        if not bool(world_val.get("enabled", False)) or int(world_val.get("interval", 0)) != 5000:
-            problems.append("trainer.world_validation must be enabled every 5000 steps")
+        if bool(world_val.get("enabled", False)) and int(world_val.get("interval", 0)) != 5000:
+            problems.append("enabled trainer.world_validation must run every 5000 steps")
 
         bypass = bool(guidance.get("action_world_bypass", False))
         if phase == "predictor_warmup":
@@ -778,7 +784,7 @@ class Qwen_GR00T(baseframework):
                     )
                 if bool(guidance.get("detach_action_query_in_world_pass", False)):
                     problems.append(
-                        "causal_action_world_queries_v1 uses one causal ACT->FUTURE pass and forbids "
+                        "causal_action_world_queries_v1 uses one causal dual-query pass and forbids "
                         "the obsolete guidance.detach_action_query_in_world_pass"
                     )
                 if str(framework.get("qwenvl", {}).get("attn_implementation", "")).lower() != "flash_attention_2":
@@ -911,7 +917,7 @@ class Qwen_GR00T(baseframework):
                     )
                 if bool(guidance.get("detach_action_query_in_world_pass", False)):
                     problems.append(
-                        "causal_action_world_queries_v1 uses one causal ACT->FUTURE pass and forbids "
+                        "causal_action_world_queries_v1 uses one causal dual-query pass and forbids "
                         "the obsolete guidance.detach_action_query_in_world_pass"
                     )
                 if str(framework.get("qwenvl", {}).get("attn_implementation", "")).lower() != "flash_attention_2":
@@ -1619,14 +1625,16 @@ class Qwen_GR00T(baseframework):
             # causal Qwen input embeddings; WORLD can specialize causal Qwen
             # states while preserving explicit gradient ownership.
             "pretraining_aligned_queries": False,
-            # One standard causal Qwen forward with ACTION queries
-            # before FUTURE queries. ACT cannot read FUTURE; FUTURE reads the
-            # ACT latent intent. Both query banks replace placeholder inputs.
+            # Run both learned query banks through one standard causal Qwen
+            # forward. Their order is selected by action_query_last below.
             "future_query_through_qwen": False,
-            # Put ACTION then WORLD query placeholders at the literal end of
-            # the causal Qwen sequence.  This is independent of the retired
-            # two-stage warmup/gate recipe name.
+            # Put both query groups at the literal end of the causal Qwen
+            # sequence. This is independent of their configured order.
             "causal_query_suffix": False,
+            # New action-conditioning layout: WORLD/visual queries precede
+            # ACTION queries, so causal ACTION hidden states can attend to the
+            # visual-query states. False preserves old checkpoint ordering.
+            "action_query_last": False,
             # Deprecated experimental two-pass switches. They remain in the
             # defaults only so saved development configs can still be loaded;
             # the causal one-pass recipe explicitly forbids them.
@@ -1901,8 +1909,8 @@ class Qwen_GR00T(baseframework):
 
         Qwen still receives ``input_ids`` (required for Qwen-VL image-token
         scattering), while a temporary embedding hook substitutes ACT and,
-        for causal one-pass, FUTURE positions. Standard causal attention makes the later
-        FUTURE states depend on ACT intent, but not vice versa. The detach
+        for causal one-pass, FUTURE positions. Standard causal attention lets
+        the configured later query group read the earlier group. The detach
         argument remains solely for loading the abandoned experimental
         two-pass path. In Stage 2, gradients still reach ACT queries through
         frozen Qwen.
@@ -2105,6 +2113,7 @@ class Qwen_GR00T(baseframework):
                 tokenize=True,
                 padding=True,
                 add_generation_prompt=False,
+                enable_thinking=_qwen_enable_thinking(getattr(self, "config", None)),
                 return_dict=True,
                 return_tensors="pt",
             )
@@ -2113,6 +2122,7 @@ class Qwen_GR00T(baseframework):
                 tokenize=True,
                 padding=True,
                 add_generation_prompt=True,
+                enable_thinking=_qwen_enable_thinking(getattr(self, "config", None)),
                 return_dict=True,
                 return_tensors="pt",
             )
@@ -2166,6 +2176,7 @@ class Qwen_GR00T(baseframework):
                 tokenize=True,
                 padding=True,
                 add_generation_prompt=True,
+                enable_thinking=_qwen_enable_thinking(getattr(self, "config", None)),
                 return_dict=True,
                 return_tensors="pt",
             )
@@ -2640,8 +2651,9 @@ class Qwen_GR00T(baseframework):
         future_mask: torch.Tensor,
         expected_act: int,
         expected_future: int,
+        action_query_last: bool = False,
     ) -> None:
-        """Validate the causal latent-intent order: ACT before FUTURE."""
+        """Validate the configured causal order of visual and action queries."""
 
         if act_mask.ndim != 2 or future_mask.shape != act_mask.shape:
             raise ValueError(
@@ -2661,13 +2673,22 @@ class Qwen_GR00T(baseframework):
                 f"FUTURE={future_counts.tolist()} (expected {expected_future})"
             )
         positions = torch.arange(act_mask.shape[1], device=act_mask.device).unsqueeze(0)
-        last_act = positions.masked_fill(~act_mask, -1).max(dim=1).values
-        first_future = positions.masked_fill(~future_mask, act_mask.shape[1]).min(dim=1).values
-        if not bool((last_act < first_future).all()):
-            raise ValueError(
-                "Dual-query prompt must place every ACT placeholder before every FUTURE placeholder "
-                "so causal attention implements ACT->FUTURE (intent->outcome)"
-            )
+        if action_query_last:
+            last_future = positions.masked_fill(~future_mask, -1).max(dim=1).values
+            first_act = positions.masked_fill(~act_mask, act_mask.shape[1]).min(dim=1).values
+            if not bool((last_future < first_act).all()):
+                raise ValueError(
+                    "Dual-query prompt must place every FUTURE/WORLD placeholder before every "
+                    "ACT placeholder so the final ACTION queries can attend to visual queries"
+                )
+        else:
+            last_act = positions.masked_fill(~act_mask, -1).max(dim=1).values
+            first_future = positions.masked_fill(~future_mask, act_mask.shape[1]).min(dim=1).values
+            if not bool((last_act < first_future).all()):
+                raise ValueError(
+                    "Legacy dual-query prompt must place every ACT placeholder before every "
+                    "FUTURE placeholder (ACT->FUTURE)"
+                )
 
     @staticmethod
     def _wam_query_suffix_exclusion_mask(act_mask: torch.Tensor, future_mask: torch.Tensor) -> torch.Tensor:
@@ -2688,8 +2709,9 @@ class Qwen_GR00T(baseframework):
         future_token_id: int,
         n_act: int,
         n_future: int,
+        action_query_last: bool = False,
     ):
-        """Physically append ``ACT`` then ``FUTURE`` after the complete chat context.
+        """Physically append both query groups after the complete chat context.
 
         Building placeholders inside the user-message text leaves chat-template
         terminators after FUTURE.  That is causally harmless, but it weakens the
@@ -2719,13 +2741,14 @@ class Qwen_GR00T(baseframework):
             )
 
         batch, context_len = input_ids.shape
-        suffix = torch.cat(
-            [
-                input_ids.new_full((batch, int(n_act)), int(act_token_id)),
-                input_ids.new_full((batch, int(n_future)), int(future_token_id)),
-            ],
-            dim=1,
+        act_suffix = input_ids.new_full((batch, int(n_act)), int(act_token_id))
+        future_suffix = input_ids.new_full((batch, int(n_future)), int(future_token_id))
+        suffix_parts = (
+            [future_suffix, act_suffix]
+            if action_query_last
+            else [act_suffix, future_suffix]
         )
+        suffix = torch.cat(suffix_parts, dim=1)
         inputs["input_ids"] = torch.cat([input_ids, suffix], dim=1)
 
         attention = inputs.get("attention_mask", None)
@@ -2754,17 +2777,20 @@ class Qwen_GR00T(baseframework):
         total_len = context_len + int(n_act) + int(n_future)
         act_mask = torch.zeros((batch, total_len), dtype=torch.bool, device=input_ids.device)
         future_mask = torch.zeros_like(act_mask)
-        act_mask[:, context_len : context_len + int(n_act)] = True
-        future_mask[:, context_len + int(n_act) :] = True
+        if action_query_last:
+            future_mask[:, context_len : context_len + int(n_future)] = True
+            act_mask[:, context_len + int(n_future) :] = True
+        else:
+            act_mask[:, context_len : context_len + int(n_act)] = True
+            future_mask[:, context_len + int(n_act) :] = True
         return act_mask, future_mask, attention_2d.to(dtype=torch.bool)
 
     def _build_wam_guided_inputs(self, examples: List[dict], task: str = "policy"):
-        """Build ``context -> ACT -> FUTURE`` for one native causal Qwen pass.
+        """Build the configured dual-query suffix for one native causal Qwen pass.
 
-        ACT states cannot read the later FUTURE block. FUTURE states read the
-        context and the ACT latent policy intent. The processor's 2D padding
-        mask is extended only with valid suffix positions, so Qwen stays on
-        its native FlashAttention-2 path.
+        New configs use ``context -> FUTURE/WORLD -> ACT`` so ACTION states can
+        read visual-query states. The processor's 2D padding mask is extended
+        only with valid suffix positions, preserving native FlashAttention-2.
         """
         task = str(task)
         is_action = task in ("policy", "idm", "joint_e2e", "joint_detached")
@@ -2777,9 +2803,16 @@ class Qwen_GR00T(baseframework):
         physical_causal_suffix = bool(
             self.wam_guidance.get("causal_query_suffix", False)
         ) or recipe == "causal_action_world_queries_v1"
+        action_query_last = bool(
+            self.wam_guidance.get("action_query_last", False)
+        )
         act_str = " ".join([self.wam_ph] * self.wam_n_act)
         fut_str = " ".join([self.wam_future_ph] * self.wam_n_flow)
-        ph_str = f"{act_str} {fut_str}"
+        ph_str = (
+            f"{fut_str} {act_str}"
+            if action_query_last
+            else f"{act_str} {fut_str}"
+        )
         drop_lang = (not is_action) and bool(getattr(self, "wam_world_model_no_language", False))
         proc = self.qwen_vl_interface.processor
         cot = self.config.datasets.vla_data.get("CoT_prompt", "{instruction}")
@@ -2802,6 +2835,7 @@ class Qwen_GR00T(baseframework):
                 tokenize=True,
                 padding=True,
                 add_generation_prompt=True,
+                enable_thinking=_qwen_enable_thinking(getattr(self, "config", None)),
                 return_dict=True,
                 return_tensors="pt",
             )
@@ -2815,6 +2849,7 @@ class Qwen_GR00T(baseframework):
                 future_token_id=self.wam_future_ph_id,
                 n_act=self.wam_n_act,
                 n_future=self.wam_n_flow,
+                action_query_last=action_query_last,
             )
         else:
             # Preserve the exact prompt ABI of existing v1-v4 checkpoints.
@@ -2830,6 +2865,7 @@ class Qwen_GR00T(baseframework):
             fut_mask,
             expected_act=self.wam_n_act,
             expected_future=self.wam_n_flow,
+            action_query_last=action_query_last,
         )
         if attention_2d.ndim != 2:
             raise ValueError(
@@ -3514,8 +3550,9 @@ class Qwen_GR00T(baseframework):
                     )
                 if separate_world_pass or causal_shared_query_pass:
                     # Finish stochastic action diffusion first. causal one-pass reuses the
-                    # same causal Qwen hidden states for both losses: ACT is
-                    # upstream of FUTURE, while Action DiT is called only here.
+                    # same causal Qwen hidden states for both losses. With
+                    # action_query_last, ACTION reads the preceding visual query
+                    # states while Action DiT is called only here.
                     # The fork below isolates world-head flow noise and never
                     # reruns Qwen.
                     query_joint_action_loss = self._wam_action_loss_from_guided_context(

@@ -38,6 +38,55 @@ SCRIPT_PATH="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 }
 echo "[AIDI] layout package_root=${PACKAGE_ROOT} repo_root=${REPO_ROOT} launcher=${SCRIPT_PATH}"
 
+preflight_vlm_runtime() {
+  local config_yaml="${1:?missing config yaml}"
+  python3 - "${config_yaml}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import yaml
+
+config_path = Path(sys.argv[1])
+config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+base_vlm = str(
+    (((config.get("framework") or {}).get("qwenvl") or {}).get("base_vlm") or "")
+).rstrip("/")
+normalized = base_vlm.lower().replace("_", "").replace("-", "").replace(".", "")
+if "rynnbrain11" not in normalized and "qwen35" not in normalized:
+    raise SystemExit(0)
+
+checkpoint = Path(base_vlm)
+checkpoint_config = checkpoint / "config.json"
+if not checkpoint_config.is_file():
+    raise SystemExit(f"RynnBrain checkpoint config is missing: {checkpoint_config}")
+payload = json.loads(checkpoint_config.read_text(encoding="utf-8"))
+if payload.get("model_type") != "qwen3_5":
+    raise SystemExit(
+        f"RynnBrain checkpoint must have model_type=qwen3_5, got {payload.get('model_type')!r}"
+    )
+if not (checkpoint / "model.safetensors").is_file() and not (
+    checkpoint / "model.safetensors.index.json"
+).is_file():
+    raise SystemExit(f"RynnBrain weights are missing under {checkpoint}")
+
+try:
+    import transformers
+except Exception as exc:
+    raise SystemExit(f"Cannot import transformers for RynnBrain: {exc}") from exc
+if getattr(transformers, "Qwen3_5ForConditionalGeneration", None) is None:
+    raise SystemExit(
+        "RynnBrain requires transformers>=5.2.0 with "
+        f"Qwen3_5ForConditionalGeneration; active version={transformers.__version__}"
+    )
+print(
+    "[AIDI] RynnBrain preflight ok: "
+    f"checkpoint={checkpoint} transformers={transformers.__version__} "
+    f"hidden={payload.get('text_config', {}).get('hidden_size')}"
+)
+PY
+}
+
 worker_main() {
   local config_arg="$1"
   local config_yaml
@@ -49,6 +98,7 @@ worker_main() {
 
   cd "${REPO_ROOT}"
   [[ -f "${config_yaml}" ]] || { echo "[AIDI][ERROR] missing config: ${config_yaml}"; exit 1; }
+  preflight_vlm_runtime "${config_yaml}"
 
   local accel_config="${REPO_ROOT}/starVLA/config/deepseeds/deepspeed_zero2_aidi_safe.yaml"
   [[ -f "${accel_config}" ]] || { echo "[AIDI][ERROR] missing accelerate config: ${accel_config}"; exit 1; }

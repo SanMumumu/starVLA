@@ -1097,12 +1097,18 @@ def test_no_world2action_runtime_contract_requires_physical_absence() -> None:
 
 
 def test_robodojo_warmup_and_gate_yaml_pass_early_contracts() -> None:
-    config_paths = (
+    original_config_paths = (
         REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_wam_warmup.yaml",
         REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_wam_gate.yaml",
     )
-    for config_path in config_paths:
+    rynnbrain_config_paths = (
+        REPO_ROOT / "examples/RoboDojo/train_files/starvla_rynnbrain11_robodojo_wam_warmup.yaml",
+        REPO_ROOT / "examples/RoboDojo/train_files/starvla_rynnbrain11_robodojo_wam_gate.yaml",
+    )
+    for config_path in original_config_paths + rynnbrain_config_paths:
         cfg = OmegaConf.load(config_path)
+        assert not bool(cfg.trainer.world_validation.enabled)
+        assert "fastwam_val_fraction" not in cfg.datasets.vla_data
         merged = merge_framework_config(QwenGR00TDefaultConfig, cfg)
         harness = SimpleNamespace(config=merged)
         Qwen_GR00T._validate_joint_e2e_contract(harness)
@@ -1110,13 +1116,38 @@ def test_robodojo_warmup_and_gate_yaml_pass_early_contracts() -> None:
         active = [key for key, value in merged.framework.tasks.weights.items() if float(value) > 0]
         expected = ["joint_detached"] if str(cfg.trainer.wam_two_stage_phase) == "predictor_warmup" else ["policy"]
         assert active == expected
-        assert str(cfg.framework.qwenvl.attn_implementation) == "flash_attention_2"
         assert bool(cfg.framework.wam.guidance.exclude_post_query_context)
+        assert bool(cfg.framework.wam.guidance.causal_query_suffix)
+        assert bool(cfg.framework.wam.guidance.action_query_last)
         assert not bool(cfg.framework.action_model.use_correlated_noise)
         assert "corrnoise" not in str(cfg.run_id)
         assert not any(str(key).startswith("correlation_") for key in cfg.framework.action_model.keys())
         assert int(cfg.datasets.vla_data.per_device_batch_size) == 16
         assert int(cfg.trainer.gradient_accumulation_steps) == 1
+
+    for config_path in original_config_paths:
+        cfg = OmegaConf.load(config_path)
+        assert str(cfg.framework.qwenvl.attn_implementation) == "flash_attention_2"
+        assert str(cfg.framework.qwenvl.base_vlm).rstrip("/").endswith(
+            "/Qwen3-VL-2B-Instruct"
+        )
+        assert "rynnbrain" not in str(cfg.run_id).lower()
+
+    warmup = OmegaConf.load(rynnbrain_config_paths[0])
+    gate = OmegaConf.load(rynnbrain_config_paths[1])
+    for cfg in (warmup, gate):
+        assert str(cfg.framework.qwenvl.attn_implementation) == "sdpa"
+        assert str(cfg.framework.qwenvl.base_vlm).rstrip("/").endswith(
+            "/rynnbrain1.1-2B"
+        )
+        assert not bool(cfg.framework.qwenvl.enable_thinking)
+        assert "rynnbrain11" in str(cfg.run_id).lower()
+    assert str(gate.trainer.pretrained_checkpoint).endswith(
+        f"/{warmup.run_id}/final_model/pytorch_model.pt"
+    )
+    assert str(warmup.run_id) != str(
+        OmegaConf.load(original_config_paths[0]).run_id
+    )
 
 
 def test_robodojo_optional_text_target_masks_unannotated_rows() -> None:
@@ -1297,6 +1328,7 @@ def test_causal_query_yaml_has_strict_world_learning_contract() -> None:
     assert not bool(cfg.framework.wam.guidance.concat_current_dino)
     assert not bool(cfg.framework.wam.guidance.include_context_in_action_memory)
     assert not bool(cfg.framework.wam.guidance.include_context_in_world_memory)
+    assert bool(cfg.framework.wam.guidance.action_query_last)
     assert bool(cfg.framework.wam.guidance.world_to_action_enabled)
     assert bool(cfg.framework.wam.guidance.action_world_bypass)
     assert bool(cfg.framework.wam.guidance.freeze_world_to_action_in_warmup)
@@ -1961,8 +1993,36 @@ def test_v5_physically_appends_act_then_future_as_final_2d_mask_suffix() -> None
     Qwen_GR00T._wam_validate_dual_query_layout(act, future, 3, 2)
 
 
+def test_action_last_suffix_places_visual_queries_before_final_action_queries() -> None:
+    inputs = {
+        "input_ids": torch.tensor([[0, 11, 12, 13]]),
+        "attention_mask": torch.tensor([[0, 1, 1, 1]]),
+    }
+    act, future, attention = Qwen_GR00T._wam_append_causal_query_suffix(
+        inputs,
+        act_token_id=90,
+        future_token_id=91,
+        n_act=3,
+        n_future=2,
+        action_query_last=True,
+    )
+
+    assert inputs["input_ids"][:, 4:6].equal(torch.full((1, 2), 91))
+    assert inputs["input_ids"][:, 6:].equal(torch.full((1, 3), 90))
+    assert future[:, 4:6].all() and not future[:, :4].any() and not future[:, 6:].any()
+    assert act[:, 6:].all() and not act[:, :6].any()
+    assert attention[:, -5:].all()
+    Qwen_GR00T._wam_validate_dual_query_layout(
+        act,
+        future,
+        expected_act=3,
+        expected_future=2,
+        action_query_last=True,
+    )
+
+
 def test_causal_query_one_causal_pass_has_required_gradient_routes() -> None:
-    """World learns ACT intent but cannot update Action DiT; action is symmetric."""
+    """Final ACTION reads visual queries; world loss cannot update ACTION/Action DiT."""
 
     from starVLA.model.framework.VLM4A.jointflow.joint_modules import (
         ActionQueryTokenBank,
@@ -1999,8 +2059,8 @@ def test_causal_query_one_causal_pass_has_required_gradient_routes() -> None:
 
     harness = QueryHarness()
     input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7]])
-    act_mask = torch.tensor([[False, False, True, True, True, False, False]])
-    future_mask = torch.tensor([[False, False, False, False, False, True, True]])
+    future_mask = torch.tensor([[False, False, True, True, False, False, False]])
+    act_mask = torch.tensor([[False, False, False, False, True, True, True]])
 
     with harness._wam_query_embedding_override(act_mask, future_mask):
         hidden = harness.qwen_vl_interface.model(input_ids)
@@ -2026,12 +2086,13 @@ def test_causal_query_one_causal_pass_has_required_gradient_routes() -> None:
 
     assert action_grads[0] is not None and action_grads[0].abs().sum() > 0
     assert action_grads[1] is not None and action_grads[1].abs().sum() > 0
-    assert action_grads[2] is None or float(action_grads[2].abs().sum()) == 0.0
+    # ACTION is last, so action loss reaches the preceding visual-query bank.
+    assert action_grads[2] is not None and action_grads[2].abs().sum() > 0
     assert action_grads[3] is not None and action_grads[3].abs().sum() > 0
     assert action_grads[4] is None or float(action_grads[4].abs().sum()) == 0.0
     assert world_grads[0] is not None and world_grads[0].abs().sum() > 0
-    # FUTURE reads the preceding ACT latent policy intent.
-    assert world_grads[1] is not None and world_grads[1].abs().sum() > 0
+    # Earlier visual queries cannot read the later ACTION query bank.
+    assert world_grads[1] is None or float(world_grads[1].abs().sum()) == 0.0
     assert world_grads[2] is not None and world_grads[2].abs().sum() > 0
     # The world objective never executes the action head/Action DiT.
     assert world_grads[3] is None or float(world_grads[3].abs().sum()) == 0.0

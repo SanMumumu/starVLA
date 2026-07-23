@@ -2,7 +2,8 @@
 # RobotWin causal action/world query predictor warmup (Stage 1/2).
 #
 # One causal Qwen pass produces:
-#   context -> ACTION query x32 -> WORLD query x64
+#   context -> WORLD query x64 -> ACTION query x32
+# ACTION is the final query group and causally attends to WORLD/visual queries.
 # Action DiT is conditioned only on hidden states at ACTION indices.
 # World DiT is conditioned only on hidden states at WORLD indices.
 # Neither branch receives proprio state. The world->action modules are created
@@ -41,6 +42,7 @@ framework:
       signal: z_pred
       prompt_mode: dual_query
       causal_query_suffix: true
+      action_query_last: true
       exclude_post_query_context: true
 
       # Stage 1 learns action/world query representations without letting the

@@ -345,9 +345,18 @@ class PolicyServerWrapper:
                 if guidance_enabled
                 else None
             ),
+            "wam_action_query_last": (
+                bool(runtime_guidance.get("action_query_last", False))
+                if guidance_enabled
+                else None
+            ),
             "qwen_attn_implementation": qwen_attn_implementation or None,
             "wam_query_attention_pattern": (
-                "causal_act_then_future"
+                (
+                    "causal_future_then_act"
+                    if bool(runtime_guidance.get("action_query_last", False))
+                    else "causal_act_then_future"
+                )
                 if guidance_enabled and recipe == "causal_action_world_queries_v1"
                 else None
             ),

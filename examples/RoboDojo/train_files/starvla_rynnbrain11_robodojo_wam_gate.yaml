@@ -1,11 +1,9 @@
 #######
-# RoboDojo WAM predictor warmup (Stage 1/2).
-# H=16 at 25 Hz; online DINO-B targets use the FastWAM composite view.
-# The native policy context is preserved while world->action modules remain
-# closed, frozen, and bypassed for the full 80k warmup.
+# RynnBrain1.1-2B RoboDojo WAM Gate finetune (Stage 2/2).
+# Loads only the independent RynnBrain warmup output.
 #######
 
-run_id: starvla_qwengroot_robodojo_wam_text_warmup_h16_dinob_online_iid_80k
+run_id: starvla_rynnbrain11_robodojo_wam_text_gate_h16_dinob_online_iid_20k
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_robodojo
 seed: 42
 wandb_entity: axi-the-cat
@@ -16,9 +14,10 @@ version_id: "0.21"
 framework:
   name: QwenGR00T
   qwenvl:
-    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B-Instruct/
-    attn_implementation: flash_attention_2
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/rynnbrain1.1-2B/
+    attn_implementation: sdpa
     enable_gradient_checkpointing: true
+    enable_thinking: false
     vl_hidden_dim: 2048
 
   wam:
@@ -29,12 +28,7 @@ framework:
     dino_loss_weight: 0.1
     world_target: absolute
     text_supervision:
-      enabled: true
-      allow_missing_annotations: true
-      subtask_field: subtask_text
-      completed_subtask_field: completed_subtask_text
-      prompt_template: "{instruction}\nReport the current subtask and the completed subtask."
-      response_template: "Current subtask: {subtask_text}\nCompleted subtask: {completed_subtask_text}"
+      enabled: false
     guidance:
       enabled: true
       mode: dual_xattn
@@ -43,9 +37,9 @@ framework:
       causal_query_suffix: true
       action_query_last: true
       exclude_post_query_context: true
-      action_world_bypass: true
+      action_world_bypass: false
       world_to_action_enabled: true
-      freeze_world_to_action_in_warmup: true
+      freeze_world_to_action_in_warmup: false
       bridge_source: predicted
       detach_world: true
       detached_prediction_eval_mode: true
@@ -66,15 +60,13 @@ framework:
 
   tasks:
     weights:
-      policy: 0.0
+      policy: 1.0
       passive: 0.0
-      joint_detached: 1.0
-    # Every batch trains action + world; annotated rows additionally train
-    # assistant-only text tokens. Empty annotation rows remain valid samples.
+      joint_detached: 0.0
     loss_weights:
       action: 1.0
       world: 0.1
-      text: 0.005
+      text: 0.0
 
   dino:
     name: dinov3_vitb16
@@ -163,13 +155,6 @@ datasets:
     future_valid_requires_full_stride: true
     online_dino: true
     dino_target_latents: false
-    optional_text_annotations:
-      enabled: true
-      require_columns: true
-      fields:
-        subtask_text: subtask_text
-        completed_subtask_text: complete_text
-      missing_values: [""]
     sequential_step_sampling: false
     balance_dataset_weights: false
     balance_trajectory_weights: false
@@ -183,15 +168,14 @@ datasets:
     persistent_workers: false
 
 trainer:
-  wam_two_stage_phase: predictor_warmup
+  wam_two_stage_phase: gate_ft
   wam_two_stage_recipe: baseline_preserving_v3
   expected_global_batch_size: 1024
-  max_train_steps: 80000
-  num_warmup_steps: 2000
-  save_interval: 10000
+  max_train_steps: 20000
+  num_warmup_steps: 500
+  save_interval: 5000
   eval_interval: 1000
   world_validation:
-    # RoboDojo uses every episode for training; do not reserve a holdout.
     enabled: false
     interval: 5000
     task: joint_detached
@@ -201,19 +185,19 @@ trainer:
     num_samples: 1
     num_inference_timesteps: 10
     seed: 2027
-  pretrained_checkpoint: null
+  pretrained_checkpoint: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_robodojo/starvla_rynnbrain11_robodojo_wam_text_warmup_h16_dinob_online_iid_80k/final_model/pytorch_model.pt
   is_resume: false
+  reset_world_gates_after_pretrained_load: true
   save_full_training_state: true
   learning_rate:
     base: 1.0e-05
-    qwen_vl_interface: 1.0e-05
-    action_model: 1.0e-04
-    wam_visual_head: 1.0e-04
-    wam_state_ctx: 1.0e-04
-  lr_scheduler_type: cosine_with_min_lr
-  scheduler_specific_kwargs:
-    min_lr: 5.0e-07
-  freeze_modules: 'wam_act_ctx'
+    action_model: 2.0e-05
+    world_adapter: 1.0e-04
+    world_gates: 1.0e-04
+    world_to_action_adapters: 1.0e-04
+  lr_scheduler_type: constant_with_warmup
+  scheduler_specific_kwargs: {}
+  freeze_modules: 'qwen_vl_interface,wam_visual_head,wam_state_ctx,wam_act_ctx'
   loss_scale:
     vla: 1.0
   max_grad_norm: 1.0

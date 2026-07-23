@@ -37,6 +37,7 @@ framework:
       signal: z_pred
       prompt_mode: dual_query
       causal_query_suffix: true
+      action_query_last: true
       exclude_post_query_context: true
 
       action_world_bypass: false

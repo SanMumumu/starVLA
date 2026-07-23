@@ -315,8 +315,10 @@ class FastWAMRobotWinDataset(LeRobotSingleDataset):
             raise ValueError(f"Unsupported fastwam_split={self._fastwam_split!r}")
         if self._fastwam_domain not in {"all", "clean", "random", "randomized"}:
             raise ValueError(f"Unsupported fastwam_domain={self._fastwam_domain!r}")
-        if self._fastwam_future_stride <= 0:
-            raise ValueError(f"fastwam_future_stride must be positive, got {self._fastwam_future_stride}")
+        # stride=0 is the current-frame DINO reconstruction ablation: image_1 == image_0.
+        # Negative strides are invalid.
+        if self._fastwam_future_stride < 0:
+            raise ValueError(f"fastwam_future_stride must be >= 0, got {self._fastwam_future_stride}")
         if self._fastwam_wam_targets and self._fastwam_wam_target != "composite":
             raise ValueError(
                 f"FastWAM WAM only supports fastwam_wam_target='composite', got {self._fastwam_wam_target!r}"

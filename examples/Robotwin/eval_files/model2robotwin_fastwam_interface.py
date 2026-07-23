@@ -91,9 +91,16 @@ class FastWAMRobotWinModelClient(StandardModelClient):
                     "causal_action_world_queries_v1 server did not activate FUTURE-query Qwen injection"
                 )
             if actual_wam_recipe == "causal_action_world_queries_v1":
-                if self.server_meta.get("wam_query_attention_pattern") != "causal_act_then_future":
+                action_query_last = self.server_meta.get("wam_action_query_last") is True
+                expected_pattern = (
+                    "causal_future_then_act"
+                    if action_query_last
+                    else "causal_act_then_future"
+                )
+                if self.server_meta.get("wam_query_attention_pattern") != expected_pattern:
                     raise RuntimeError(
-                        "causal_action_world_queries_v1 server did not declare causal ACT->FUTURE attention"
+                        "causal_action_world_queries_v1 server query order disagrees with "
+                        f"action_query_last={action_query_last}"
                     )
                 if self.server_meta.get("wam_single_qwen_forward") is not True:
                     raise RuntimeError(
@@ -101,7 +108,7 @@ class FastWAMRobotWinModelClient(StandardModelClient):
                     )
                 if self.server_meta.get("wam_queries_are_final_suffix") is not True:
                     raise RuntimeError(
-                        "causal_action_world_queries_v1 server did not declare context->ACT32->FUTURE64 "
+                        "causal_action_world_queries_v1 server did not declare both query groups "
                         "as its physical final token suffix"
                     )
                 if self.server_meta.get("wam_future_query_count") != 64:
