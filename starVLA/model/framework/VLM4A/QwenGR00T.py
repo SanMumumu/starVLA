@@ -265,9 +265,10 @@ class Qwen_GR00T(baseframework):
                     self.config.framework.qwenvl.get("attn_implementation", ""),
                 )
             ).lower()
-            if actual_attn != "flash_attention_2":
+            if actual_attn not in {"flash_attention_2", "sdpa"}:
                 raise RuntimeError(
-                    "causal_action_world_queries_v1 requires an active FlashAttention-2 Qwen backbone; "
+                    "causal_action_world_queries_v1 requires an active causal Qwen attention "
+                    "implementation (flash_attention_2 or sdpa); "
                     f"loaded implementation={actual_attn!r}"
                 )
         # align dims --> we should put them to config or no?
@@ -597,10 +598,17 @@ class Qwen_GR00T(baseframework):
                 problems.append(
                     "causal_action_world_queries_v1 requires guidance.exclude_post_query_context=true"
                 )
-            if int(action_cfg.get("action_horizon", 0)) != 32:
-                problems.append("causal_action_world_queries_v1 requires action_model.action_horizon=32")
-            if int(action_cfg.get("n_action_query", 0)) != 32:
-                problems.append("causal_action_world_queries_v1 requires action_model.n_action_query=32")
+            action_horizon = int(action_cfg.get("action_horizon", 0))
+            action_query_count = int(action_cfg.get("n_action_query", 0))
+            if action_horizon <= 0:
+                problems.append(
+                    "causal_action_world_queries_v1 requires a positive action_model.action_horizon"
+                )
+            if action_query_count != action_horizon:
+                problems.append(
+                    "causal_action_world_queries_v1 requires action_model.n_action_query "
+                    f"to equal action_horizon ({action_horizon}), got {action_query_count}"
+                )
             if int(visual_cfg.get("n_flow_query", 0)) != 64:
                 problems.append("causal_action_world_queries_v1 requires visual_model.n_flow_query=64")
             if str(guidance.get("mode", "")).lower() != "dual_xattn":
@@ -787,15 +795,20 @@ class Qwen_GR00T(baseframework):
                         "causal_action_world_queries_v1 uses one causal dual-query pass and forbids "
                         "the obsolete guidance.detach_action_query_in_world_pass"
                     )
-                if str(framework.get("qwenvl", {}).get("attn_implementation", "")).lower() != "flash_attention_2":
+                configured_attn = str(
+                    framework.get("qwenvl", {}).get("attn_implementation", "")
+                ).lower()
+                if configured_attn not in {"flash_attention_2", "sdpa"}:
                     problems.append(
                         "causal_action_world_queries_v1 requires "
-                        "framework.qwenvl.attn_implementation=flash_attention_2"
+                        "framework.qwenvl.attn_implementation=flash_attention_2 or sdpa"
                     )
-                if not bool(framework.get("qwenvl", {}).get("require_attn_implementation", False)):
+                if configured_attn == "flash_attention_2" and not bool(
+                    framework.get("qwenvl", {}).get("require_attn_implementation", False)
+                ):
                     problems.append(
-                        "causal_action_world_queries_v1 requires "
-                        "framework.qwenvl.require_attn_implementation=true"
+                        "causal_action_world_queries_v1 with flash_attention_2 requires "
+                        "framework.qwenvl.require_attn_implementation=true; SDPA does not"
                     )
                 if not bool(guidance.get("freeze_world_to_action_in_warmup", False)):
                     problems.append(
@@ -920,15 +933,20 @@ class Qwen_GR00T(baseframework):
                         "causal_action_world_queries_v1 uses one causal dual-query pass and forbids "
                         "the obsolete guidance.detach_action_query_in_world_pass"
                     )
-                if str(framework.get("qwenvl", {}).get("attn_implementation", "")).lower() != "flash_attention_2":
+                configured_attn = str(
+                    framework.get("qwenvl", {}).get("attn_implementation", "")
+                ).lower()
+                if configured_attn not in {"flash_attention_2", "sdpa"}:
                     problems.append(
                         "causal_action_world_queries_v1 requires "
-                        "framework.qwenvl.attn_implementation=flash_attention_2"
+                        "framework.qwenvl.attn_implementation=flash_attention_2 or sdpa"
                     )
-                if not bool(framework.get("qwenvl", {}).get("require_attn_implementation", False)):
+                if configured_attn == "flash_attention_2" and not bool(
+                    framework.get("qwenvl", {}).get("require_attn_implementation", False)
+                ):
                     problems.append(
-                        "causal_action_world_queries_v1 requires "
-                        "framework.qwenvl.require_attn_implementation=true"
+                        "causal_action_world_queries_v1 with flash_attention_2 requires "
+                        "framework.qwenvl.require_attn_implementation=true; SDPA does not"
                     )
                 if bool(guidance.get("freeze_world_to_action_in_warmup", False)):
                     problems.append(
@@ -2718,8 +2736,8 @@ class Qwen_GR00T(baseframework):
         sequence ABI and makes it easier for a later memory builder to leak a
         post-query token.  causal one-pass therefore lets the processor finish all visual,
         language, and chat framing first, then appends the two learned-query
-        blocks as the literal final suffix.  Only a standard 2D padding mask is
-        produced, which keeps the native FlashAttention-2 path available.
+        blocks as the literal final suffix. Only a standard 2D padding mask is
+        produced, which works with the native FlashAttention-2 and SDPA paths.
         """
 
         input_ids = inputs.get("input_ids", None)
@@ -2756,7 +2774,7 @@ class Qwen_GR00T(baseframework):
             attention = torch.ones_like(input_ids, dtype=torch.long)
         if not torch.is_tensor(attention) or tuple(attention.shape) != tuple(input_ids.shape):
             raise ValueError(
-                "FlashAttention-2 causal query suffix requires a 2D padding mask aligned "
+                "Causal query suffix requires a 2D padding mask aligned "
                 f"with input_ids; ids={tuple(input_ids.shape)}, mask="
                 f"{None if attention is None else tuple(attention.shape)}"
             )
@@ -2870,7 +2888,7 @@ class Qwen_GR00T(baseframework):
         if attention_2d.ndim != 2:
             raise ValueError(
                 "WAM causal Qwen path requires a standard 2D padding mask for "
-                f"FlashAttention-2, got {tuple(attention_2d.shape)}"
+                f"FlashAttention-2/SDPA, got {tuple(attention_2d.shape)}"
             )
 
         if bool(self.wam_guidance.get("exclude_post_query_context", False)):

@@ -769,60 +769,76 @@ def test_robodojo_train_and_deploy_contracts() -> None:
         name: yaml.safe_load((train_dir / name).read_text(encoding="utf-8"))
         for name in (
             "starvla_qwengroot_robodojo_baseline.yaml",
-            "starvla_qwengroot_robodojo_wam_warmup.yaml",
-            "starvla_qwengroot_robodojo_wam_gate.yaml",
+            "mot_base.yaml",
+            "mot_joint.yaml",
+            "rynn_base.yaml",
+            "rynn_joint.yaml",
         )
     }
     source_views = ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
     for cfg in configs.values():
         action_cfg = cfg["framework"]["action_model"]
         data_cfg = cfg["datasets"]["vla_data"]
-        assert action_cfg["action_dim"] == action_cfg["state_dim"] == 14
+        assert action_cfg["action_dim"] == 14
         assert action_cfg["action_horizon"] == 16
         assert data_cfg["data_root_dir"] == "/horizon-bucket/robot_lab/users/sen.wang-labs/RoboDojo"
-        assert data_cfg["include_state"] is True
         assert data_cfg["video_backend"] == "pyav"
-        assert data_cfg["image_layout"] == "fastwam_composite"
         assert data_cfg["composite_source_view_keys"] == source_views
-        assert data_cfg["composite_view_key"] == "video.fastwam_composite"
         assert data_cfg["obs_image_size"] == [320, 384]
 
     baseline = configs["starvla_qwengroot_robodojo_baseline.yaml"]
-    warmup = configs["starvla_qwengroot_robodojo_wam_warmup.yaml"]
-    gate = configs["starvla_qwengroot_robodojo_wam_gate.yaml"]
+    mot_configs = [
+        configs["mot_base.yaml"],
+        configs["mot_joint.yaml"],
+        configs["rynn_base.yaml"],
+        configs["rynn_joint.yaml"],
+    ]
     assert baseline["datasets"]["vla_data"]["data_mix"] == "robodojo_v21"
-    assert warmup["datasets"]["vla_data"]["data_mix"] == "robodojo_v21_language_optional"
-    assert gate["datasets"]["vla_data"]["data_mix"] == "robodojo_v21_language_optional"
     assert baseline["datasets"]["vla_data"]["dataset_py"] == "lerobot_datasets"
+    assert baseline["datasets"]["vla_data"]["image_layout"] == "fastwam_composite"
+    assert baseline["datasets"]["vla_data"]["composite_view_key"] == "video.fastwam_composite"
+    assert baseline["framework"]["action_model"]["state_dim"] == 14
+    assert baseline["datasets"]["vla_data"]["include_state"] is True
     assert "correlation_cholesky_path" not in baseline["framework"]["action_model"]
-    for cfg in (warmup, gate):
+    for cfg in mot_configs:
+        assert cfg["framework"]["name"] == "QwenWorldActionMoT"
+        assert cfg["framework"]["enable_world_action_mot"] is True
+        assert "wam" not in cfg["framework"]
+        assert cfg["framework"]["world_action_mot"]["architecture"] == "causal_dino_mot"
+        assert cfg["framework"]["world_action_mot"]["world_hidden_size"] == 512
+        assert cfg["framework"]["world_action_mot"]["world_ffn_dim"] == 2048
+        assert cfg["framework"]["world_action_mot"]["action_hidden_size"] == 1024
+        assert cfg["framework"]["world_action_mot"]["action_ffn_dim"] == 4096
+        assert cfg["framework"]["world_action_mot"]["num_layers"] == 30
+        assert cfg["framework"]["world_action_mot"]["num_attention_heads"] == 24
+        assert cfg["framework"]["world_action_mot"]["attention_head_dim"] == 128
+        assert cfg["framework"]["action_model"]["state_dim"] == 14
+        assert cfg["datasets"]["vla_data"]["include_state"] is True
+        assert cfg["datasets"]["vla_data"]["data_mix"] == "robodojo_v21_language_optional"
         assert cfg["datasets"]["vla_data"]["dataset_py"] == "jointflow"
+        assert cfg["datasets"]["vla_data"]["image_layout"] == "tri_view_composite"
+        assert cfg["datasets"]["vla_data"]["composite_view_key"] == "video.tri_view_composite"
         assert cfg["datasets"]["vla_data"]["action_horizon"] == 16
         assert cfg["datasets"]["vla_data"]["world_model"]["future_stride"] == 16
         assert cfg["datasets"]["vla_data"]["future_valid_requires_full_stride"] is True
         assert cfg["framework"]["dino"]["image_size"] == [384, 320]
-        assert cfg["framework"]["dino"]["future_view_keys"] == ["video.fastwam_composite"]
-        assert cfg["framework"]["visual_model"]["max_target_tokens"] == 480
+        assert cfg["framework"]["dino"]["dino_pool"] == 2
         assert cfg["framework"]["dino"]["force_online"] is True
         assert cfg["framework"]["dino"]["weights"].endswith("/DINO-B/")
-        assert cfg["framework"]["action_model"]["use_correlated_noise"] is False
-        assert not any(
-            str(key).startswith("correlation_")
-            for key in cfg["framework"]["action_model"]
-        )
-
-    assert gate["trainer"]["pretrained_checkpoint"].startswith(
-        f"{gate['run_root_dir']}/{warmup['run_id']}/"
-    )
-    assert warmup["trainer"]["wam_two_stage_phase"] == "predictor_warmup"
-    assert gate["trainer"]["wam_two_stage_phase"] == "gate_ft"
-    assert warmup["framework"]["wam"]["guidance"]["bridge_source"] == "predicted"
-    assert warmup["framework"]["wam"]["guidance"]["oracle_ratio"] == 0.0
-    assert gate["framework"]["wam"]["guidance"]["bridge_source"] == "predicted"
-    assert gate["framework"]["wam"]["guidance"]["oracle_ratio"] == 0.0
-    assert warmup["framework"]["wam"]["guidance"]["action_world_bypass"] is True
-    assert gate["framework"]["wam"]["guidance"]["action_world_bypass"] is False
-    assert gate["trainer"]["reset_world_gates_after_pretrained_load"] is True
+        assert cfg["framework"]["world_action_mot"]["world_num_train_timesteps"] == 1000
+        assert cfg["framework"]["world_action_mot"]["action_num_train_timesteps"] == 1000
+        assert cfg["framework"]["planner"]["text_supervision"]["enabled"] is False
+        assert cfg["framework"]["world_action_mot"]["text_loss_weight"] == 0.0
+        assert cfg["datasets"]["vla_data"]["optional_text_annotations"]["enabled"] is False
+        assert cfg["datasets"]["vla_data"]["optional_text_annotations"]["require_columns"] is False
+        assert cfg["trainer"]["seed_before_model_init"] is True
+        assert cfg["trainer"]["pretrained_checkpoint"] is None
+        assert cfg["trainer"]["max_train_steps"] == 50000
+        assert cfg["trainer"]["expected_global_batch_size"] == 768
+    assert configs["mot_base.yaml"]["framework"]["world_action_mot"]["interaction_mode"] == "base"
+    assert configs["rynn_base.yaml"]["framework"]["world_action_mot"]["interaction_mode"] == "base"
+    assert configs["mot_joint.yaml"]["framework"]["world_action_mot"]["interaction_mode"] == "joint"
+    assert configs["rynn_joint.yaml"]["framework"]["world_action_mot"]["interaction_mode"] == "joint"
 
     data_config = ROBOT_TYPE_CONFIG_MAP["robodojo_arx_x5"]
     expected_state = [

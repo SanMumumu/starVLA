@@ -1,0 +1,29 @@
+#######
+# RoboDojo/Isaac evaluation client job: one node and eight parallel clients.
+# Open the job terminal and run one of sections 6A/6B/6C in run.sh.
+#######
+REQUIRED:
+  JOB_NAME: "starvla-robodojo-eval-client-8gpu"
+  JOB_PASSWD: "newk8s666"
+  UPLOAD_DIR: "/home/users/sen02.wang/workspace/starvla_dev"
+  PROJECT_ID: "horizon-labs"
+  WORKER_MIN_NUM: 1
+  WORKER_MAX_NUM: 1
+  GPU_PER_WORKER: 8
+  RUN_SCRIPTS: "${WORKING_PATH}/run_aidi.sh"
+  environment:
+    NVIDIA_DRIVER_CAPABILITIES: "compute,utility,graphics"
+    PYTHONNOUSERSITE: "1"
+
+OPTIONAL:
+  FRAMEWORK: "pytorch"
+  TASK_LABEL: "DEV"
+  PRIORITY: 5
+  DOCKER_IMAGE: "docker.hobot.cc/imagesys/starvla-rbtw:v2.1"
+  WALL_TIME: 20000
+  JOB_TYPE: "train"
+  REMARK: "RoboDojo Isaac client; eight GPUs; full official fast eval supports 54 rollout jobs and 2100 episodes"
+  DATA_SPACE:
+    DATA_TYPE: "dmp"
+    INPUT: "robot_lab"
+    OUTPUT: "robot_lab"

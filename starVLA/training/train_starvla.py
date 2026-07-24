@@ -1506,6 +1506,23 @@ class VLATrainer(TrainerUtils):
     def _build_native_loss_metrics(output_dict: dict, total_loss: torch.Tensor) -> dict:
         """Build single-objective metrics without changing legacy semantics."""
 
+        if "mot_action_loss_raw" in output_dict:
+            return {
+                "train/task": "world_action_mot",
+                "train/loss_total": float(total_loss.detach()),
+                "train/action_loss_raw": float(
+                    output_dict["mot_action_loss_raw"].detach()
+                ),
+                "train/world_loss_raw": float(
+                    output_dict["mot_world_loss_raw"].detach()
+                ),
+                "train/text_loss_raw": float(
+                    output_dict["mot_text_loss_raw"].detach()
+                ),
+                "train/text_annotated_count": float(
+                    output_dict["mot_text_annotated_count"].detach()
+                ),
+            }
         if "coflow_action_loss_raw" not in output_dict:
             value = float(total_loss.detach())
             return {
@@ -1548,6 +1565,11 @@ class VLATrainer(TrainerUtils):
             and framework_cfg.get("enable_action_world_coflow", False)
         ):
             return "action_world_coflow"
+        if bool(
+            framework_cfg is not None
+            and framework_cfg.get("enable_world_action_mot", False)
+        ):
+            return "world_action_mot"
         return "action"
 
     def _is_log_step(self, sync_gradients: bool) -> bool:

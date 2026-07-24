@@ -23,6 +23,8 @@ from starVLA.dataloader.fastwam_image import (
     FASTWAM_COMPOSITE_LAYOUT,
     FASTWAM_COMPOSITE_SIZE,
     FASTWAM_COMPOSITE_VIEW_KEY,
+    TRI_VIEW_COMPOSITE_LAYOUT,
+    TRI_VIEW_COMPOSITE_VIEW_KEY,
     build_robotwin_composite,
 )
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset, LeRobotSingleDataset, ModalityConfig
@@ -516,7 +518,10 @@ class JointLiberoDataset(LeRobotSingleDataset):
                 if decode_future:
                     future_views.append(frames[min(1, frames.shape[0] - 1)])
 
-            if image_layout == FASTWAM_COMPOSITE_LAYOUT:
+            if image_layout in {
+                FASTWAM_COMPOSITE_LAYOUT,
+                TRI_VIEW_COMPOSITE_LAYOUT,
+            }:
                 expected_source_keys = list(_cfg_get(self.data_cfg, "composite_source_view_keys", []))
                 if expected_source_keys and source_view_keys != expected_source_keys:
                     raise ValueError(
@@ -532,7 +537,15 @@ class JointLiberoDataset(LeRobotSingleDataset):
                         f"got {configured_size}"
                     )
                 composite_view_key = str(
-                    _cfg_get(self.data_cfg, "composite_view_key", FASTWAM_COMPOSITE_VIEW_KEY)
+                    _cfg_get(
+                        self.data_cfg,
+                        "composite_view_key",
+                        (
+                            TRI_VIEW_COMPOSITE_VIEW_KEY
+                            if image_layout == TRI_VIEW_COMPOSITE_LAYOUT
+                            else FASTWAM_COMPOSITE_VIEW_KEY
+                        ),
+                    )
                 )
                 img0 = [np.asarray(build_robotwin_composite(current_views), dtype=np.uint8)]
                 img1 = (
@@ -559,7 +572,10 @@ class JointLiberoDataset(LeRobotSingleDataset):
                 sample["image_1"] = np.stack(img1, axis=0)
             sample["image_view_keys"] = view_keys
             sample["dino_view_keys"] = view_keys
-            if image_layout == FASTWAM_COMPOSITE_LAYOUT:
+            if image_layout in {
+                FASTWAM_COMPOSITE_LAYOUT,
+                TRI_VIEW_COMPOSITE_LAYOUT,
+            }:
                 sample["dino_target_view_keys"] = view_keys
             #######
             if self._dino_target_latents:

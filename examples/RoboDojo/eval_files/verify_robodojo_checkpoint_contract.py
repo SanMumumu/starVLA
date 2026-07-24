@@ -72,10 +72,77 @@ def verify(checkpoint_path: str) -> dict:
     framework = config.get("framework") or {}
     action = framework.get("action_model") or {}
     data = ((config.get("datasets") or {}).get("vla_data") or {})
-    _expect(framework.get("name"), "QwenGR00T", "framework.name")
+    framework_name = str(framework.get("name", ""))
+    if framework_name not in {"QwenGR00T", "QwenWorldActionMoT"}:
+        raise ValueError(
+            "RoboDojo checkpoint framework.name="
+            f"{framework_name!r}; expected QwenGR00T or QwenWorldActionMoT."
+        )
     _expect(int(action.get("action_dim", -1)), 14, "framework.action_model.action_dim")
-    _expect(int(action.get("state_dim", -1)), 14, "framework.action_model.state_dim")
     _expect(int(action.get("action_horizon", -1)), 16, "framework.action_model.action_horizon")
+    if framework_name == "QwenWorldActionMoT":
+        mot = framework.get("world_action_mot") or {}
+        _expect(
+            bool(framework.get("enable_world_action_mot", False)),
+            True,
+            "framework.enable_world_action_mot",
+        )
+        if str(mot.get("architecture", "legacy")).lower() == "causal_dino_mot":
+            if str(mot.get("interaction_mode", "")).lower() not in {"base", "joint"}:
+                raise ValueError(
+                    "framework.world_action_mot.interaction_mode must be "
+                    "'base' or 'joint'"
+                )
+            _expect(
+                mot.get("world_attention_mask_mode"),
+                "first_frame_causal",
+                "framework.world_action_mot.world_attention_mask_mode",
+            )
+            for field, expected in (
+                ("world_hidden_size", 512),
+                ("action_hidden_size", 1024),
+                ("world_ffn_dim", 2048),
+                ("action_ffn_dim", 4096),
+                ("num_layers", 30),
+                ("num_attention_heads", 24),
+                ("attention_head_dim", 128),
+                ("time_frequency_dim", 256),
+                ("world_grid_height", 12),
+                ("world_grid_width", 10),
+                ("world_num_train_timesteps", 1000),
+                ("action_num_train_timesteps", 1000),
+            ):
+                _expect(
+                    int(mot.get(field, -1)),
+                    expected,
+                    f"framework.world_action_mot.{field}",
+                )
+            for field, expected in (
+                ("norm_eps", 1.0e-6),
+                ("world_train_shift", 5.0),
+                ("world_infer_shift", 5.0),
+                ("action_train_shift", 5.0),
+                ("action_infer_shift", 5.0),
+            ):
+                _expect(
+                    float(mot.get(field, -1.0)),
+                    expected,
+                    f"framework.world_action_mot.{field}",
+                )
+        else:
+            _expect(
+                mot.get("attention_pattern"),
+                "alternating_condition_joint",
+                "framework.world_action_mot.attention_pattern",
+            )
+        _expect(int(action.get("state_dim", -1)), 14, "framework.action_model.state_dim")
+        _expect(bool(data.get("include_state", False)), True, "datasets.vla_data.include_state")
+        _expect(bool(data.get("online_dino", False)), True, "datasets.vla_data.online_dino")
+        _expect(bool(data.get("decode_future_video", False)), True, "datasets.vla_data.decode_future_video")
+    else:
+        # Preserve the historical baseline/WAM checkpoint contract verbatim.
+        _expect(int(action.get("state_dim", -1)), 14, "framework.action_model.state_dim")
+        _expect(bool(data.get("include_state", False)), True, "datasets.vla_data.include_state")
     data_mix = data.get("data_mix")
     allowed_data_mixes = {"robodojo_v21", "robodojo_v21_language_optional"}
     if data_mix not in allowed_data_mixes:
@@ -83,17 +150,24 @@ def verify(checkpoint_path: str) -> dict:
             "RoboDojo checkpoint datasets.vla_data.data_mix="
             f"{data_mix!r}; expected one of {sorted(allowed_data_mixes)!r}."
         )
-    _expect(bool(data.get("include_state", False)), True, "datasets.vla_data.include_state")
-    _expect(data.get("image_layout"), "fastwam_composite", "datasets.vla_data.image_layout")
+    composite_contracts = {
+        ("fastwam_composite", "video.fastwam_composite"),
+        ("tri_view_composite", "video.tri_view_composite"),
+    }
+    composite_contract = (
+        data.get("image_layout"),
+        data.get("composite_view_key"),
+    )
+    if composite_contract not in composite_contracts:
+        raise ValueError(
+            "RoboDojo checkpoint composite layout/key mismatch: "
+            f"got {composite_contract!r}, expected one of "
+            f"{sorted(composite_contracts)!r}"
+        )
     _expect(
         list(data.get("composite_source_view_keys") or []),
         EXPECTED_SOURCE_VIEWS,
         "datasets.vla_data.composite_source_view_keys",
-    )
-    _expect(
-        data.get("composite_view_key"),
-        "video.fastwam_composite",
-        "datasets.vla_data.composite_view_key",
     )
     _expect(list(data.get("obs_image_size") or []), [320, 384], "datasets.vla_data.obs_image_size")
     _expect(data.get("action_type"), "abs_qpos", "datasets.vla_data.action_type")
@@ -127,7 +201,8 @@ def verify(checkpoint_path: str) -> dict:
         "checkpoint": str(checkpoint),
         "run_dir": str(run_dir),
         "contract_config": str(config_path),
-        "include_state": True,
+        "framework": framework_name,
+        "include_state": bool(data.get("include_state", False)),
         "data_mix": data_mix,
         "state_action_normalization": "fastwam_zscore via new_embodiment statistics",
         "image": "head+left_wrist+right_wrist -> FastWAM 320x384 composite",

@@ -23,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from starVLA.model.framework.VLM4A.QwenGR00T import Qwen_GR00T, QwenGR00TDefaultConfig
+from starVLA.model.framework.VLM4A.QwenWorldActionMoT import QwenWorldActionMoT
 from starVLA.model.framework.VLM4A.jointflow.dino_v3 import DINOv3Backbone, dino_num_patches, dino_patch_grid
 from starVLA.model.framework.VLM4A.jointflow.visual_dino_flow_head import VisualFlowMatchingHead
 from starVLA.model.framework.VLM4A.wam_guidance import linear_gradient_ramp
@@ -591,6 +592,7 @@ def test_causal_query_warmup_uses_one_causal_backbone_pass() -> None:
         global_step=20,
     )
     assert harness.backbone_calls == 1
+    assert harness.native_context_calls == 0
     assert harness.detach_action_query_calls == [False]
     assert harness.world_signal_scales == []
     torch.testing.assert_close(output["world_loss_raw"], torch.tensor(4.0))
@@ -600,6 +602,32 @@ def test_causal_query_warmup_uses_one_causal_backbone_pass() -> None:
     torch.testing.assert_close(output["action_world_bypassed"], torch.tensor(1.0))
     torch.testing.assert_close(output["action_backbone_detached"], torch.tensor(0.0))
     torch.testing.assert_close(output["world_backbone_detached"], torch.tensor(0.0))
+    torch.testing.assert_close(output["baseline_action_context"], torch.tensor(0.0))
+
+
+def test_causal_query_gate_policy_uses_act_hidden_not_native_context() -> None:
+    """Gate FT and inference-facing policy loss must keep ACT on the action path."""
+
+    harness = _JointE2EForwardHarness()
+    harness.expected_task = "policy"
+    harness.wam_guidance.update(
+        {
+            "baseline_action_context": False,
+            "future_query_through_qwen": True,
+            "separate_world_backbone_pass": False,
+            "detach_action_query_in_world_pass": False,
+        }
+    )
+    harness._wam_maybe_logged_gate_metrics = lambda: {}
+    output = Qwen_GR00T._wam_guided_forward(
+        harness,
+        examples=[{}],
+        task="policy",
+    )
+    assert harness.backbone_calls == 1
+    assert harness.native_context_calls == 0
+    assert harness.action_world_tokens is not None
+    torch.testing.assert_close(output["baseline_action_context"], torch.tensor(0.0))
 
 
 def test_policy_first_warmup_routes_qwen_gradient_only_from_action() -> None:
@@ -1096,58 +1124,98 @@ def test_no_world2action_runtime_contract_requires_physical_absence() -> None:
         raise AssertionError("No-W2A runtime accepted a world adapter")
 
 
-def test_robodojo_warmup_and_gate_yaml_pass_early_contracts() -> None:
-    original_config_paths = (
-        REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_wam_warmup.yaml",
-        REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_wam_gate.yaml",
-    )
-    rynnbrain_config_paths = (
-        REPO_ROOT / "examples/RoboDojo/train_files/starvla_rynnbrain11_robodojo_wam_warmup.yaml",
-        REPO_ROOT / "examples/RoboDojo/train_files/starvla_rynnbrain11_robodojo_wam_gate.yaml",
-    )
-    for config_path in original_config_paths + rynnbrain_config_paths:
-        cfg = OmegaConf.load(config_path)
-        assert not bool(cfg.trainer.world_validation.enabled)
-        assert "fastwam_val_fraction" not in cfg.datasets.vla_data
-        merged = merge_framework_config(QwenGR00TDefaultConfig, cfg)
-        harness = SimpleNamespace(config=merged)
-        Qwen_GR00T._validate_joint_e2e_contract(harness)
-        Qwen_GR00T._validate_wam_two_stage_contract(harness)
-        active = [key for key, value in merged.framework.tasks.weights.items() if float(value) > 0]
-        expected = ["joint_detached"] if str(cfg.trainer.wam_two_stage_phase) == "predictor_warmup" else ["policy"]
-        assert active == expected
-        assert bool(cfg.framework.wam.guidance.exclude_post_query_context)
-        assert bool(cfg.framework.wam.guidance.causal_query_suffix)
-        assert bool(cfg.framework.wam.guidance.action_query_last)
-        assert not bool(cfg.framework.action_model.use_correlated_noise)
-        assert "corrnoise" not in str(cfg.run_id)
-        assert not any(str(key).startswith("correlation_") for key in cfg.framework.action_model.keys())
-        assert int(cfg.datasets.vla_data.per_device_batch_size) == 16
-        assert int(cfg.trainer.gradient_accumulation_steps) == 1
+def test_robodojo_qwen_and_rynnbrain_use_single_stage_mot_configs() -> None:
+    train_dir = REPO_ROOT / "examples/RoboDojo/train_files"
+    paths = [
+        train_dir / "mot_base.yaml",
+        train_dir / "mot_joint.yaml",
+        train_dir / "rynn_base.yaml",
+        train_dir / "rynn_joint.yaml",
+    ]
+    configs = [OmegaConf.load(path) for path in paths]
 
-    for config_path in original_config_paths:
-        cfg = OmegaConf.load(config_path)
-        assert str(cfg.framework.qwenvl.attn_implementation) == "flash_attention_2"
-        assert str(cfg.framework.qwenvl.base_vlm).rstrip("/").endswith(
+    for cfg in configs:
+        assert str(cfg.framework.name) == "QwenWorldActionMoT"
+        assert bool(cfg.framework.enable_world_action_mot)
+        assert "wam" not in cfg.framework
+        assert "jointflow" not in cfg.framework
+        assert "wam_two_stage_phase" not in cfg.trainer
+        assert "wam_two_stage_recipe" not in cfg.trainer
+        assert cfg.trainer.pretrained_checkpoint is None
+        assert not bool(cfg.trainer.world_validation.enabled)
+        assert int(cfg.trainer.max_train_steps) == 50000
+        assert int(cfg.trainer.expected_global_batch_size) == 768
+        assert int(cfg.trainer.gradient_accumulation_steps) == 1
+        assert int(cfg.datasets.vla_data.per_device_batch_size) == 12
+        assert bool(cfg.datasets.vla_data.include_state)
+        assert int(cfg.framework.action_model.state_dim) == 14
+        assert int(cfg.framework.action_model.action_horizon) == 16
+        assert int(cfg.framework.planner.num_action_queries) == 16
+        assert int(cfg.framework.planner.num_world_queries) == 16
+        assert str(cfg.framework.world_action_mot.architecture) == "causal_dino_mot"
+        assert int(cfg.framework.world_action_mot.world_hidden_size) == 512
+        assert int(cfg.framework.world_action_mot.world_ffn_dim) == 2048
+        assert int(cfg.framework.world_action_mot.action_hidden_size) == 1024
+        assert int(cfg.framework.world_action_mot.action_ffn_dim) == 4096
+        assert int(cfg.framework.world_action_mot.num_layers) == 30
+        assert int(cfg.framework.world_action_mot.num_attention_heads) == 24
+        assert int(cfg.framework.world_action_mot.attention_head_dim) == 128
+        assert int(cfg.framework.world_action_mot.world_num_train_timesteps) == 1000
+        assert int(cfg.framework.world_action_mot.action_num_train_timesteps) == 1000
+        assert not bool(cfg.framework.planner.text_supervision.enabled)
+        assert float(cfg.framework.world_action_mot.text_loss_weight) == 0.0
+        assert bool(cfg.trainer.seed_before_model_init)
+        assert bool(cfg.framework.dino.force_online)
+        assert str(cfg.framework.dino.weights).endswith("/DINO-B/")
+        assert not bool(cfg.datasets.vla_data.optional_text_annotations.require_columns)
+
+    qwen_base, qwen_joint, rynn_base, rynn_joint = configs
+    for qwen in (qwen_base, qwen_joint):
+        assert str(qwen.framework.qwenvl.attn_implementation) == "flash_attention_2"
+        assert str(qwen.framework.qwenvl.base_vlm).rstrip("/").endswith(
             "/Qwen3-VL-2B-Instruct"
         )
-        assert "rynnbrain" not in str(cfg.run_id).lower()
-
-    warmup = OmegaConf.load(rynnbrain_config_paths[0])
-    gate = OmegaConf.load(rynnbrain_config_paths[1])
-    for cfg in (warmup, gate):
-        assert str(cfg.framework.qwenvl.attn_implementation) == "sdpa"
-        assert str(cfg.framework.qwenvl.base_vlm).rstrip("/").endswith(
+    for rynn in (rynn_base, rynn_joint):
+        assert str(rynn.framework.qwenvl.attn_implementation) == "sdpa"
+        assert str(rynn.framework.qwenvl.base_vlm).rstrip("/").endswith(
             "/rynnbrain1.1-2B"
         )
-        assert not bool(cfg.framework.qwenvl.enable_thinking)
-        assert "rynnbrain11" in str(cfg.run_id).lower()
-    assert str(gate.trainer.pretrained_checkpoint).endswith(
-        f"/{warmup.run_id}/final_model/pytorch_model.pt"
+        assert not bool(rynn.framework.qwenvl.enable_thinking)
+        assert "rynnbrain11" in str(rynn.run_id).lower()
+    assert str(qwen_base.framework.world_action_mot.interaction_mode) == "base"
+    assert str(rynn_base.framework.world_action_mot.interaction_mode) == "base"
+    assert str(qwen_joint.framework.world_action_mot.interaction_mode) == "joint"
+    assert str(rynn_joint.framework.world_action_mot.interaction_mode) == "joint"
+
+    removed = (
+        "starvla_qwen3_robodojo_world_action_mot.yaml",
+        "starvla_rynnbrain11_robodojo_world_action_mot.yaml",
+        "starvla_qwengroot_robodojo_wam_warmup.yaml",
+        "starvla_qwengroot_robodojo_wam_gate.yaml",
+        "starvla_rynnbrain11_robodojo_causal_query_warmup.yaml",
+        "starvla_rynnbrain11_robodojo_causal_query_gate.yaml",
     )
-    assert str(warmup.run_id) != str(
-        OmegaConf.load(original_config_paths[0]).run_id
+    assert all(not (train_dir / name).exists() for name in removed)
+
+
+def test_robodojo_mot_stacks_current_state_as_one_normalized_token() -> None:
+    harness = SimpleNamespace(
+        include_state=True,
+        device=torch.device("cpu"),
+        config=SimpleNamespace(
+            framework=SimpleNamespace(
+                action_model=SimpleNamespace(state_dim=14)
+            )
+        ),
     )
+    examples = [
+        {"state": np.arange(14, dtype=np.float32)[None]},
+        {"state": (np.arange(14, dtype=np.float32) + 10)[None]},
+    ]
+    state = QwenWorldActionMoT._stack_state(harness, examples, torch.float32)
+    assert state.shape == (2, 1, 14)
+    assert torch.equal(state[0, 0], torch.arange(14, dtype=torch.float32))
+    assert torch.equal(state[1, 0], torch.arange(14, dtype=torch.float32) + 10)
 
 
 def test_robodojo_optional_text_target_masks_unannotated_rows() -> None:
@@ -2451,7 +2519,9 @@ def test_accelerator_state_roundtrips_registered_raw_scheduler() -> None:
 
 
 def test_robodojo_warmup_contract_rejects_bad_suffix_and_corrnoise() -> None:
-    config_path = REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_wam_warmup.yaml"
+    # Historical Qwen causal-query configs remain loadable for reproducing old
+    # runs, but are no longer exposed by the current RoboDojo run script.
+    config_path = REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwen3_robodojo_causal_query_warmup.yaml"
     for field, expected_message in (
         ("suffix", "exclude_post_query_context"),
         ("corrnoise", "use_correlated_noise"),

@@ -1,0 +1,30 @@
+#######
+# RynnBrain1.1 RoboDojo DINO--Action MoT base training: 8 nodes x 8 GPUs x bs12.
+# Submit:
+#   aidi-inf-cli job submit -f rynn_base.yaml -q project-ppu-robot-lab-acloud-bj
+#######
+REQUIRED:
+  JOB_NAME: "starvla-rynn-robodojo-mot-base-50k-8x8"
+  JOB_PASSWD: "newk8s666"
+  UPLOAD_DIR: "/home/users/sen02.wang/workspace/starvla_dev"
+  PROJECT_ID: "horizon-labs"
+  WORKER_MIN_NUM: 8
+  WORKER_MAX_NUM: 8
+  GPU_PER_WORKER: 8
+  RUN_SCRIPTS: "EXPECTED_NUM_MACHINES=8 ${WORKING_PATH}/run_aidi_rbtw.sh examples/RoboDojo/train_files/rynn_base.yaml"
+  environment:
+    EXPECTED_NUM_MACHINES: "8"
+    GPUS_PER_NODE: "8"
+
+OPTIONAL:
+  FRAMEWORK: "pytorch"
+  TASK_LABEL: "DEV"
+  PRIORITY: 5
+  DOCKER_IMAGE: "docker.hobot.cc/imagesys/starvla-rynn-ppu:v1.0"
+  WALL_TIME: 20000
+  JOB_TYPE: "train"
+  REMARK: "RynnBrain1.1 RoboDojo base physical flow; action 1.019B, world 445.6M; online DINO-B; global batch 768; 50k"
+  DATA_SPACE:
+    DATA_TYPE: "dmp"
+    INPUT: "robot_lab"
+    OUTPUT: "robot_lab"

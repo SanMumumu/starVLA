@@ -1403,7 +1403,7 @@ class LeRobotSingleDataset(Dataset):
         image_layout = str(
             self.data_cfg.get("image_layout", "separate_views") if self.data_cfg is not None else "separate_views"
         ).lower()
-        if image_layout == "fastwam_composite":
+        if image_layout in {"fastwam_composite", "tri_view_composite"}:
             from starVLA.dataloader.fastwam_image import (
                 FASTWAM_COMPOSITE_SIZE,
                 build_robotwin_composite,

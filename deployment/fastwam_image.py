@@ -18,6 +18,8 @@ from torchvision.transforms import functional as tvf
 
 FASTWAM_COMPOSITE_LAYOUT = "fastwam_composite"
 FASTWAM_COMPOSITE_VIEW_KEY = "video.fastwam_composite"
+TRI_VIEW_COMPOSITE_LAYOUT = "tri_view_composite"
+TRI_VIEW_COMPOSITE_VIEW_KEY = "video.tri_view_composite"
 # PIL/config order is (width, height); numpy/tensor order is (height, width).
 FASTWAM_COMPOSITE_SIZE = (320, 384)
 
@@ -60,5 +62,7 @@ __all__ = [
     "FASTWAM_COMPOSITE_LAYOUT",
     "FASTWAM_COMPOSITE_SIZE",
     "FASTWAM_COMPOSITE_VIEW_KEY",
+    "TRI_VIEW_COMPOSITE_LAYOUT",
+    "TRI_VIEW_COMPOSITE_VIEW_KEY",
     "build_robotwin_composite",
 ]

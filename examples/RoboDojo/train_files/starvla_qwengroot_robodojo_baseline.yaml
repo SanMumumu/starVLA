@@ -81,7 +81,7 @@ datasets:
     sequential_step_sampling: false
     balance_dataset_weights: false
     balance_trajectory_weights: false
-    per_device_batch_size: 16
+    per_device_batch_size: 12
 
     load_all_data_for_training: true
     # PIL/config order is [width, height].
@@ -93,6 +93,7 @@ datasets:
     persistent_workers: false
 
 trainer:
+  expected_global_batch_size: 768
   max_train_steps: 80000
   num_warmup_steps: 2000
   save_interval: 10000

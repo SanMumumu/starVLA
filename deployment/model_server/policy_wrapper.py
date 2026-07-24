@@ -17,7 +17,8 @@ Exposed API:
   - ``metadata`` (dict, sent at handshake): ``action_chunk_size``,
     ``available_unnorm_keys``, ``action_keys``, ``state_keys``.
   - ``predict_action(examples, unnorm_key=None, **kwargs)`` returns
-    ``{"actions": np.ndarray[B, T, action_dim]}``.
+    ``{"actions": np.ndarray[B, T, action_dim]}`` plus optional
+    ``{"planner_text": list[str]}``.
 """
 
 from __future__ import annotations
@@ -605,7 +606,7 @@ class PolicyServerWrapper:
         examples: List[dict],
         unnorm_key: Optional[str] = None,
         **kwargs,
-    ) -> Dict[str, np.ndarray]:
+    ) -> Dict[str, Any]:
         """Run the framework, then un-normalize via training-time transforms.
 
         Args:
@@ -616,7 +617,8 @@ class PolicyServerWrapper:
                 (``do_sample``, ``use_ddim``, ``num_ddim_steps``, ...).
 
         Returns:
-            ``{"actions": np.ndarray[B, T, D]}`` -- un-normalized.
+            Un-normalized ``actions`` and, for unified text planners, the
+            optional generated ``planner_text``.
         """
         examples = self._prepare_examples(examples)
         effective_key = unnorm_key if unnorm_key is not None else self._default_unnorm_key
@@ -637,4 +639,10 @@ class PolicyServerWrapper:
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
-        return {"actions": unnorm}
+        result = {"actions": unnorm}
+        # Unified text planners expose their low-frequency AR plan alongside
+        # the action chunk.  Existing clients remain compatible because the
+        # actions field is unchanged and the metadata is optional.
+        if "planner_text" in out:
+            result["planner_text"] = out["planner_text"]
+        return result

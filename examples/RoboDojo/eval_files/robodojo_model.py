@@ -152,6 +152,8 @@ class Model(ModelTemplate):
         FASTWAM_COMPOSITE_LAYOUT = fastwam_image.FASTWAM_COMPOSITE_LAYOUT
         FASTWAM_COMPOSITE_SIZE = fastwam_image.FASTWAM_COMPOSITE_SIZE
         FASTWAM_COMPOSITE_VIEW_KEY = fastwam_image.FASTWAM_COMPOSITE_VIEW_KEY
+        TRI_VIEW_COMPOSITE_LAYOUT = fastwam_image.TRI_VIEW_COMPOSITE_LAYOUT
+        TRI_VIEW_COMPOSITE_VIEW_KEY = fastwam_image.TRI_VIEW_COMPOSITE_VIEW_KEY
         build_robotwin_composite = fastwam_image.build_robotwin_composite
 
         self._build_composite = build_robotwin_composite
@@ -171,14 +173,27 @@ class Model(ModelTemplate):
             raise TypeError(f"Invalid StarVLA server metadata: {metadata!r}")
 
         expected_layout = str(self.model_cfg.get("expected_image_layout", FASTWAM_COMPOSITE_LAYOUT))
-        if metadata.get("image_layout") != expected_layout:
-            raise RuntimeError(
-                f"Checkpoint image_layout={metadata.get('image_layout')!r}; expected {expected_layout!r}."
-            )
         expected_key = str(self.model_cfg.get("expected_composite_view_key", FASTWAM_COMPOSITE_VIEW_KEY))
-        if metadata.get("composite_view_key") != expected_key:
+        equivalent_composite_contracts = {
+            (FASTWAM_COMPOSITE_LAYOUT, FASTWAM_COMPOSITE_VIEW_KEY),
+            (TRI_VIEW_COMPOSITE_LAYOUT, TRI_VIEW_COMPOSITE_VIEW_KEY),
+        }
+        expected_composite_contract = (expected_layout, expected_key)
+        checkpoint_composite_contract = (
+            metadata.get("image_layout"),
+            metadata.get("composite_view_key"),
+        )
+        if (
+            checkpoint_composite_contract != expected_composite_contract
+            and not (
+                checkpoint_composite_contract in equivalent_composite_contracts
+                and expected_composite_contract in equivalent_composite_contracts
+            )
+        ):
             raise RuntimeError(
-                f"Checkpoint composite_view_key={metadata.get('composite_view_key')!r}; expected {expected_key!r}."
+                "Checkpoint composite layout/key="
+                f"{checkpoint_composite_contract!r}; "
+                f"expected {expected_composite_contract!r}."
             )
         if list(metadata.get("composite_source_view_keys") or []) != _EXPECTED_SOURCE_VIEW_KEYS:
             raise RuntimeError(
@@ -215,6 +230,7 @@ class Model(ModelTemplate):
         self.default_instruction = str(self.model_cfg.get("task_name") or "follow the instruction")
         self.obs_by_env: dict[int, dict[str, Any]] = {}
         self.action_chunks_by_env: dict[int, np.ndarray] = {}
+        self.planner_text_by_env: dict[int, str] = {}
         self.step_by_env: dict[int, int] = {}
         self._latest_env_idx_list = [0]
         print(
@@ -279,7 +295,13 @@ class Model(ModelTemplate):
         )
         if not response.get("ok", False):
             raise RuntimeError(f"StarVLA inference failed: {response.get('error', response)}")
-        chunk = np.asarray(response["data"]["actions"][0], dtype=np.float32)
+        response_data = response["data"]
+        planner_text = response_data.get("planner_text")
+        if planner_text:
+            text = str(planner_text[0]).strip()
+            self.planner_text_by_env[env_idx] = text
+            print(f"[starVLA][RoboDojo][env={env_idx}] planner_text={text!r}")
+        chunk = np.asarray(response_data["actions"][0], dtype=np.float32)
         expected = (self.action_chunk_size, self.action_dim)
         if chunk.shape != expected:
             raise ValueError(f"Expected unnormalized action chunk {expected}, got {chunk.shape}.")
