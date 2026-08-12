@@ -1,0 +1,159 @@
+# LIBERO adaptation of the RoboDojo best-H25 architecture with an explicit FP32 shell.
+# Dataset contract: 7-D delta_qpos, H8 full-chunk execution, two RGB views.
+
+run_id: starvla_rynnbrain11_libero_dino_mot_base_h8_50k_fp32_v1
+run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_libero
+seed: 42
+wandb_entity: axi-the-cat
+wandb_project: starVLA_Libero
+is_debug: false
+version_id: "0.21"
+
+framework:
+  name: QwenWorldActionMoT
+  enable_world_action_mot: true
+
+  qwenvl:
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/rynnbrain1.1-2B/
+    attn_implementation: sdpa
+    require_attn_implementation: true
+    enable_gradient_checkpointing: true
+    enable_thinking: false
+    vl_hidden_dim: 2048
+    truncate_vlm_layers: 0
+
+  planner:
+    num_world_queries: 16
+    num_action_queries: 8
+    world_placeholder_token: "<WORLD_PLAN>"
+    action_placeholder_token: "<ACTION_PLAN>"
+    text_supervision:
+      enabled: false
+
+  world_action_mot:
+    architecture: causal_dino_mot
+    interaction_mode: base
+    world_attention_mask_mode: first_frame_causal
+    action_precision_mode: fp32_shell
+    world_hidden_size: 512
+    action_hidden_size: 1024
+    world_ffn_dim: 2048
+    action_ffn_dim: 4096
+    num_layers: 30
+    num_attention_heads: 24
+    attention_head_dim: 128
+    layerwise_planner_coupling: false
+    norm_eps: 1.0e-06
+    time_frequency_dim: 256
+    # Two 12x10 pooled DINO grids are concatenated in dataset camera order.
+    world_grid_height: 24
+    world_grid_width: 10
+    max_world_tokens: 240
+    num_world_views: 2
+    enable_gradient_checkpointing: true
+    world_train_shift: 5.0
+    world_infer_shift: 5.0
+    world_num_train_timesteps: 1000
+    action_train_shift: 5.0
+    action_infer_shift: 5.0
+    action_num_train_timesteps: 1000
+    num_inference_timesteps: 20
+    action_prediction_type: velocity
+    action_velocity_target: noise_minus_clean
+    jit_t_eps: 0.05
+    repeated_diffusion_steps: 1
+    action_loss_weight: 1.0
+    world_loss_weight: 1.0
+    text_loss_weight: 0.0
+
+  dino:
+    name: dinov3_vitb16
+    model_size: base
+    hf_model_id: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO-B/
+    repo_or_dir: facebookresearch/dinov3
+    weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO-B/
+    loader: hf
+    image_size: [384, 320]
+    patch_size: 16
+    embed_dim: 768
+    stats_path: null
+    load_live_backbone: true
+    force_online: true
+    dino_pool: 2
+    current_dino_pool: null
+
+  action_model:
+    action_dim: 7
+    state_dim: 8
+    action_horizon: 8
+
+datasets:
+  vla_data:
+    dataset_py: jointflow
+    data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero
+    data_mix: libero_all
+    image_layout: separate_views
+    include_state: true
+    action_type: delta_qpos
+    # LIBERO LeRobot files already store delta-qpos labels; do not delta them twice.
+    action_mode: abs
+    action_horizon: 8
+    world_model:
+      future_stride: 8
+    future_valid_requires_full_stride: true
+    decode_future_video: true
+    online_dino: true
+    dino_target_latents: false
+    text_annotations:
+      enabled: false
+    sequential_step_sampling: false
+    balance_dataset_weights: false
+    balance_trajectory_weights: false
+    per_device_batch_size: 6
+    load_all_data_for_training: true
+    obs_image_size: [320, 384]
+    video_backend: torchvision_av
+    num_workers: 8
+    prefetch_factor: 2
+    pin_memory: true
+    persistent_workers: false
+
+trainer:
+  seed_before_model_init: true
+  # 6 micro-batch x 8 GPUs x 16 accumulation steps.
+  expected_global_batch_size: 768
+  max_train_steps: 50000
+  num_warmup_steps: 2000
+  save_interval: 10000
+  eval_interval: 1000
+  action_eval_enabled: true
+  world_validation:
+    enabled: false
+  pretrained_checkpoint: null
+  is_resume: false
+  save_full_training_state: true
+  learning_rate:
+    base: 1.0e-05
+    qwen_vl_interface: 1.0e-05
+    action_plan_queries: 1.0e-04
+    world_plan_queries: 1.0e-04
+    action_model: 1.0e-04
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: ""
+  loss_scale:
+    vla: 1.0
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  logging_frequency: 200
+  log_grad_norms: false
+  log_global_grad_norm: true
+  deepspeed_skip_unused_param_anchors: true
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 16
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08

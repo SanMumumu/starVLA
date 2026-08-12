@@ -97,6 +97,42 @@ def _without_video(create_eval_env):
     return create_eval_env_without_video
 
 
+def _install_eval_batch_override(namespace: dict) -> None:
+    """Make the official client honor this invocation's runtime batch mode.
+
+    Upstream ``main.py`` re-reads
+    ``RoboDojo/XPolicyLab/policy/starVLA/deploy.yml`` after parsing
+    ``--num_envs``.  That shared checkout intentionally remains untouched and
+    commonly contains ``eval_batch: false``, which silently collapses a
+    requested six-environment rollout back to one.  The repository launcher
+    already owns the per-run deployment contract, so override only the lookup
+    in this process.
+    """
+
+    raw = os.environ.get("ROBODOJO_EVAL_BATCH")
+    if raw is None:
+        return
+    if not callable(namespace.get("_eval_batch_from_deploy")):
+        raise RuntimeError(
+            "RoboDojo official main no longer exposes "
+            "_eval_batch_from_deploy; refusing to silently reduce vector "
+            "rollout concurrency."
+        )
+    normalized = raw.strip().lower()
+    if normalized not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+        raise ValueError(
+            "ROBODOJO_EVAL_BATCH must be a boolean, got "
+            f"{raw!r}"
+        )
+    enabled = normalized in {"1", "true", "yes", "on"}
+    namespace["_eval_batch_from_deploy"] = lambda _policy_name: enabled
+    print(
+        "[RoboDojo] simulator batch contract overridden by launcher: "
+        f"eval_batch={str(enabled).lower()}",
+        flush=True,
+    )
+
+
 def _execute_official_main(entry: Path) -> None:
     """Define upstream main, apply narrow runtime hooks, then call it.
 
@@ -114,6 +150,7 @@ def _execute_official_main(entry: Path) -> None:
     }
     source = entry.read_bytes()
     exec(compile(source, str(entry), "exec"), namespace)
+    _install_eval_batch_override(namespace)
     if os.environ.get("ROBODOJO_DISABLE_EVAL_VIDEO", "0") == "1":
         namespace["create_eval_env"] = _without_video(namespace["create_eval_env"])
     namespace["main"]()

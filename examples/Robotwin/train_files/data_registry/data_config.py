@@ -150,13 +150,48 @@ class FastWAMRobotWinDataConfig(AgilexDataConfig):
             data_cfg=data_cfg,
         )
 
+    def make_joint_dataset(
+        self,
+        dataset_path,
+        modality_configs,
+        transforms,
+        embodiment_tag,
+        video_backend,
+        delete_pause_frame,
+        data_cfg,
+        **kwargs,
+    ):
+        """Use FastWAM metadata with JointFlow's current/future sample ABI."""
 
-# Closed-loop Co-Flow uses the identical release order, z-score transforms,
-# state contract, and dataset implementation; only the requested action chunk
-# changes.  A distinct robot type keeps old H32 checkpoint normalization and
-# reconstruction untouched.
+        from starVLA.dataloader.jointflow.joint_dataset import (
+            JointFastWAMRobotWinDataset,
+        )
+
+        return JointFastWAMRobotWinDataset(
+            dataset_path=dataset_path,
+            modality_configs=modality_configs,
+            transforms=transforms,
+            embodiment_tag=embodiment_tag,
+            video_backend=video_backend,
+            delete_pause_frame=delete_pause_frame,
+            data_cfg=data_cfg,
+            online_dino=kwargs.get("online_dino", True),
+            dino_feature_dir=kwargs.get("dino_feature_dir", "latents"),
+            dino_episode_cache_size=kwargs.get("dino_episode_cache_size", 2),
+            dino_target_latents=kwargs.get("dino_target_latents", False),
+        )
+
+
+# H16/H50 variants use the identical release order, z-score transforms, state
+# contract, and dataset implementation; only the requested action chunk
+# changes. Distinct robot types prevent an H32 action index list from being
+# reused silently by a different policy horizon.
 class FastWAMRobotWinH16DataConfig(FastWAMRobotWinDataConfig):
     action_indices = list(range(16))
+
+
+class FastWAMRobotWinH50DataConfig(FastWAMRobotWinDataConfig):
+    action_indices = list(range(50))
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +247,7 @@ ROBOT_TYPE_CONFIG_MAP = {
     "robotwin50": AgilexData50Config(),
     "robotwin_fastwam": FastWAMRobotWinDataConfig(),
     "robotwin_fastwam_h16": FastWAMRobotWinH16DataConfig(),
+    "robotwin_fastwam_h50": FastWAMRobotWinH50DataConfig(),
     "robotwin16": AgilexData16Config(),
     "arx_x5": ArxX5DataConfig(),
 }
@@ -386,6 +422,7 @@ DATASET_NAMED_MIXTURES = {
     "robotwin_task2": [("place_a2b_left", 1.0, "robotwin"), ("place_a2b_right", 1.0, "robotwin")],
     "robotwin_fastwam": [(".", 1.0, "robotwin_fastwam")],
     "robotwin_fastwam_h16": [(".", 1.0, "robotwin_fastwam_h16")],
+    "robotwin_fastwam_h50": [(".", 1.0, "robotwin_fastwam_h50")],
     "arx_x5": [("arx_x5", 1.0, "arx_x5")],
 }
 

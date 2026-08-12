@@ -1,3 +1,57 @@
+# Current Rynn H50 recipe
+
+The canonical training config is `train_files/rynn_base_h50_50k.yaml`. It
+keeps the current Rynn model/optimizer implementation and adopts the released
+FastWAM RoboTwin data ABI from
+`train_files/starvla_qwengroot_robotwin_fastwam_old.yaml`: 50 Hz metadata,
+14-D absolute actions/state in release order, global z-score normalization,
+the exact 320x384 head+wrist composite, and seeded global-frame sampling
+without replacement. Both the action chunk and world target use H50/t+50.
+Evaluation executes 20 actions from each chunk before replanning.
+
+Train on 8 nodes with 8 GPUs per node through Slurm:
+
+```bash
+sbatch --export=ALL,\
+ROBOTWIN_DATA_ROOT=/path/to/RoboTwin/lerobot/data,\
+RYNN_BASE_VLM=/path/to/rynnbrain1.1-2B,\
+RUN_ROOT_DIR=/path/to/outputs \
+examples/Robotwin/train_files/run_robotwin_train_batch.sh
+```
+
+The YAML and launcher are deliberately locked to
+`16 per GPU x 8 nodes x 8 GPUs x 1 accumulation = global batch 1024`.
+`run_robotwin_train_batch.sh` starts one Accelerate launcher per node; the
+node-local `run_robotwin_train.sh` rejects any topology that would change this
+batch contract.
+
+For full 8-way evaluation, run the policy servers in the StarVLA environment:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+CKPT=/path/to/steps_50000_pytorch_model.pt \
+BASE_PORT=6698 \
+bash examples/Robotwin/eval_files/run_policy_servers_8.sh
+```
+
+Then run the RoboTwin clients (same node: `HOST=127.0.0.1`):
+
+```bash
+CKPT=/path/to/steps_50000_pytorch_model.pt \
+HOST=127.0.0.1 \
+ROBOTWIN_PATH=/path/to/RoboTwin \
+BASE_PORT=6698 REPLAN_STEPS=20 \
+bash examples/Robotwin/eval_files/eval_robotwin_8clients_rynn_fastwam_h50.sh
+```
+
+All previous top-level training YAML files, including the superseded FP32
+Robotwin recipe, were retained as `*_old.yaml`.
+Legacy experiment launchers, `compare_files/`, and old evaluation paths are
+intentionally preserved; the two canonical Robotwin training launchers now use
+the current 8-node Rynn recipe.
+
+---
+
 # 🚀 RoboTwin 2.0 Evaluation
 
 This document provides instructions for reproducing our **experimental results** with [RoboTwin2.0](https://github.com/RoboTwin-Platform/RoboTwin).  
@@ -394,21 +448,27 @@ This schedules all 50 tasks across 8 GPUs, running up to 8 tasks in parallel. Wh
 The policy always predicts the action horizon stored in the checkpoint. To execute only the first `N` actions and then infer a fresh chunk, use the result-only replan launcher:
 
 ```bash
-REPLAN_STEPS=24 \
+REPLAN_STEPS=20 \
 CKPT=/path/to/checkpoint.pt \
 HOST=policy-server-host \
 ROBOTWIN_PATH=/path/to/RoboTwin \
 bash examples/Robotwin/eval_files/eval_robotwin_8clients_replan.sh
 ```
 
-The default is `24`, matching FastWAM's RoboTwin execution horizon. For a 50-action StarVLA checkpoint, `REPLAN_STEPS=50` executes the full predicted chunk and preserves the previous behavior. Values larger than the checkpoint action horizon are rejected.
+The current Rynn default is `20` for an H50 checkpoint. For a 50-action
+checkpoint, `REPLAN_STEPS=50` executes the full predicted chunk. Values larger
+than the checkpoint action horizon are rejected. This execution horizon is
+independent from the training target: the Rynn world model predicts `t+50` to
+align with its H50 action chunk even when evaluation replans after 20 actions.
+The archived QwenGR00T FastWAM launcher continues to use its historical 24/32
+contract.
 
 ### FastWAM 50 Hz IID baseline
 
 Use this config for the controlled FastWAM data experiment:
 
 ```text
-examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam.yaml
+examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam_old.yaml
 ```
 
 It reads the full global 50 Hz LeRobot release, applies its global z-score

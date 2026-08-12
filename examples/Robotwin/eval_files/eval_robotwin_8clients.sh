@@ -4,6 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
+# Current released Rynn contract: predict H50, execute 20, then replan.
+export ROBOTWIN_REPLAN_STEPS="${ROBOTWIN_REPLAN_STEPS:-${REPLAN_STEPS:-20}}"
+
 CKPT="${CKPT:?Please set CKPT}"
 HOST="${HOST:?Please set HOST to the policy-server job IP}"
 BASE_PORT="${BASE_PORT:-6698}"

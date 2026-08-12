@@ -334,7 +334,12 @@ class TrainerUtils:
         return num_params, num_trainable_params
 
     @staticmethod
-    def load_pretrained_backbones(model, checkpoint_path=None, reload_modules=None):
+    def load_pretrained_backbones(
+        model,
+        checkpoint_path=None,
+        reload_modules=None,
+        strict=False,
+    ):
         """
         load checkpoint:
         - if reload_modules is set, load by path part
@@ -359,6 +364,12 @@ class TrainerUtils:
 
         loaded_modules = []
 
+        if strict and reload_modules:
+            raise ValueError(
+                "strict pretrained loading is only defined for a full-model "
+                "checkpoint; trainer.reload_modules must be empty"
+            )
+
         if reload_modules:  # partial load
             module_paths = [p.strip() for p in reload_modules.split(",") if p.strip()]
             for path in module_paths:
@@ -380,9 +391,21 @@ class TrainerUtils:
                     print(f"❌ cannot find module path: {path}")
         else:  # full load
             try:
-                model.load_state_dict(checkpoint, strict=False)
+                incompatible = model.load_state_dict(checkpoint, strict=bool(strict))
                 if dist.get_rank() == 0:
-                    print("✅ loaded <full_model> model parameters")
+                    if strict:
+                        print("✅ loaded <full_model> model parameters (strict)")
+                    else:
+                        missing = list(incompatible.missing_keys)
+                        unexpected = list(incompatible.unexpected_keys)
+                        print(
+                            "✅ loaded <full_model> model parameters "
+                            f"(missing={len(missing)}, unexpected={len(unexpected)})"
+                        )
+                        if missing:
+                            print(f"⚠️ first missing keys: {missing[:8]}")
+                        if unexpected:
+                            print(f"⚠️ first unexpected keys: {unexpected[:8]}")
                 loaded_modules = ["<full_model>"]
             except Exception as e:
                 raise RuntimeError(f"❌ loading full model failed: {e}")

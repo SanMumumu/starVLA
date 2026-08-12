@@ -786,9 +786,13 @@ class WorldActionMoT(nn.Module):
             if bool(valid.any())
             else per_sample_world.sum() * 0.0
         )
-        total = self.action_loss_weight * action_loss + self.world_loss_weight * world_loss
+        action_objective = self.action_loss_weight * action_loss
+        world_objective = self.world_loss_weight * world_loss
+        total = action_objective + world_objective
         return {
             "loss": total,
+            "action_objective": action_objective,
+            "world_objective": world_objective,
             "action_loss_raw": action_loss.detach(),
             "world_loss_raw": world_loss.detach(),
         }

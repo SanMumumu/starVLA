@@ -1,21 +1,9 @@
-# RynnBrain1.1-2B planner with a causal current/future-DINO and action flow.
-#
-# Physical token order:
-#   [z0 (clean current DINO), zf(t) (noisy future DINO), af(t) (noisy action)]
-#
-# Mask:
-#   z0 -> z0
-#   zf -> [z0, zf]
-#   af -> [z0, af]
-#
-# z0 uses flow timestep zero and is clamped during every sampling step.
-# World uses 2D spatial RoPE plus current/future frame-type embeddings; action
-# uses 1D horizon RoPE. Experts have independent Q/K/V, FFN and output heads.
-# Every layer mixes their self-attention Q/K/V once; world never reads action.
-# Cross-attention KV is [WORLD_PLAN, state] for world and
-# [ACTION_PLAN, state] for action; neither condition enters the physical stream.
+# Event-driven semantic-memory text variant of the verified best H25 recipe.
+# It inherits the maintained global BF16 runtime and uses a separate
+# phase-aligned semantic stream for one-token KEEP/UPDATE decisions and
+# UPDATE-only memory deltas; no RGB history or Rynn MEM vision encoder is used.
 
-run_id: starvla_rynnbrain11_robodojo_dino_mot_base_50k
+run_id: starvla_rynnbrain11_robodojo_dino_mot_base_text_h25_eventmem_ntp_nohist_bf16_50k
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_robodojo
 seed: 42
 wandb_entity: axi-the-cat
@@ -26,27 +14,56 @@ version_id: "0.21"
 framework:
   name: QwenWorldActionMoT
   enable_world_action_mot: true
+  reproduction_profile: robodojo_rynnbrain11_causal_dino_mot_base_text_h25_eventmem_ntp_nohist_bf16_50k_v1
 
   qwenvl:
     base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/rynnbrain1.1-2B/
     attn_implementation: sdpa
+    require_attn_implementation: true
     enable_gradient_checkpointing: true
     enable_thinking: false
     vl_hidden_dim: 2048
+    truncate_vlm_layers: 0
 
   planner:
     num_world_queries: 16
-    num_action_queries: 16
+    num_action_queries: 25
     world_placeholder_token: "<WORLD_PLAN>"
     action_placeholder_token: "<ACTION_PLAN>"
     text_supervision:
-      enabled: false
-      allow_missing_annotations: true
+      enabled: true
+      mode: event_driven_memory_ntp
+      keep_token: "<KEEP>"
+      update_token: "<UPDATE>"
+      subtask_field: subtask_text
+      prompt_template: |-
+        Task instruction: {instruction}
+        Semantic Memory: {semantic_memory}
+        Cached Current Subtask: {cached_current_subtask}
+        Decide whether the cached subtask is still valid. Reply with <KEEP> only when it remains valid. Otherwise begin with <UPDATE>, then provide only `Memory Add:` and `Current Subtask:`.
+      update_response_template: |-
+        {update_token}
+        Memory Add: {memory_add}
+        Current Subtask: {subtask_text}
+      max_new_tokens: 96
+      do_sample: false
+      scheduled_sampling:
+        enabled: true
+        # p(model semantic state used as physical conditioning), linearly
+        # interpolated by optimizer step. Sampled text never supervises itself.
+        points:
+          - [0, 0.0]
+          - [30000, 0.0]
+          - [40000, 0.2]
+          - [50000, 0.5]
+      history:
+        enabled: false
 
   world_action_mot:
     architecture: causal_dino_mot
     interaction_mode: base
     world_attention_mask_mode: first_frame_causal
+    action_precision_mode: inherit
 
     world_hidden_size: 512
     action_hidden_size: 1024
@@ -55,6 +72,7 @@ framework:
     num_layers: 30
     num_attention_heads: 24
     attention_head_dim: 128
+    layerwise_planner_coupling: false
     norm_eps: 1.0e-06
     time_frequency_dim: 256
     world_grid_height: 12
@@ -70,14 +88,20 @@ framework:
     action_num_train_timesteps: 1000
     num_inference_timesteps: 20
 
+    action_prediction_type: velocity
+    action_velocity_target: noise_minus_clean
+    jit_t_eps: 0.05
+    repeated_diffusion_steps: 1
     action_loss_weight: 1.0
     world_loss_weight: 1.0
-    text_loss_weight: 0.0
+    # Semantic objective = 0.005 * (decision CE + UPDATE-body CE).
+    text_loss_weight: 0.005
 
   dino:
     name: dinov3_vitb16
     model_size: base
     hf_model_id: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO-B/
+    repo_or_dir: facebookresearch/dinov3
     weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO-B/
     loader: hf
     image_size: [384, 320]
@@ -87,17 +111,19 @@ framework:
     load_live_backbone: true
     force_online: true
     dino_pool: 2
+    current_dino_pool: null
 
   action_model:
     action_dim: 14
     state_dim: 14
-    action_horizon: 16
+    action_horizon: 25
 
 datasets:
   vla_data:
     dataset_py: jointflow
     data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/RoboDojo
-    data_mix: robodojo_v21_language_optional
+    # Audited v2.1 text dataset: 3500 episodes / 1,859,602 frames.
+    data_mix: robodojo_v21_language
     lerobot_version: v2.1
     image_layout: tri_view_composite
     composite_source_view_keys: ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
@@ -105,7 +131,7 @@ datasets:
     include_state: true
     action_type: abs_qpos
     action_mode: abs
-    action_horizon: 16
+    action_horizon: 25
     world_model:
       future_stride: 16
     future_valid_requires_full_stride: true
@@ -115,6 +141,39 @@ datasets:
     optional_text_annotations:
       enabled: false
       require_columns: false
+    text_annotations:
+      enabled: true
+      fields:
+        subtask_text: subtask_text
+        completed_subtask_text: complete_text
+      history:
+        enabled: false
+      event_memory:
+        enabled: true
+        semantic_offset: -10
+        replan_interval: 10
+        replan_phase: 0
+        normalization: n1
+        empty_memory: "None."
+        empty_cached_subtask: "None."
+        semantic_memory_field: semantic_memory
+        cached_subtask_field: cached_current_subtask
+        decision_field: semantic_decision
+        memory_add_field: memory_add
+        cache_valid_field: semantic_cache_valid
+        index_cache_name: semantic_index_v1.npz
+        expected_phase_update_ratio: 0.064
+        expected_phase_update_tolerance: 0.005
+        sampler:
+          per_device_batch_size: 6
+          update_per_batch: 2
+          hard_keep_per_batch: 2
+          random_keep_per_batch: 2
+          seed: 42
+          num_workers: 4
+          prefetch_factor: 2
+          pin_memory: true
+          persistent_workers: false
     sequential_step_sampling: false
     balance_dataset_weights: false
     balance_trajectory_weights: false
@@ -134,6 +193,9 @@ trainer:
   num_warmup_steps: 2000
   save_interval: 10000
   eval_interval: 1000
+  # External RoboDojo evaluation maintains persistent semantic state. The
+  # trainer's stateless action-MSE probe is intentionally disabled.
+  action_eval_enabled: false
   world_validation:
     enabled: false
   pretrained_checkpoint: null

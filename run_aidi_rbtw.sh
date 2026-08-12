@@ -42,6 +42,7 @@ preflight_vlm_runtime() {
   local config_yaml="${1:?missing config yaml}"
   python3 - "${config_yaml}" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -49,18 +50,76 @@ import yaml
 
 config_path = Path(sys.argv[1])
 config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+framework = config.get("framework") or {}
+qwenvl = framework.get("qwenvl") or {}
+mot = framework.get("world_action_mot") or {}
+trainer = config.get("trainer") or {}
+pretrained = trainer.get("pretrained_checkpoint")
+if pretrained:
+    pretrained_path = Path(
+        os.path.expandvars(os.path.expanduser(str(pretrained)))
+    )
+    if not pretrained_path.is_file():
+        raise SystemExit(
+            "Configured pretrained checkpoint is missing; finish the pretraining "
+            f"stage first: {pretrained_path}"
+        )
+    if bool(trainer.get("pretrained_strict", False)) and trainer.get("reload_modules"):
+        raise SystemExit(
+            "trainer.pretrained_strict=true requires a full-model load; "
+            "trainer.reload_modules must be empty"
+        )
+    print(
+        "[AIDI] pretrained checkpoint preflight ok: "
+        f"path={pretrained_path} strict={str(bool(trainer.get('pretrained_strict', False))).lower()}"
+    )
 base_vlm = str(
-    (((config.get("framework") or {}).get("qwenvl") or {}).get("base_vlm") or "")
+    (qwenvl.get("base_vlm") or "")
 ).rstrip("/")
 normalized = base_vlm.lower().replace("_", "").replace("-", "").replace(".", "")
-if "rynnbrain11" not in normalized and "qwen35" not in normalized:
+is_rynnbrain = "rynnbrain11" in normalized or "qwen35" in normalized
+is_layerwise_mot = (
+    str(framework.get("name", "")) == "QwenWorldActionMoT"
+    and str(mot.get("architecture", "legacy")).lower() == "causal_dino_mot"
+    and bool(mot.get("layerwise_planner_coupling", False))
+)
+if not is_rynnbrain and not is_layerwise_mot:
     raise SystemExit(0)
 
 checkpoint = Path(base_vlm)
 checkpoint_config = checkpoint / "config.json"
 if not checkpoint_config.is_file():
-    raise SystemExit(f"RynnBrain checkpoint config is missing: {checkpoint_config}")
+    raise SystemExit(f"VLM checkpoint config is missing: {checkpoint_config}")
 payload = json.loads(checkpoint_config.read_text(encoding="utf-8"))
+
+if is_layerwise_mot:
+    requested_layers = int(qwenvl.get("truncate_vlm_layers", 0) or 0)
+    physical_layers = int(mot.get("num_layers", 0) or 0)
+    text_config = payload.get("text_config") or payload
+    available_layers = int(text_config.get("num_hidden_layers", 0) or 0)
+    if min(requested_layers, physical_layers, available_layers) <= 0:
+        raise SystemExit(
+            "Layer-wise MoT requires positive VLM/physical layer counts: "
+            f"truncate={requested_layers}, physical={physical_layers}, "
+            f"checkpoint={available_layers}"
+        )
+    if requested_layers != physical_layers:
+        raise SystemExit(
+            "Layer-wise MoT requires truncate_vlm_layers == num_layers, got "
+            f"{requested_layers} != {physical_layers}"
+        )
+    if requested_layers > available_layers:
+        raise SystemExit(
+            f"Requested {requested_layers} VLM layers but checkpoint has "
+            f"{available_layers}: {checkpoint_config}"
+        )
+    print(
+        "[AIDI] layer-wise planner preflight ok: "
+        f"checkpoint_layers={available_layers} coupled_layers={physical_layers}"
+    )
+
+if not is_rynnbrain:
+    raise SystemExit(0)
 if payload.get("model_type") != "qwen3_5":
     raise SystemExit(
         f"RynnBrain checkpoint must have model_type=qwen3_5, got {payload.get('model_type')!r}"

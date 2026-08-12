@@ -1,11 +1,16 @@
 """Causal current/future-DINO and action Mixture-of-Transformers.
 
-The physical stream is ordered as ``[z0, z_future_t, action_t]``.  ``z0`` is
-the clean current-observation DINO grid and is clamped throughout sampling;
-only future DINO and action tokens are noised and denoised.
+The physical stream follows FastWAM's clean-prefix layout and is ordered as
+``[z0, z_future_t, action_t]``.  ``z0`` is the full-resolution clean current
+observation and is clamped throughout sampling.  Only the lower-resolution
+future DINO tokens and action tokens are noised and denoised.
 """
 
 from __future__ import annotations
+
+import math
+from contextlib import nullcontext
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -40,23 +45,28 @@ def _precompute_freqs_cis(
     dim: int,
     end: int = 1024,
     theta: float = 10_000.0,
+    real_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     if dim <= 0 or dim % 2:
         raise ValueError("RoPE dimensions must be positive even integers")
     frequencies = 1.0 / (
         theta
         ** (
-            torch.arange(0, dim, 2, dtype=torch.float64)[: dim // 2]
+            torch.arange(0, dim, 2, dtype=real_dtype)[: dim // 2]
             / float(dim)
         )
     )
-    phase = torch.outer(torch.arange(end), frequencies)
+    phase = torch.outer(
+        torch.arange(end, dtype=real_dtype),
+        frequencies,
+    )
     return torch.polar(torch.ones_like(phase), phase)
 
 
 def _precompute_freqs_cis_2d(
     dim: int,
     end: int = 1024,
+    real_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     height_dim = dim // 2
     width_dim = dim - height_dim
@@ -65,8 +75,16 @@ def _precompute_freqs_cis_2d(
             "attention_head_dim must split into even height/width RoPE dimensions"
         )
     return (
-        _precompute_freqs_cis(height_dim, end=end),
-        _precompute_freqs_cis(width_dim, end=end),
+        _precompute_freqs_cis(
+            height_dim,
+            end=end,
+            real_dtype=real_dtype,
+        ),
+        _precompute_freqs_cis(
+            width_dim,
+            end=end,
+            real_dtype=real_dtype,
+        ),
     )
 
 
@@ -82,12 +100,18 @@ def _rope_apply(
         )
     head_dim = inner_dim // num_heads
     values = hidden.reshape(batch, length, num_heads, head_dim)
-    complex_values = torch.view_as_complex(
-        values.to(torch.float64).reshape(batch, length, num_heads, -1, 2)
+    real_dtype = (
+        torch.float64
+        if frequencies.dtype == torch.complex128
+        else torch.float32
     )
-    frequencies = frequencies.to(device=hidden.device)
-    if hidden.device.type == "npu":
-        frequencies = frequencies.to(torch.complex64)
+    complex_values = torch.view_as_complex(
+        values.to(real_dtype).reshape(batch, length, num_heads, -1, 2)
+    )
+    frequencies = frequencies.to(
+        device=hidden.device,
+        dtype=complex_values.dtype,
+    )
     complex_values = complex_values * frequencies
     return torch.view_as_real(complex_values).flatten(2).to(hidden.dtype)
 
@@ -120,6 +144,17 @@ def _attention(
     return attended.transpose(1, 2).reshape(batch, query_length, inner_dim)
 
 
+@dataclass(frozen=True)
+class _BaseActionCache:
+    """Time-independent base-policy inputs reused across action denoising."""
+
+    batch_size: int
+    action_contexts: tuple[torch.Tensor, ...]
+    world_keys: tuple[torch.Tensor, ...]
+    world_values: tuple[torch.Tensor, ...]
+    action_frequencies: torch.Tensor
+
+
 class InnerRMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float) -> None:
         super().__init__()
@@ -131,7 +166,9 @@ class InnerRMSNorm(nn.Module):
         normalized = hidden.float() * torch.rsqrt(
             hidden.float().pow(2).mean(dim=-1, keepdim=True) + self.eps
         )
-        return normalized.to(dtype) * self.weight
+        # Keep the activation contract stable when the learned scale is kept
+        # in fp32 while the surrounding attention projections remain bf16.
+        return (normalized.to(dtype) * self.weight).to(dtype)
 
 
 class ExpertSelfAttention(nn.Module):
@@ -288,7 +325,26 @@ class PhysicalExpertBlock(nn.Module):
         gate_mlp: torch.Tensor,
     ) -> torch.Tensor:
         hidden = residual_hidden + gate_msa * self.self_attn.o(mixed_attention)
-        hidden = hidden + self.cross_attn(self.norm3(hidden), context)
+        # ``fp32_shell`` deliberately restores the action expert's affine
+        # norm3 parameters to FP32 after the surrounding Transformer is cast
+        # to BF16. CUDA LayerNorm requires its activation and parameters to
+        # share a dtype, so compute this one boundary norm in the parameter
+        # dtype and immediately return to the core activation dtype before the
+        # BF16 cross-attention projections. Preserve the original LayerNorm
+        # call exactly when the dtypes already match, which is the path used by
+        # every non-fp32-shell model.
+        core_dtype = hidden.dtype
+        norm3_dtype = self.norm3.weight.dtype
+        if core_dtype == norm3_dtype:
+            norm3_hidden = self.norm3(hidden)
+        else:
+            norm3_hidden = self.norm3(hidden.to(dtype=norm3_dtype)).to(
+                dtype=core_dtype
+            )
+        hidden = hidden + self.cross_attn(
+            norm3_hidden,
+            context,
+        )
         ffn_input = self.norm2(hidden) * (1.0 + scale_mlp) + shift_mlp
         return hidden + gate_mlp * self.ffn(ffn_input)
 
@@ -512,7 +568,7 @@ class DINOFlowHead(nn.Module):
 
 
 class CausalDINOActionMoT(nn.Module):
-    """Per-layer mixed-attention MoT over ``[z0, z_future_t, action_t]``."""
+    """FastWAM-style clean-current/future/action mixed-attention MoT."""
 
     def __init__(
         self,
@@ -521,12 +577,21 @@ class CausalDINOActionMoT(nn.Module):
         world_dim: int,
         action_config,
         mot_config,
+        current_world_grid: tuple[int, int] | None = None,
     ) -> None:
         super().__init__()
         self.action_horizon = int(_cfg_get(action_config, "action_horizon", 16))
         self.action_dim = int(_cfg_get(action_config, "action_dim", 14))
         self.state_dim = int(_cfg_get(action_config, "state_dim", 0) or 0)
         self.world_dim = int(world_dim)
+        self.action_precision_mode = str(
+            _cfg_get(mot_config, "action_precision_mode", "inherit")
+        ).strip().lower()
+        if self.action_precision_mode not in {"inherit", "fp32_shell"}:
+            raise ValueError(
+                "action_precision_mode must be 'inherit' or 'fp32_shell', got "
+                f"{self.action_precision_mode!r}"
+            )
         self.interaction_mode = str(
             _cfg_get(mot_config, "interaction_mode", "base")
         ).lower()
@@ -557,18 +622,95 @@ class CausalDINOActionMoT(nn.Module):
         self.head_dim = int(_cfg_get(mot_config, "attention_head_dim", 128))
         self.attention_inner_dim = self.num_heads * self.head_dim
         self.num_layers = int(_cfg_get(mot_config, "num_layers", 30))
+        self.layerwise_planner_coupling = bool(
+            _cfg_get(mot_config, "layerwise_planner_coupling", False)
+        )
+        # Historical state-conditioned checkpoints are reconstructed from their
+        # saved state_dim. Current layer-wise RoboDojo recipes set state_dim=0,
+        # so neither expert receives a proprioceptive cross-attention token.
+        # Non-layerwise 50k/80k checkpoints still append their saved state token
+        # to both planner branches and therefore keep strict load/inference
+        # compatibility without a new user-facing condition switch.
+        self._legacy_world_condition_on_state = (
+            self.state_dim > 0 and not self.layerwise_planner_coupling
+        )
         self.norm_eps = float(_cfg_get(mot_config, "norm_eps", 1.0e-6))
         self.time_frequency_dim = int(
             _cfg_get(mot_config, "time_frequency_dim", 256)
         )
         self.grid_height = int(_cfg_get(mot_config, "world_grid_height", 12))
         self.grid_width = int(_cfg_get(mot_config, "world_grid_width", 10))
+        # ``world_tokens`` is retained as the legacy public name; it denotes
+        # only the future tokens that receive noise and a world loss.
         self.world_tokens = self.grid_height * self.grid_width
+        self.future_world_tokens = self.world_tokens
+        if current_world_grid is None:
+            self.current_grid_height = self.grid_height
+            self.current_grid_width = self.grid_width
+        else:
+            if len(current_world_grid) != 2:
+                raise ValueError(
+                    "current_world_grid must contain exactly (height, width)"
+                )
+            self.current_grid_height = int(current_world_grid[0])
+            self.current_grid_width = int(current_world_grid[1])
+        self.current_world_tokens = (
+            self.current_grid_height * self.current_grid_width
+        )
+        self.multires_world_input = (
+            self.current_grid_height != self.grid_height
+            or self.current_grid_width != self.grid_width
+        )
+        if self.multires_world_input and (
+            self.current_grid_height < self.grid_height
+            or self.current_grid_width < self.grid_width
+            or self.current_grid_height % self.grid_height
+            or self.current_grid_width % self.grid_width
+        ):
+            raise ValueError(
+                "the clean current grid must be an integer-resolution "
+                "upsampling of the future grid, got current="
+                f"{(self.current_grid_height, self.current_grid_width)}, "
+                f"future={(self.grid_height, self.grid_width)}"
+            )
+        self.checkpoint_contract_version = (
+            (
+                "layerwise_query_only_multires_world_v3"
+                if self.layerwise_planner_coupling
+                else "legacy_planner_multires_world_v3"
+            )
+            if self.multires_world_input
+            else (
+                "layerwise_query_only_world_v2"
+                if self.layerwise_planner_coupling
+                else "legacy_shared_context_state_world_v1"
+            )
+        )
         self.inference_steps = int(
             _cfg_get(mot_config, "num_inference_timesteps", 20)
         )
+        # This model predicts flow velocity directly, so inference-time RTC
+        # can guide the clean-action estimate without retraining.
+        self.rtc_guidance_supported = True
         self.gradient_checkpointing = bool(
             _cfg_get(mot_config, "enable_gradient_checkpointing", True)
+        )
+        # Keep legacy checkpoints backward compatible: historical causal-MoT
+        # configs omitted these fields and directly predicted scheduler
+        # velocity (noise - clean) with one noise draw.
+        self.action_prediction_type = str(
+            _cfg_get(mot_config, "action_prediction_type", "velocity")
+        ).lower()
+        self.action_velocity_target = str(
+            _cfg_get(
+                mot_config,
+                "action_velocity_target",
+                "noise_minus_clean",
+            )
+        ).lower()
+        self.jit_t_eps = float(_cfg_get(mot_config, "jit_t_eps", 0.05))
+        self.repeated_diffusion_steps = int(
+            _cfg_get(mot_config, "repeated_diffusion_steps", 1)
         )
         self.action_loss_weight = float(
             _cfg_get(mot_config, "action_loss_weight", 1.0)
@@ -588,24 +730,57 @@ class CausalDINOActionMoT(nn.Module):
             self.num_layers,
             self.grid_height,
             self.grid_width,
+            self.current_grid_height,
+            self.current_grid_width,
             self.inference_steps,
+            self.repeated_diffusion_steps,
         ) <= 0:
             raise ValueError("all architecture sizes must be positive")
         if self.head_dim % 2:
             raise ValueError("attention_head_dim must be even for RoPE")
+        if self.action_prediction_type not in {"velocity", "jit_x"}:
+            raise ValueError(
+                "action_prediction_type must be 'velocity' or 'jit_x', got "
+                f"{self.action_prediction_type!r}"
+            )
+        if self.action_velocity_target not in {
+            "clean_minus_noise",
+            "noise_minus_clean",
+        }:
+            raise ValueError(
+                "action_velocity_target must be 'clean_minus_noise' or "
+                f"'noise_minus_clean', got {self.action_velocity_target!r}"
+            )
+        if self.jit_t_eps <= 0:
+            raise ValueError("jit_t_eps must be positive")
+        if min(self.action_loss_weight, self.world_loss_weight) < 0:
+            raise ValueError(
+                "action_loss_weight and world_loss_weight must be non-negative"
+            )
 
         self.world_input = nn.Linear(self.world_dim, self.world_hidden_size)
         self.action_input = nn.Linear(self.action_dim, self.action_hidden_size)
-        self.world_context = nn.Sequential(
-            nn.Linear(int(planner_dim), self.world_hidden_size),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(self.world_hidden_size, self.world_hidden_size),
-        )
-        self.action_context = nn.Sequential(
-            nn.Linear(int(planner_dim), self.action_hidden_size),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(self.action_hidden_size, self.action_hidden_size),
-        )
+
+        def make_context(hidden_size: int) -> nn.Sequential:
+            return nn.Sequential(
+                nn.Linear(int(planner_dim), hidden_size),
+                nn.GELU(approximate="tanh"),
+                nn.Linear(hidden_size, hidden_size),
+            )
+
+        if self.layerwise_planner_coupling:
+            self.world_context = nn.ModuleList(
+                [make_context(self.world_hidden_size) for _ in range(self.num_layers)]
+            )
+            self.action_context = nn.ModuleList(
+                [make_context(self.action_hidden_size) for _ in range(self.num_layers)]
+            )
+        else:
+            self.world_context = make_context(self.world_hidden_size)
+            self.action_context = make_context(self.action_hidden_size)
+        # Compatibility-only for checkpoints/configs that were trained with
+        # proprioception. New query-only layer-wise recipes instantiate no state
+        # projection at all.
         self.state_to_planner = (
             nn.Linear(self.state_dim, int(planner_dim))
             if self.state_dim > 0
@@ -685,27 +860,60 @@ class CausalDINOActionMoT(nn.Module):
             shift=world_infer_shift,
         )
 
+        # Preserve the exact complex128 RoPE path used by released non-layerwise
+        # 50k/80k checkpoints. New layer-wise recipes train and infer with the
+        # faster standard complex64 path.
+        rope_real_dtype = (
+            torch.float32
+            if self.layerwise_planner_coupling
+            else torch.float64
+        )
         action_frequencies = _precompute_freqs_cis(
             self.head_dim,
             end=max(1024, self.action_horizon),
+            real_dtype=rope_real_dtype,
         )
-        rope_cache_end = max(1024, self.grid_height, self.grid_width)
+        rope_cache_end = max(
+            1024,
+            self.current_grid_height,
+            self.current_grid_width,
+            self.grid_height,
+            self.grid_width,
+        )
         height, width = _precompute_freqs_cis_2d(
             self.head_dim,
             end=rope_cache_end,
+            real_dtype=rope_real_dtype,
         )
-        spatial_frequencies = torch.cat(
-            [
-                height[: self.grid_height]
-                .view(self.grid_height, 1, -1)
-                .expand(self.grid_height, self.grid_width, -1),
-                width[: self.grid_width]
-                .view(1, self.grid_width, -1)
-                .expand(self.grid_height, self.grid_width, -1),
-            ],
-            dim=-1,
-        ).reshape(self.world_tokens, 1, -1)
-        world_frequencies = spatial_frequencies.repeat(2, 1, 1)
+
+        def spatial_grid_frequencies(
+            grid_height: int,
+            grid_width: int,
+        ) -> torch.Tensor:
+            return torch.cat(
+                [
+                    height[:grid_height]
+                    .view(grid_height, 1, -1)
+                    .expand(grid_height, grid_width, -1),
+                    width[:grid_width]
+                    .view(1, grid_width, -1)
+                    .expand(grid_height, grid_width, -1),
+                ],
+                dim=-1,
+            ).reshape(grid_height * grid_width, 1, -1)
+
+        current_frequencies = spatial_grid_frequencies(
+            self.current_grid_height,
+            self.current_grid_width,
+        )
+        future_frequencies = spatial_grid_frequencies(
+            self.grid_height,
+            self.grid_width,
+        )
+        world_frequencies = torch.cat(
+            [current_frequencies, future_frequencies],
+            dim=0,
+        )
         self.world_frame_embedding = nn.Parameter(
             torch.empty(1, 2, self.world_hidden_size)
         )
@@ -724,10 +932,11 @@ class CausalDINOActionMoT(nn.Module):
             self._build_attention_mask(),
             persistent=False,
         )
+        self._restore_action_precision_policy()
 
     def _build_attention_mask(self) -> torch.Tensor:
-        current = self.world_tokens
-        future_end = 2 * self.world_tokens
+        current = self.current_world_tokens
+        future_end = current + self.world_tokens
         total = future_end + self.action_horizon
         mask = torch.zeros(total, total, dtype=torch.bool)
         # z0/zf video-style first-frame-causal block.
@@ -740,39 +949,308 @@ class CausalDINOActionMoT(nn.Module):
         mask[future_end:, :world_key_end] = True
         return mask
 
+    @property
+    def uses_fp32_action_shell(self) -> bool:
+        return self.action_precision_mode == "fp32_shell"
+
+    def _restore_action_precision_policy(self) -> None:
+        """Restore opt-in fp32 parameters after a parent module-wide cast.
+
+        Training and deployment both cast the complete framework to bf16.  A
+        configuration-owned policy must therefore survive recursive
+        ``module.to(torch.bfloat16)`` calls; otherwise checkpoint reload would
+        silently erase the intended precision boundary.
+        """
+
+        if not self.uses_fp32_action_shell:
+            return
+        fp32_modules = [
+            self.action_input,
+            self.action_time_embedding,
+            self.action_time_projection,
+            self.action_output,
+        ]
+        if self.state_to_planner is not None:
+            fp32_modules.append(self.state_to_planner)
+        for layer in self.layers:
+            fp32_modules.extend(
+                [
+                    layer.action.norm3,
+                    layer.action.self_attn.norm_q,
+                    layer.action.self_attn.norm_k,
+                    layer.action.cross_attn.norm_q,
+                    layer.action.cross_attn.norm_k,
+                ]
+            )
+        for module in fp32_modules:
+            module.float()
+
+    def _apply(self, fn, recurse: bool = True):
+        result = super()._apply(fn, recurse=recurse)
+        self._restore_action_precision_policy()
+        return result
+
+    @staticmethod
+    def _autocast_disabled(device: torch.device):
+        if device.type in {"cpu", "cuda"}:
+            return torch.autocast(device_type=device.type, enabled=False)
+        return nullcontext()
+
     def _device_dtype(self) -> tuple[torch.device, torch.dtype]:
-        weight = self.action_input.weight
+        # This is the physical Transformer dtype.  ``action_input`` is an fp32
+        # boundary module in fp32_shell mode and can no longer serve as the
+        # core-dtype anchor.
+        weight = self.layers[0].action.self_attn.q.weight
         return weight.device, weight.dtype
+
+    def action_flow_dtype(self) -> torch.dtype:
+        """Dtype for action targets/noise/time/velocity and Euler state."""
+
+        if self.uses_fp32_action_shell:
+            return torch.float32
+        return self._device_dtype()[1]
+
+    def _project_state_token(
+        self,
+        current_state: torch.Tensor,
+        *,
+        device: torch.device,
+        core_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.state_to_planner is None:
+            raise RuntimeError("state projection requested while state_dim is zero")
+        if self.uses_fp32_action_shell:
+            with self._autocast_disabled(device):
+                token = self.state_to_planner(
+                    current_state.to(device=device, dtype=torch.float32)
+                )
+            return token.to(dtype=core_dtype)
+        return self.state_to_planner(
+            current_state.to(device=device, dtype=core_dtype)
+        )
+
+    def _project_action_input(
+        self,
+        noisy_action: torch.Tensor,
+        *,
+        device: torch.device,
+        core_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if self.uses_fp32_action_shell:
+            with self._autocast_disabled(device):
+                hidden = self.action_input(
+                    noisy_action.to(device=device, dtype=torch.float32)
+                )
+            return hidden.to(dtype=core_dtype)
+        return self.action_input(
+            noisy_action.to(device=device, dtype=core_dtype)
+        )
+
+    def _project_action_output(self, action_hidden: torch.Tensor) -> torch.Tensor:
+        if self.uses_fp32_action_shell:
+            with self._autocast_disabled(action_hidden.device):
+                return self.action_output(action_hidden.float())
+        return self.action_output(action_hidden)
+
+    @staticmethod
+    def _repeat_batch(
+        tensor: torch.Tensor
+        | list[torch.Tensor]
+        | tuple[torch.Tensor, ...]
+        | None,
+        repeats: int,
+    ) -> (
+        torch.Tensor
+        | list[torch.Tensor]
+        | tuple[torch.Tensor, ...]
+        | None
+    ):
+        if tensor is None or int(repeats) == 1:
+            return tensor
+        if isinstance(tensor, list):
+            return [CausalDINOActionMoT._repeat_batch(value, repeats) for value in tensor]
+        if isinstance(tensor, tuple):
+            return tuple(
+                CausalDINOActionMoT._repeat_batch(value, repeats) for value in tensor
+            )
+        return tensor.repeat(int(repeats), *([1] * (tensor.ndim - 1)))
+
+    def _normalize_plan_layers(
+        self,
+        plan: torch.Tensor
+        | list[torch.Tensor]
+        | tuple[torch.Tensor, ...],
+        *,
+        name: str,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> list[torch.Tensor]:
+        if self.layerwise_planner_coupling:
+            if not isinstance(plan, (list, tuple)):
+                raise TypeError(
+                    f"{name} must be a list/tuple for layer-wise planner coupling"
+                )
+            if len(plan) != self.num_layers:
+                raise ValueError(
+                    f"{name} layer count must match physical layers: "
+                    f"got={len(plan)}, expected={self.num_layers}"
+                )
+            layers = [value.to(device=device, dtype=dtype) for value in plan]
+        else:
+            if isinstance(plan, (list, tuple)):
+                raise TypeError(
+                    f"{name} must be a tensor when layer-wise coupling is disabled"
+                )
+            value = plan.to(device=device, dtype=dtype)
+            layers = [value] * self.num_layers
+        batch, length = layers[0].shape[:2]
+        if any(tuple(layer.shape[:2]) != (batch, length) for layer in layers):
+            raise ValueError(f"{name} layers must share batch and token dimensions")
+        return layers
+
+    def _project_plan_layers(
+        self,
+        plans: list[torch.Tensor],
+        projectors: nn.Module,
+    ) -> list[torch.Tensor]:
+        if self.layerwise_planner_coupling:
+            if not isinstance(projectors, nn.ModuleList):
+                raise TypeError("layer-wise planner coupling requires per-layer projectors")
+            return [
+                projector(plan)
+                for projector, plan in zip(projectors, plans, strict=True)
+            ]
+        return [projectors(plans[0])] * self.num_layers
+
+    @staticmethod
+    def _action_sigma(
+        timestep: torch.Tensor,
+        reference: torch.Tensor,
+        *,
+        scheduler: ShiftedFlowScheduler,
+    ) -> torch.Tensor:
+        timestep = torch.as_tensor(
+            timestep,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        if timestep.ndim == 0:
+            timestep = timestep.expand(reference.shape[0])
+        if timestep.ndim != 1 or timestep.shape[0] != reference.shape[0]:
+            raise ValueError(
+                "action timestep must be scalar or have shape [batch], got "
+                f"{tuple(timestep.shape)} for batch={reference.shape[0]}"
+            )
+        sigma = timestep / float(scheduler.num_train_timesteps)
+        return sigma.view(-1, *([1] * (reference.ndim - 1)))
+
+    def _action_prediction_to_velocity(
+        self,
+        prediction: torch.Tensor,
+        noisy_action: torch.Tensor,
+        timestep: torch.Tensor,
+        *,
+        scheduler: ShiftedFlowScheduler,
+    ) -> torch.Tensor:
+        """Convert the configured action prediction into scheduler velocity.
+
+        ``ShiftedFlowScheduler`` parameterizes the path by noise fraction
+        ``sigma = 1 - tau``:
+
+            a_sigma = (1 - sigma) * a_clean + sigma * noise
+
+        and integrates from sigma=1 to sigma=0, so its velocity is
+        ``d a / d sigma = noise - a_clean``.  A model configured to predict
+        denoising velocity ``a_clean - noise`` is negated before the scheduler
+        step. Legacy JiT-x predicts ``a_clean`` and is converted to velocity as
+        ``(a_sigma - a_pred) / max(sigma, eps)``.
+        """
+
+        if self.action_prediction_type == "velocity":
+            return (
+                -prediction
+                if self.action_velocity_target == "clean_minus_noise"
+                else prediction
+            )
+        if prediction.shape != noisy_action.shape:
+            raise ValueError(
+                "action prediction and noisy action must have identical shapes, "
+                f"got prediction={tuple(prediction.shape)} "
+                f"noisy={tuple(noisy_action.shape)}"
+            )
+        sigma = self._action_sigma(
+            timestep,
+            prediction,
+            scheduler=scheduler,
+        )
+        noisy_action = noisy_action.to(
+            device=prediction.device,
+            dtype=prediction.dtype,
+        )
+        return (noisy_action - prediction) / sigma.clamp_min(self.jit_t_eps)
 
     def _prepare_conditions(
         self,
         *,
-        action_plan: torch.Tensor,
-        world_plan: torch.Tensor,
+        action_plan: torch.Tensor
+        | list[torch.Tensor]
+        | tuple[torch.Tensor, ...],
+        world_plan: torch.Tensor
+        | list[torch.Tensor]
+        | tuple[torch.Tensor, ...],
         current_world: torch.Tensor,
         current_state: torch.Tensor | None,
     ):
         device, dtype = self._device_dtype()
-        action_plan = action_plan.to(device=device, dtype=dtype)
-        world_plan = world_plan.to(device=device, dtype=dtype)
+        action_plan_layers = self._normalize_plan_layers(
+            action_plan,
+            name="action_plan",
+            device=device,
+            dtype=dtype,
+        )
+        world_plan_layers = self._normalize_plan_layers(
+            world_plan,
+            name="world_plan",
+            device=device,
+            dtype=dtype,
+        )
         current_world = current_world.to(device=device, dtype=dtype)
-        if current_world.ndim != 3 or current_world.shape[1] != self.world_tokens:
+        if (
+            current_world.ndim != 3
+            or current_world.shape[1] != self.current_world_tokens
+            or current_world.shape[2] != self.world_dim
+        ):
             raise ValueError(
                 "current DINO must have shape "
-                f"[B,{self.world_tokens},{self.world_dim}], got {tuple(current_world.shape)}"
+                f"[B,{self.current_world_tokens},{self.world_dim}], "
+                f"got {tuple(current_world.shape)}"
             )
         if self.state_to_planner is not None:
             if current_state is None:
                 raise ValueError("current_state is required when state_dim > 0")
             if current_state.ndim == 2:
                 current_state = current_state[:, None]
-            current_state = current_state.to(device=device, dtype=dtype)
-            state_token = self.state_to_planner(current_state[:, :1])
-            action_plan = torch.cat([action_plan, state_token], dim=1)
-            world_plan = torch.cat([world_plan, state_token], dim=1)
+            state_token = self._project_state_token(
+                current_state[:, :1],
+                device=device,
+                core_dtype=dtype,
+            )
+            action_plan_layers = [
+                torch.cat([plan, state_token], dim=1)
+                for plan in action_plan_layers
+            ]
+            if self._legacy_world_condition_on_state:
+                world_plan_layers = [
+                    torch.cat([plan, state_token], dim=1)
+                    for plan in world_plan_layers
+                ]
         elif current_state is not None:
             raise ValueError("current_state was provided but state_dim is zero")
-        return action_plan, world_plan, current_world
+        return (
+            action_plan_layers,
+            world_plan_layers,
+            current_world,
+        )
 
     def _time_features(
         self,
@@ -780,21 +1258,31 @@ class CausalDINOActionMoT(nn.Module):
         world_time: torch.Tensor,
     ):
         batch = action_time.shape[0]
-        action_time_embedding = self.action_time_embedding(
-            _sinusoidal_embedding_1d(
-                self.time_frequency_dim,
-                action_time,
-            )
+        _, core_dtype = self._device_dtype()
+        action_sinusoid = _sinusoidal_embedding_1d(
+            self.time_frequency_dim,
+            action_time,
         )
-        action_time_modulation = self.action_time_projection(
-            action_time_embedding
-        ).unflatten(1, (6, self.action_hidden_size))
+        if self.uses_fp32_action_shell:
+            with self._autocast_disabled(action_time.device):
+                action_time_embedding = self.action_time_embedding(
+                    action_sinusoid.float()
+                )
+                action_time_modulation = self.action_time_projection(
+                    action_time_embedding
+                ).unflatten(1, (6, self.action_hidden_size))
+            action_time_modulation = action_time_modulation.to(dtype=core_dtype)
+        else:
+            action_time_embedding = self.action_time_embedding(action_sinusoid)
+            action_time_modulation = self.action_time_projection(
+                action_time_embedding
+            ).unflatten(1, (6, self.action_hidden_size))
 
         token_times = torch.cat(
             [
                 torch.zeros(
                     batch,
-                    self.world_tokens,
+                    self.current_world_tokens,
                     device=world_time.device,
                     dtype=world_time.dtype,
                 ),
@@ -807,7 +1295,11 @@ class CausalDINOActionMoT(nn.Module):
                 self.time_frequency_dim,
                 token_times.reshape(-1),
             )
-        ).reshape(batch, 2 * self.world_tokens, self.world_hidden_size)
+        ).reshape(
+            batch,
+            self.current_world_tokens + self.world_tokens,
+            self.world_hidden_size,
+        )
         world_time_modulation = self.world_time_projection(
             world_time_embedding
         ).unflatten(2, (6, self.world_hidden_size))
@@ -832,20 +1324,31 @@ class CausalDINOActionMoT(nn.Module):
         current_state: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         del action_is_pad
-        action_plan, world_plan, current_world = self._prepare_conditions(
+        (
+            action_plan,
+            world_plan,
+            current_world,
+        ) = self._prepare_conditions(
             action_plan=action_plan,
             world_plan=world_plan,
             current_world=current_world,
             current_state=current_state,
         )
         device, dtype = self._device_dtype()
-        noisy_action = noisy_action.to(device=device, dtype=dtype)
+        action_dtype = self.action_flow_dtype()
+        noisy_action = noisy_action.to(device=device, dtype=action_dtype)
         noisy_world = noisy_world.to(device=device, dtype=dtype)
-        action_time = action_time.to(device=device, dtype=dtype)
+        action_time = action_time.to(device=device, dtype=action_dtype)
         world_time = world_time.to(device=device, dtype=dtype)
-        if noisy_world.shape != current_world.shape:
+        expected_noisy_world = (
+            current_world.shape[0],
+            self.world_tokens,
+            self.world_dim,
+        )
+        if noisy_world.shape != expected_noisy_world:
             raise ValueError(
-                "noisy future DINO and current DINO must have identical shapes"
+                "noisy future DINO must have shape "
+                f"{expected_noisy_world}, got {tuple(noisy_world.shape)}"
             )
 
         (
@@ -854,23 +1357,52 @@ class CausalDINOActionMoT(nn.Module):
             world_time_embedding,
             world_time_modulation,
         ) = self._time_features(action_time, world_time)
-        action_hidden = self.action_input(noisy_action)
+        action_hidden = self._project_action_input(
+            noisy_action,
+            device=device,
+            core_dtype=dtype,
+        )
         world_hidden = self.world_input(
             torch.cat([current_world, noisy_world], dim=1)
         )
-        frame_embedding = (
-            self.world_frame_embedding[:, :, None, :]
-            .expand(-1, -1, self.world_tokens, -1)
-            .reshape(1, 2 * self.world_tokens, self.world_hidden_size)
+        frame_embedding = torch.cat(
+            [
+                self.world_frame_embedding[:, :1].expand(
+                    -1,
+                    self.current_world_tokens,
+                    -1,
+                ),
+                self.world_frame_embedding[:, 1:2].expand(
+                    -1,
+                    self.world_tokens,
+                    -1,
+                ),
+            ],
+            dim=1,
         )
         world_hidden = world_hidden + frame_embedding
-        action_context = self.action_context(action_plan)
-        world_context = self.world_context(world_plan)
+        action_contexts = self._project_plan_layers(
+            action_plan,
+            self.action_context,
+        )
+        world_contexts = self._project_plan_layers(
+            world_plan,
+            self.world_context,
+        )
         attention_mask = self.physical_attention_mask.to(device=device)
         action_frequencies = self.action_frequencies.to(device=device)
         world_frequencies = self.world_frequencies.to(device=device)
 
-        for layer in self.layers:
+        for (
+            layer,
+            action_context,
+            world_context,
+        ) in zip(
+            self.layers,
+            action_contexts,
+            world_contexts,
+            strict=True,
+        ):
             if (
                 self.gradient_checkpointing
                 and self.training
@@ -901,14 +1433,215 @@ class CausalDINOActionMoT(nn.Module):
                     world_frequencies,
                     attention_mask,
                 )
-        action_prediction = self.action_output(action_hidden)
-        future_hidden = world_hidden[:, self.world_tokens :]
-        future_time_embedding = world_time_embedding[:, self.world_tokens :]
+        action_prediction = self._project_action_output(action_hidden)
+        future_hidden = world_hidden[:, self.current_world_tokens :]
+        future_time_embedding = world_time_embedding[
+            :,
+            self.current_world_tokens :,
+        ]
         world_prediction = self.world_output(
             future_hidden,
             future_time_embedding,
         )
         return action_prediction, world_prediction
+
+    def _prepare_action_base_cache(
+        self,
+        *,
+        action_plan: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+        world_plan: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+        current_world: torch.Tensor,
+        current_state: torch.Tensor | None = None,
+    ) -> _BaseActionCache:
+        """Precompute the base policy's clean current-world layer trajectory.
+
+        Base-mode action tokens can read only the clean current-world tokens,
+        while world tokens cannot read action.  Consequently every world's
+        per-layer K/V and planner projection is invariant across action
+        denoising steps and can be computed once per replan.
+        """
+        if self.interaction_mode != "base":
+            raise RuntimeError(
+                "_prepare_action_base_cache requires interaction_mode='base'"
+            )
+        (
+            action_plan,
+            world_plan,
+            current_world,
+        ) = self._prepare_conditions(
+            action_plan=action_plan,
+            world_plan=world_plan,
+            current_world=current_world,
+            current_state=current_state,
+        )
+        device, dtype = self._device_dtype()
+        batch = current_world.shape[0]
+        current_times = torch.zeros(
+            batch,
+            self.current_world_tokens,
+            device=device,
+            dtype=dtype,
+        )
+        current_time_embedding = self.world_time_embedding(
+            _sinusoidal_embedding_1d(
+                self.time_frequency_dim,
+                current_times.reshape(-1),
+            )
+        ).reshape(
+            batch,
+            self.current_world_tokens,
+            self.world_hidden_size,
+        )
+        current_time_modulation = self.world_time_projection(
+            current_time_embedding
+        ).unflatten(2, (6, self.world_hidden_size))
+
+        current_hidden = self.world_input(current_world)
+        current_hidden = current_hidden + self.world_frame_embedding[:, :1]
+        action_contexts = tuple(
+            self._project_plan_layers(action_plan, self.action_context)
+        )
+        world_contexts = self._project_plan_layers(world_plan, self.world_context)
+        action_frequencies = self.action_frequencies.to(device=device)
+        current_frequencies = self.world_frequencies[
+            : self.current_world_tokens
+        ].to(device=device)
+
+        world_keys = []
+        world_values = []
+        for layer, world_context in zip(
+            self.layers,
+            world_contexts,
+            strict=True,
+        ):
+            world_io = layer.world.attention_io(
+                current_hidden,
+                current_time_modulation,
+                current_frequencies,
+            )
+            world_query, world_key, world_value = world_io[:3]
+            world_attention = _attention(
+                world_query,
+                world_key,
+                world_value,
+                num_heads=self.num_heads,
+                attention_mask=None,
+            )
+            current_hidden = layer.world.post_attention(
+                residual_hidden=world_io[3],
+                mixed_attention=world_attention,
+                context=world_context,
+                gate_msa=world_io[4],
+                shift_mlp=world_io[5],
+                scale_mlp=world_io[6],
+                gate_mlp=world_io[7],
+            )
+            world_keys.append(world_key)
+            world_values.append(world_value)
+
+        return _BaseActionCache(
+            batch_size=batch,
+            action_contexts=action_contexts,
+            world_keys=tuple(world_keys),
+            world_values=tuple(world_values),
+            action_frequencies=action_frequencies,
+        )
+
+    def _predict_action_base(
+        self,
+        *,
+        action_plan: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+        world_plan: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+        current_world: torch.Tensor,
+        noisy_action: torch.Tensor,
+        action_time: torch.Tensor,
+        current_state: torch.Tensor | None = None,
+        cache: _BaseActionCache | None = None,
+    ) -> torch.Tensor:
+        """Predict only action, reusing current-world features when available."""
+        if self.interaction_mode != "base":
+            raise RuntimeError("_predict_action_base requires interaction_mode='base'")
+        if cache is None:
+            cache = self._prepare_action_base_cache(
+                action_plan=action_plan,
+                world_plan=world_plan,
+                current_world=current_world,
+                current_state=current_state,
+            )
+        device, dtype = self._device_dtype()
+        action_dtype = self.action_flow_dtype()
+        noisy_action = noisy_action.to(device=device, dtype=action_dtype)
+        action_time = action_time.to(device=device, dtype=action_dtype)
+        if action_time.ndim == 0:
+            action_time = action_time.expand(noisy_action.shape[0])
+        if noisy_action.shape[0] != cache.batch_size or action_time.shape != (
+            cache.batch_size,
+        ):
+            raise ValueError(
+                "base action cache batch mismatch: "
+                f"cache={cache.batch_size}, noisy_action={noisy_action.shape[0]}, "
+                f"action_time={tuple(action_time.shape)}"
+            )
+
+        action_sinusoid = _sinusoidal_embedding_1d(
+            self.time_frequency_dim,
+            action_time,
+        )
+        if self.uses_fp32_action_shell:
+            with self._autocast_disabled(device):
+                action_time_embedding = self.action_time_embedding(
+                    action_sinusoid.float()
+                )
+                action_time_modulation = self.action_time_projection(
+                    action_time_embedding
+                ).unflatten(1, (6, self.action_hidden_size))
+            action_time_modulation = action_time_modulation.to(dtype=dtype)
+        else:
+            action_time_embedding = self.action_time_embedding(action_sinusoid)
+            action_time_modulation = self.action_time_projection(
+                action_time_embedding
+            ).unflatten(1, (6, self.action_hidden_size))
+        action_hidden = self._project_action_input(
+            noisy_action,
+            device=device,
+            core_dtype=dtype,
+        )
+
+        for (
+            layer,
+            action_context,
+            world_key,
+            world_value,
+        ) in zip(
+            self.layers,
+            cache.action_contexts,
+            cache.world_keys,
+            cache.world_values,
+            strict=True,
+        ):
+            action_io = layer.action.attention_io(
+                action_hidden,
+                action_time_modulation,
+                cache.action_frequencies,
+            )
+            action_query, action_key, action_value = action_io[:3]
+            action_attention = _attention(
+                action_query,
+                torch.cat([world_key, action_key], dim=1),
+                torch.cat([world_value, action_value], dim=1),
+                num_heads=self.num_heads,
+                attention_mask=None,
+            )
+            action_hidden = layer.action.post_attention(
+                residual_hidden=action_io[3],
+                mixed_attention=action_attention,
+                context=action_context,
+                gate_msa=action_io[4],
+                shift_mlp=action_io[5],
+                scale_mlp=action_io[6],
+                gate_mlp=action_io[7],
+            )
+        return self._project_action_output(action_hidden)
 
     def forward_train(
         self,
@@ -923,20 +1656,30 @@ class CausalDINOActionMoT(nn.Module):
         current_state: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         device, dtype = self._device_dtype()
-        target_action = target_action.to(device=device, dtype=dtype)
+        action_dtype = self.action_flow_dtype()
+        target_action = target_action.to(device=device, dtype=action_dtype)
         target_world = target_world.to(device=device, dtype=dtype)
         if target_world.ndim != 3 or target_world.shape[1] != self.world_tokens:
             raise ValueError(
                 "target future DINO must have shape "
                 f"[B,{self.world_tokens},{self.world_dim}], got {tuple(target_world.shape)}"
             )
+        repeats = self.repeated_diffusion_steps
+        action_plan = self._repeat_batch(action_plan, repeats)
+        world_plan = self._repeat_batch(world_plan, repeats)
+        current_world = self._repeat_batch(current_world, repeats)
+        target_action = self._repeat_batch(target_action, repeats)
+        target_world = self._repeat_batch(target_world, repeats)
+        current_state = self._repeat_batch(current_state, repeats)
+        action_is_pad = self._repeat_batch(action_is_pad, repeats)
+        future_valid = self._repeat_batch(future_valid, repeats)
         batch = target_action.shape[0]
         action_noise = torch.randn_like(target_action)
         world_noise = torch.randn_like(target_world)
         action_time = self.train_action_scheduler.sample_training_t(
             batch,
             device=device,
-            dtype=dtype,
+            dtype=action_dtype,
         )
         world_time = self.train_world_scheduler.sample_training_t(
             batch,
@@ -965,13 +1708,30 @@ class CausalDINOActionMoT(nn.Module):
             current_state=current_state,
         )
 
-        action_per_step = (
-            predicted_action.float()
-            - self.train_action_scheduler.training_target(
+        predicted_action_velocity = self._action_prediction_to_velocity(
+            predicted_action,
+            noisy_action,
+            action_time,
+            scheduler=self.train_action_scheduler,
+        )
+        target_action_velocity = (
+            self._action_prediction_to_velocity(
+                target_action,
+                noisy_action,
+                action_time,
+                scheduler=self.train_action_scheduler,
+            )
+            if self.action_prediction_type == "jit_x"
+            else self.train_action_scheduler.training_target(
                 target_action,
                 action_noise,
-            ).float()
-        ).square().mean(dim=-1)
+            )
+        )
+        action_error = (
+            predicted_action_velocity.float()
+            - target_action_velocity.float()
+        ).square()
+        action_per_step = action_error.mean(dim=-1)
         if action_is_pad is not None:
             valid_action = (~action_is_pad.to(device=device, dtype=torch.bool)).to(
                 action_per_step.dtype
@@ -984,7 +1744,8 @@ class CausalDINOActionMoT(nn.Module):
         action_weight = self.train_action_scheduler.training_weight(
             action_time
         ).to(device=device, dtype=action_per_sample.dtype)
-        action_loss = (action_per_sample * action_weight).mean()
+        action_per_sample = action_per_sample * action_weight
+        action_loss = action_per_sample.mean()
 
         world_per_sample = (
             predicted_world.float()
@@ -1005,17 +1766,215 @@ class CausalDINOActionMoT(nn.Module):
             if bool(valid_world.any())
             else world_per_sample.sum() * 0.0
         )
-        total = (
-            self.action_loss_weight * action_loss
-            + self.world_loss_weight * world_loss
-        )
+        action_objective = self.action_loss_weight * action_loss
+        world_objective = self.world_loss_weight * world_loss
+        total = action_objective + world_objective
         return {
             "loss": total,
+            # Keep the weighted, graph-carrying objectives available to the
+            # trainer's opt-in shared-VLM interface-gradient diagnostic.
+            # ``autograd.grad`` is taken only with respect to the planner
+            # interface tensors, so these values never populate/alter .grad.
+            "action_objective": action_objective,
+            "world_objective": world_objective,
             "action_loss_raw": action_loss.detach(),
             "world_loss_raw": world_loss.detach(),
         }
 
-    @torch.inference_mode()
+    @staticmethod
+    def rtc_prefix_weights(
+        *,
+        inference_delay: int,
+        execution_horizon: int,
+        total_horizon: int,
+        schedule: str,
+        device: torch.device | None = None,
+    ) -> torch.Tensor:
+        """Build the LeRobot/RTC soft prefix mask for one action chunk."""
+
+        if total_horizon <= 0:
+            raise ValueError("RTC total_horizon must be positive")
+        if inference_delay < 0:
+            raise ValueError("RTC inference_delay must be non-negative")
+        if execution_horizon < 0:
+            raise ValueError("RTC execution_horizon must be non-negative")
+        schedule = str(schedule).strip().lower()
+        if schedule not in {"exp", "linear", "ones", "zeros"}:
+            raise ValueError(
+                "RTC prefix_attention_schedule must be exp, linear, ones, "
+                f"or zeros, got {schedule!r}"
+            )
+
+        end = min(int(execution_horizon), int(total_horizon))
+        start = min(int(inference_delay), end)
+        weights = torch.zeros(total_horizon, device=device, dtype=torch.float32)
+        if end == 0:
+            return weights
+        if schedule == "ones":
+            weights[:end] = 1.0
+            return weights
+        if schedule == "zeros":
+            weights[:start] = 1.0
+            return weights
+
+        weights[:start] = 1.0
+        transition = end - start
+        if transition > 0:
+            soft = torch.linspace(
+                1.0,
+                0.0,
+                transition + 2,
+                device=device,
+                dtype=torch.float32,
+            )[1:-1]
+            if schedule == "exp":
+                soft = soft * torch.expm1(soft) / (math.e - 1.0)
+            weights[start:end] = soft
+        return weights
+
+    def _prepare_rtc_guidance(
+        self,
+        *,
+        prev_actions,
+        prefix_lengths,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        inference_delay: int,
+        execution_horizon: int | None,
+        prefix_attention_schedule: str,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if prev_actions is None:
+            return None
+        previous = torch.as_tensor(prev_actions, device=device, dtype=dtype)
+        if previous.ndim == 2 and batch_size == 1:
+            previous = previous.unsqueeze(0)
+        if previous.ndim != 3:
+            raise ValueError(
+                "prev_action_chunk_normalized must have shape [B,T,A], got "
+                f"{tuple(previous.shape)}"
+            )
+        if previous.shape[0] != batch_size or previous.shape[2] != self.action_dim:
+            raise ValueError(
+                "RTC previous-action batch/action dimensions must match the "
+                f"sample: previous={tuple(previous.shape)}, "
+                f"expected B={batch_size}, A={self.action_dim}"
+            )
+
+        available = min(int(previous.shape[1]), self.action_horizon)
+        if prefix_lengths is None:
+            lengths = torch.full(
+                (batch_size,),
+                available,
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            lengths = torch.as_tensor(
+                prefix_lengths,
+                device=device,
+                dtype=torch.long,
+            ).reshape(-1)
+            if lengths.shape != (batch_size,):
+                raise ValueError(
+                    "rtc_prefix_lengths must have shape [B], got "
+                    f"{tuple(lengths.shape)} for B={batch_size}"
+                )
+            if bool((lengths < 0).any()) or bool((lengths > available).any()):
+                raise ValueError(
+                    "rtc_prefix_lengths must lie within the supplied previous "
+                    f"chunk [0,{available}], got {lengths.tolist()}"
+                )
+        if not bool((lengths > 0).any()):
+            return None
+
+        if inference_delay < 0:
+            raise ValueError("RTC inference_delay must be non-negative")
+        if execution_horizon is not None and int(execution_horizon) <= 0:
+            raise ValueError("RTC execution_horizon must be positive")
+
+        target = torch.zeros(
+            batch_size,
+            self.action_horizon,
+            self.action_dim,
+            device=device,
+            dtype=dtype,
+        )
+        target[:, :available] = previous[:, :available]
+        weights = torch.zeros(
+            batch_size,
+            self.action_horizon,
+            1,
+            device=device,
+            dtype=dtype,
+        )
+        for row, length_tensor in enumerate(lengths):
+            length = int(length_tensor.item())
+            if length == 0:
+                continue
+            horizon = (
+                length
+                if execution_horizon is None
+                else min(length, int(execution_horizon))
+            )
+            weights[row, :, 0] = self.rtc_prefix_weights(
+                inference_delay=min(int(inference_delay), horizon),
+                execution_horizon=horizon,
+                total_horizon=self.action_horizon,
+                schedule=prefix_attention_schedule,
+                device=device,
+            ).to(dtype=dtype)
+        return target, weights
+
+    def _rtc_guided_action_velocity(
+        self,
+        *,
+        noisy_action: torch.Tensor,
+        action_time: torch.Tensor,
+        target: torch.Tensor,
+        weights: torch.Tensor,
+        max_guidance_weight: float,
+        velocity_fn,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply pseudo-inverse RTC guidance to one denoising evaluation."""
+
+        if max_guidance_weight <= 0:
+            raise ValueError("RTC max_guidance_weight must be positive")
+        with torch.enable_grad():
+            differentiable_action = noisy_action.detach().requires_grad_(True)
+            velocity, auxiliary = velocity_fn(differentiable_action)
+            sigma = self._action_sigma(
+                action_time,
+                differentiable_action,
+                scheduler=self.infer_action_scheduler,
+            )
+            clean_estimate = differentiable_action - sigma * velocity
+            error = (target - clean_estimate) * weights
+            correction = torch.autograd.grad(
+                clean_estimate,
+                differentiable_action,
+                grad_outputs=error.detach(),
+                retain_graph=False,
+            )[0]
+
+        # LeRobot's implementation parameterizes denoising from sigma=1 to 0.
+        # The cap keeps the endpoint singularities finite.
+        sigma32 = sigma.detach().float()
+        tau32 = 1.0 - sigma32
+        tiny = torch.finfo(torch.float32).eps
+        inv_r2 = (sigma32.square() + tau32.square()) / sigma32.square().clamp_min(tiny)
+        coefficient = sigma32 / tau32.clamp_min(tiny)
+        guidance_weight = torch.nan_to_num(
+            coefficient * inv_r2,
+            nan=0.0,
+            posinf=float(max_guidance_weight),
+            neginf=0.0,
+        ).clamp(max=float(max_guidance_weight))
+        guided = velocity.detach() - guidance_weight.to(velocity.dtype) * correction.detach()
+        auxiliary = auxiliary.detach() if auxiliary is not None else None
+        return guided, auxiliary
+
+    @torch.no_grad()
     def sample(
         self,
         *,
@@ -1024,26 +1983,50 @@ class CausalDINOActionMoT(nn.Module):
         current_world: torch.Tensor,
         current_state: torch.Tensor | None = None,
         seed: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_inference_steps: int | None = None,
+        prev_action_chunk_normalized=None,
+        rtc_prefix_lengths=None,
+        inference_delay: int = 0,
+        execution_horizon: int | None = None,
+        prefix_attention_schedule: str = "exp",
+        max_guidance_weight: float = 10.0,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         device, dtype = self._device_dtype()
+        action_dtype = self.action_flow_dtype()
+        inference_steps = (
+            self.inference_steps
+            if num_inference_steps is None
+            else int(num_inference_steps)
+        )
+        if inference_steps <= 0:
+            raise ValueError(
+                f"num_inference_steps must be positive, got {inference_steps}"
+            )
         current_world = current_world.to(device=device, dtype=dtype)
         if current_world.ndim != 3 or current_world.shape[1:] != (
-            self.world_tokens,
+            self.current_world_tokens,
             self.world_dim,
         ):
             raise ValueError(
                 "current DINO must have shape "
-                f"[B,{self.world_tokens},{self.world_dim}], "
+                f"[B,{self.current_world_tokens},{self.world_dim}], "
                 f"got {tuple(current_world.shape)}"
             )
         action_generator = None
-        world_generator = None
         if seed is not None:
             action_generator = torch.Generator(device="cpu")
-            world_generator = torch.Generator(device="cpu")
             action_generator.manual_seed(int(seed))
-            world_generator.manual_seed(int(seed))
         batch = current_world.shape[0]
+        rtc_guidance = self._prepare_rtc_guidance(
+            prev_actions=prev_action_chunk_normalized,
+            prefix_lengths=rtc_prefix_lengths,
+            batch_size=batch,
+            device=device,
+            dtype=action_dtype,
+            inference_delay=int(inference_delay),
+            execution_horizon=execution_horizon,
+            prefix_attention_schedule=prefix_attention_schedule,
+        )
         action = torch.randn(
             batch,
             self.action_horizon,
@@ -1051,20 +2034,74 @@ class CausalDINOActionMoT(nn.Module):
             device="cpu",
             dtype=torch.float32,
             generator=action_generator,
-        ).to(device=device, dtype=dtype)
+        ).to(device=device, dtype=action_dtype)
+        action_times, action_deltas = self.infer_action_scheduler.inference_schedule(
+            inference_steps,
+            device=device,
+            dtype=action_dtype,
+        )
+        if self.interaction_mode == "base":
+            base_cache = self._prepare_action_base_cache(
+                action_plan=action_plan,
+                world_plan=world_plan,
+                current_world=current_world,
+                current_state=current_state,
+            )
+            for action_time, action_delta in zip(action_times, action_deltas):
+                expanded_action_time = action_time.expand(batch)
+
+                def base_velocity(candidate_action):
+                    prediction = self._predict_action_base(
+                        action_plan=action_plan,
+                        world_plan=world_plan,
+                        current_world=current_world,
+                        noisy_action=candidate_action,
+                        action_time=expanded_action_time,
+                        current_state=current_state,
+                        cache=base_cache,
+                    )
+                    return (
+                        self._action_prediction_to_velocity(
+                            prediction,
+                            candidate_action,
+                            expanded_action_time,
+                            scheduler=self.infer_action_scheduler,
+                        ),
+                        None,
+                    )
+
+                if rtc_guidance is None:
+                    action_velocity, _ = base_velocity(action)
+                else:
+                    action_velocity, _ = self._rtc_guided_action_velocity(
+                        noisy_action=action,
+                        action_time=expanded_action_time,
+                        target=rtc_guidance[0],
+                        weights=rtc_guidance[1],
+                        max_guidance_weight=float(max_guidance_weight),
+                        velocity_fn=base_velocity,
+                    )
+                action = self.infer_action_scheduler.step(
+                    action_velocity,
+                    action_delta,
+                    action,
+                ).to(action_dtype)
+            return action, None
+
+        world_generator = None
+        if seed is not None:
+            world_generator = torch.Generator(device="cpu")
+            world_generator.manual_seed(int(seed))
         future_world = torch.randn(
-            current_world.shape,
+            batch,
+            self.world_tokens,
+            self.world_dim,
             device="cpu",
             dtype=torch.float32,
             generator=world_generator,
         ).to(device=device, dtype=dtype)
-        action_times, action_deltas = self.infer_action_scheduler.inference_schedule(
-            self.inference_steps,
-            device=device,
-            dtype=dtype,
-        )
         world_times, world_deltas = self.infer_world_scheduler.inference_schedule(
-            self.inference_steps,
+            inference_steps,
             device=device,
             dtype=dtype,
         )
@@ -1074,22 +2111,47 @@ class CausalDINOActionMoT(nn.Module):
             world_times,
             world_deltas,
         ):
-            action_prediction, world_prediction = self._predict(
-                action_plan=action_plan,
-                world_plan=world_plan,
-                current_world=current_world,
-                noisy_action=action,
-                noisy_world=future_world,
-                action_time=action_time.expand(batch),
-                world_time=world_time.expand(batch),
-                action_is_pad=None,
-                current_state=current_state,
-            )
+            expanded_action_time = action_time.expand(batch)
+            expanded_world_time = world_time.expand(batch)
+
+            def joint_velocity(candidate_action):
+                action_prediction, world_prediction = self._predict(
+                    action_plan=action_plan,
+                    world_plan=world_plan,
+                    current_world=current_world,
+                    noisy_action=candidate_action,
+                    noisy_world=future_world,
+                    action_time=expanded_action_time,
+                    world_time=expanded_world_time,
+                    action_is_pad=None,
+                    current_state=current_state,
+                )
+                return (
+                    self._action_prediction_to_velocity(
+                        action_prediction,
+                        candidate_action,
+                        expanded_action_time,
+                        scheduler=self.infer_action_scheduler,
+                    ),
+                    world_prediction,
+                )
+
+            if rtc_guidance is None:
+                action_velocity, world_prediction = joint_velocity(action)
+            else:
+                action_velocity, world_prediction = self._rtc_guided_action_velocity(
+                    noisy_action=action,
+                    action_time=expanded_action_time,
+                    target=rtc_guidance[0],
+                    weights=rtc_guidance[1],
+                    max_guidance_weight=float(max_guidance_weight),
+                    velocity_fn=joint_velocity,
+                )
             action = self.infer_action_scheduler.step(
-                action_prediction,
+                action_velocity,
                 action_delta,
                 action,
-            ).to(dtype)
+            ).to(action_dtype)
             future_world = self.infer_world_scheduler.step(
                 world_prediction,
                 world_delta,

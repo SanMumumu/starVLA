@@ -41,6 +41,15 @@ export PYTHONPATH="${STARVLA_ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export ALBUMENTATIONS_DISABLE_VERSION_CHECK=1
 export NO_ALBUMENTATIONS_UPDATE=1
+# Avoid ABI/architecture-dependent RynnBrain extension kernels in the H20
+# server image. This is inference-only; training still follows the checkpoint
+# YAML and keeps required FlashAttention-2.
+export STARVLA_QWEN35_DISABLE_CAUSAL_CONV1D="${STARVLA_QWEN35_DISABLE_CAUSAL_CONV1D:-1}"
+export STARVLA_QWEN35_DISABLE_FLA="${STARVLA_QWEN35_DISABLE_FLA:-1}"
+export STARVLA_QWEN35_ATTN_IMPLEMENTATION="${STARVLA_QWEN35_ATTN_IMPLEMENTATION:-sdpa}"
+if [[ "${ROBODOJO_CUDA_DEBUG:-0}" == "1" ]]; then
+  export CUDA_LAUNCH_BLOCKING=1
+fi
 
 "${STARVLA_PYTHON}" "${SCRIPT_DIR}/verify_robodojo_checkpoint_contract.py" \
   --checkpoint "${CHECKPOINT_PATH}"
@@ -170,6 +179,11 @@ echo "[RoboDojo][server] GPUs=${GPU_IDS[*]}"
 echo "[RoboDojo][server] ports=${BASE_PORT}-${LAST_PORT}"
 echo "[RoboDojo][server] logs=${LOG_ROOT}"
 echo "[RoboDojo][server] advertised-host=${ADVERTISE_HOST}"
+echo "[RoboDojo][server] topology=one standard policy process per GPU"
+echo "[RoboDojo][server] qwen35-safe-causal-conv=${STARVLA_QWEN35_DISABLE_CAUSAL_CONV1D}"
+echo "[RoboDojo][server] qwen35-safe-fla=${STARVLA_QWEN35_DISABLE_FLA}"
+echo "[RoboDojo][server] qwen35-attention=${STARVLA_QWEN35_ATTN_IMPLEMENTATION}"
+echo "[RoboDojo][server] cuda-debug=${ROBODOJO_CUDA_DEBUG:-0}"
 
 for ((slot = 0; slot < NUM_SERVERS; ++slot)); do
   gpu="${GPU_IDS[$slot]}"

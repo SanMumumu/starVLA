@@ -5,6 +5,11 @@ import cv2 as cv
 import numpy as np
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
+from starVLA.dataloader.fastwam_image import (
+    FASTWAM_COMPOSITE_LAYOUT,
+    TRI_VIEW_COMPOSITE_LAYOUT,
+    build_robotwin_composite,
+)
 
 try:
     from examples.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
@@ -93,6 +98,10 @@ class ModelClient:
 
         self.server_meta = self.client.get_server_metadata()
         self.action_chunk_size = self.server_meta["action_chunk_size"]
+        self.expects_state = bool(self.server_meta.get("expects_state", False))
+        self.image_layout = str(
+            self.server_meta.get("image_layout", "separate_views")
+        ).lower()
         self.replan_steps = resolve_replan_steps(replan_steps, self.action_chunk_size)
         print(
             f"*** policy_setup: {policy_setup}, unnorm_key: {unnorm_key}, "
@@ -206,10 +215,25 @@ class ModelClient:
         return rel_actions + self.initial_state
 
     def _prepare_images(self, images: list[np.ndarray]) -> list[np.ndarray]:
+        if self.image_layout in {
+            FASTWAM_COMPOSITE_LAYOUT,
+            TRI_VIEW_COMPOSITE_LAYOUT,
+        }:
+            return [np.asarray(build_robotwin_composite(images), dtype=np.uint8)]
         return [self._resize_image(image) for image in images]
 
-    def _prepare_state_for_server(self, _state: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        return None
+    def _prepare_state_for_server(self, state: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if not self.expects_state:
+            return None
+        if state is None:
+            raise ValueError("This checkpoint was trained with include_state=true and requires RoboTwin state")
+        state = np.asarray(state, dtype=np.float32).reshape(-1)
+        if state.size != 14:
+            raise ValueError(f"RoboTwin checkpoint requires exactly 14 state values, got shape={state.shape}")
+        # Environment order is [left6, left_gripper, right6, right_gripper].
+        # The standard training registry uses [left6, right6, left_gripper, right_gripper].
+        training_order = state[[0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13]]
+        return training_order.reshape(1, 14)
 
     def _prepare_action_for_env(self, action: np.ndarray) -> np.ndarray:
         return action[[0, 1, 2, 3, 4, 5, 12, 6, 7, 8, 9, 10, 11, 13]]

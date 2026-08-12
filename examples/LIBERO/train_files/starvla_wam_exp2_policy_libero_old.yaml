@@ -1,6 +1,7 @@
+# Archived legacy WAM experiment; kept for reference.
 #######
 #######
-run_id: starvla_wam_exp3_policy_tricks
+run_id: starvla_wam_exp2_policy
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
 seed: 42
 wandb_entity: your_wandb_entity
@@ -45,9 +46,9 @@ framework:
     action_horizon: 8
     n_action_query: 32
     #######
-    use_correlated_noise: true
+    use_correlated_noise: false
     correlation_beta: 0.5
-    flow_matching_steps: 20
+    flow_matching_steps: 1
     #######
     add_pos_embed: true
     max_seq_len: 1024

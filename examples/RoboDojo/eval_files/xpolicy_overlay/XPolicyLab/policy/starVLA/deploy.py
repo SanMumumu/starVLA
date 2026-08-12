@@ -2,7 +2,8 @@
 
 The policy server deliberately returns one cached chunk element per request.
 This keeps the simulator observation current at every 25 Hz control step while
-replanning the 16-action StarVLA chunk only at chunk boundaries.
+the repository adapter replans its checkpoint-defined StarVLA chunk at the
+configured execution interval.
 """
 
 

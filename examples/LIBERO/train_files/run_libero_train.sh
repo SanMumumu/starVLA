@@ -1,74 +1,44 @@
-unset NCCL_SOCKET_IFNAME
-unset NCCL_IB_HCA
-export NCCL_IB_DISABLE=1
+#!/usr/bin/env bash
+set -euo pipefail
 
-# used for check save when communication
-export NCCL_BLOCKING_WAIT=1
-export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_TIMEOUT=10000  # timeout set to 1 hour (unit: seconds)
-export NCCL_SOCKET_TIMEOUT_MS=360000
-###########################################################################################
-# === Please modify the following paths according to your environment ===
-Framework_name=QwenGR00T
-freeze_module_list=''
-base_vlm=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-4B-Instruct/
-config_yaml=./examples/LIBERO/train_files/starvla_cotrain_libero.yaml
-libero_data_root=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/DATA/LEBERO/libero/
-data_mix=libero_all
-run_root_dir=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_qwenwam/gr00t
-run_id=0618_libero4in1_qwen3gr00t
-# === End of environment variable configuration ===
-###########################################################################################
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+cd "${REPO_ROOT}"
 
+CONFIG_YAML="${CONFIG_YAML:-examples/LIBERO/train_files/rynn_base_h8_50k_fp32.yaml}"
+NUM_PROCESSES="${NUM_PROCESSES:-8}"
+DATA_ROOT="${LIBERO_DATA_ROOT:-}"
+BASE_VLM="${RYNN_BASE_VLM:-}"
+RUN_ROOT_DIR="${RUN_ROOT_DIR:-}"
+RUN_ID="${RUN_ID:-}"
 
-# export WANDB_MODE=disabled
+if [[ ! -f "${CONFIG_YAML}" ]]; then
+  echo "[LIBERO train][ERROR] config does not exist: ${CONFIG_YAML}" >&2
+  exit 1
+fi
+if [[ "${NUM_PROCESSES}" != "8" ]]; then
+  echo "[LIBERO train][ERROR] this YAML is batch-locked to one 8-GPU node (6 x 8 x 16 = 768); got NUM_PROCESSES=${NUM_PROCESSES}." >&2
+  echo "Create a separate topology-specific YAML instead of silently changing the training contract." >&2
+  exit 1
+fi
 
-output_dir=${run_root_dir}/${run_id}
-mkdir -p ${output_dir}
-# mv this script to the output dir
-cp $0 ${output_dir}/
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
+export NCCL_BLOCKING_WAIT="${NCCL_BLOCKING_WAIT:-1}"
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
+export NO_ALBUMENTATIONS_UPDATE="${NO_ALBUMENTATIONS_UPDATE:-1}"
 
+args=(
+  accelerate launch
+  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml
+  --num_processes "${NUM_PROCESSES}"
+  starVLA/training/train_starvla.py
+  --config_yaml "${CONFIG_YAML}"
+)
+[[ -n "${DATA_ROOT}" ]] && args+=(--datasets.vla_data.data_root_dir "${DATA_ROOT}")
+[[ -n "${BASE_VLM}" ]] && args+=(--framework.qwenvl.base_vlm "${BASE_VLM}")
+[[ -n "${RUN_ROOT_DIR}" ]] && args+=(--run_root_dir "${RUN_ROOT_DIR}")
+[[ -n "${RUN_ID}" ]] && args+=(--run_id "${RUN_ID}")
 
-num_processes=${NUM_PROCESSES:-$(nvidia-smi -L | wc -l)}
-
-accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes ${num_processes} \
-  starVLA/training/train_starvla.py \
-  --config_yaml ${config_yaml} \
-  --framework.name ${Framework_name} \
-  --framework.qwenvl.base_vlm ${base_vlm} \
-  --datasets.vla_data.data_root_dir ${libero_data_root}\
-  --datasets.vla_data.data_mix ${data_mix} \
-  --datasets.vla_data.per_device_batch_size 8 \
-  --trainer.vla_data.video_backend torchvision_av \
-  --trainer.freeze_modules ${freeze_module_list} \
-  --trainer.max_train_steps 50000 \
-  --trainer.save_interval 10000 \
-  --trainer.logging_frequency 100 \
-  --trainer.eval_interval 50000 \
-  --run_root_dir ${run_root_dir} \
-  --run_id ${run_id} \
-  --wandb_project starVLA_Libero \
-  --wandb_entity jinhuiye
-  # --is_debug True
-
-
-
-##### Multi-Server Multi-GPU training script #####
-  # accelerate launch \
-  #   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  #   --main_process_ip $MASTER_ADDR \
-  #   --main_process_port $MASTER_PORT \
-  #   --machine_rank $SLURM_PROCID \
-  #   --num_machines $SLURM_NNODES \
-  #   --num_processes=${TOTAL_GPUS} \
-  #   starVLA/training/train_starvla.py \
-  #   --config_yaml ${config_yaml} \
-  #   --framework.name ${Framework_name} \
-  #   --framework.qwenvl.base_vlm ${base_vlm} \
-  #   --run_root_dir ${run_root_dir} \
-  #   --run_id ${run_id} \
-  #   --wandb_project your_project \
-  #   --wandb_entity your_name
-##### Multi-Server Multi-GPU training script #####
+echo "[LIBERO train] config=${CONFIG_YAML} GPUs=${NUM_PROCESSES} H8 full-chunk"
+"${args[@]}"

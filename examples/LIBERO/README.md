@@ -1,3 +1,50 @@
+# Current Rynn H8 recipe
+
+The canonical config is `train_files/rynn_base_h8_50k_fp32.yaml`. It adapts
+RoboDojo's released H25-FP32 model/optimizer recipe to LIBERO while preserving
+the existing dataset contract: two camera views, 7-D `delta_qpos` actions and
+8-D robot state. LIBERO predicts H8 and executes the whole chunk; there is no
+separate replan parameter.
+
+Train on one 8-GPU node from the repository root:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+LIBERO_DATA_ROOT=/path/to/libero_lerobot_root \
+RYNN_BASE_VLM=/path/to/rynnbrain1.1-2B \
+RUN_ROOT_DIR=/path/to/outputs \
+bash examples/LIBERO/train_files/run_libero_train.sh
+```
+
+This YAML is batch-locked to `6 x 8 GPUs x 16 accumulation = 768`.
+
+For ordinary evaluation, use two terminals. Start the server in the StarVLA
+environment:
+
+```bash
+CKPT=/path/to/steps_50000_pytorch_model.pt GPU_ID=0 PORT=6694 \
+bash examples/LIBERO/eval_files/run_policy_server.sh
+```
+
+Run the simulator in the LIBERO environment:
+
+```bash
+CKPT=/path/to/steps_50000_pytorch_model.pt HOST=127.0.0.1 PORT=6694 \
+LIBERO_HOME=/path/to/LIBERO LIBERO_PYTHON=/path/to/libero/python \
+bash examples/LIBERO/eval_files/eval_libero.sh
+```
+
+For an 8-way sharded evaluation, replace those commands with
+`eval_files/run_policy_servers_8.sh` and `eval_files/eval_libero_8clients.sh`.
+The current Rynn checkpoint must use `STRIP_DINO_KEYS=0` (the new scripts make
+that the default).
+
+All previous top-level training YAML files were retained as `*_old.yaml`, and
+their old experiment launchers were updated to point to the archived names.
+The `compare/` and `eval_horizon/` experiment trees are intentionally preserved.
+
+---
+
 # 🚀 LIBERO Evaluation
 
 This document provides instructions for reproducing our **experimental results** with LIBERO.  
@@ -69,10 +116,10 @@ The evaluation should be run **from the repository root** using **two separate t
 In the first terminal, activate the `starVLA` conda environment and run:  
 
 ```bash
-bash examples/LIBERO/eval_files/run_policy_server.sh
+CKPT=/path/to/checkpoint.pt bash examples/LIBERO/eval_files/run_policy_server.sh
 ```
 
-⚠️ **Note:** Please ensure that you specify the correct checkpoint path in `examples/LIBERO/eval_files/run_policy_server.sh`  
+Pass the checkpoint through `CKPT`; the script no longer embeds a historical default.
 
 
 ---
@@ -82,9 +129,10 @@ bash examples/LIBERO/eval_files/run_policy_server.sh
 In the second terminal, activate the `LIBERO` conda environment and run:  
 
 ```bash
+CKPT=/path/to/checkpoint.pt HOST=127.0.0.1 \
 bash examples/LIBERO/eval_files/eval_libero.sh
 ```
-⚠️ **Note:** Please ensure that you specify the correct checkpoint path in `eval_libero.sh` to load action unnormalization stats. 
+Use the same `CKPT` as the server so results and normalization metadata are written under the correct run.
 
 Also ensure the environment variables at the top of `eval_libero.sh` are correctly set.
 

@@ -1,6 +1,10 @@
+# Archived legacy WAM recipe; kept for reference.
 #######
+#
+#        --output Z_ws/wan_init/ckpts/WanActionBackbone_dimB_16L_first.pt \
+#        --num-layers 16 --hidden-dim 768 --ffn-dim 3072 --num-heads 12 --attn-head-dim 64 --text-dim 2048
 #######
-run_id: starvla_wam_exp5_2b_bigbs_policy
+run_id: starvla_wam_add1_2b_wan_init_policy
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
 seed: 42
 wandb_entity: your_wandb_entity
@@ -45,6 +49,18 @@ framework:
     action_horizon: 8
     n_action_query: 32
     #######
+    backbone: wan
+    wan:
+      hidden_dim: 768
+      ffn_dim: 3072
+      num_heads: 12
+      attn_head_dim: 64
+      num_layers: 16
+      text_dim: 2048
+      freq_dim: 256
+      eps: 1.0e-6
+      init_path: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/WanActionBackbone_dimB_16L_first.pt
+    #######
     use_correlated_noise: true
     correlation_beta: 0.5
     flow_matching_steps: 20
@@ -57,6 +73,7 @@ framework:
     noise_beta_beta: 1.0
     noise_s: 0.999
     repeated_diffusion_steps: 1
+    #######
     diffusion_model_cfg:
       cross_attention_dim: 2048
       dropout: 0.2

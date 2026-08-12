@@ -1,6 +1,7 @@
+# Archived legacy WAM experiment; kept for reference.
 #######
 #######
-run_id: starvla_wam_exp6_2b_bigbs_policy_fdm
+run_id: starvla_wam_exp8_2b_bigbs_policy_passive_nolang
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
 seed: 42
 wandb_entity: your_wandb_entity
@@ -19,15 +20,16 @@ framework:
   wam:
     enabled: true
     placeholder_token: "<ACT_PH>"
-    dino_loss_weight: 1.0
+    dino_loss_weight: 0.01
     #######
     fdm_delta_dino: true
+    world_model_no_language: true
     #######
   #######
   tasks:
     weights:
       policy: 1.0
-      fdm: 0.2
+      passive: 0.2
   #######
   dino:
     name: dinov3_vits16

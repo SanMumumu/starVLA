@@ -1,21 +1,7 @@
-# RynnBrain1.1-2B planner with jointly denoised future-DINO and action flow.
-#
-# Physical token order:
-#   [z0 (clean current DINO), zf(t) (noisy future DINO), af(t) (noisy action)]
-#
-# Mask:
-#   z0 -> z0
-#   zf -> [z0, zf]
-#   af -> [z0, zf, af]
-#
-# z0 uses flow timestep zero and is clamped during every sampling step.
-# World uses 2D spatial RoPE plus current/future frame-type embeddings; action
-# uses 1D horizon RoPE. Experts have independent Q/K/V, FFN and output heads.
-# Every layer mixes their self-attention Q/K/V once; world never reads action.
-# Cross-attention KV is [WORLD_PLAN, state] for world and
-# [ACTION_PLAN, state] for action; neither condition enters the physical stream.
+# RynnBrain1.1 base recipe with the selected 25-step action horizon.
+# Evaluation uses a 10-step replan interval.
 
-run_id: starvla_rynnbrain11_robodojo_dino_mot_joint_50k
+run_id: starvla_rynnbrain11_robodojo_dino_mot_base_h25_50k_v1
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_robodojo
 seed: 42
 wandb_entity: axi-the-cat
@@ -26,26 +12,28 @@ version_id: "0.21"
 framework:
   name: QwenWorldActionMoT
   enable_world_action_mot: true
+  reproduction_profile: robodojo_rynnbrain11_causal_dino_mot_base_h25_50k_v1
 
   qwenvl:
     base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/rynnbrain1.1-2B/
     attn_implementation: sdpa
+    require_attn_implementation: true
     enable_gradient_checkpointing: true
     enable_thinking: false
     vl_hidden_dim: 2048
+    truncate_vlm_layers: 0
 
   planner:
     num_world_queries: 16
-    num_action_queries: 16
+    num_action_queries: 25
     world_placeholder_token: "<WORLD_PLAN>"
     action_placeholder_token: "<ACTION_PLAN>"
     text_supervision:
       enabled: false
-      allow_missing_annotations: true
 
   world_action_mot:
     architecture: causal_dino_mot
-    interaction_mode: joint
+    interaction_mode: base
     world_attention_mask_mode: first_frame_causal
 
     world_hidden_size: 512
@@ -55,6 +43,7 @@ framework:
     num_layers: 30
     num_attention_heads: 24
     attention_head_dim: 128
+    layerwise_planner_coupling: false
     norm_eps: 1.0e-06
     time_frequency_dim: 256
     world_grid_height: 12
@@ -70,6 +59,10 @@ framework:
     action_num_train_timesteps: 1000
     num_inference_timesteps: 20
 
+    action_prediction_type: velocity
+    action_velocity_target: noise_minus_clean
+    jit_t_eps: 0.05
+    repeated_diffusion_steps: 1
     action_loss_weight: 1.0
     world_loss_weight: 1.0
     text_loss_weight: 0.0
@@ -78,6 +71,7 @@ framework:
     name: dinov3_vitb16
     model_size: base
     hf_model_id: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO-B/
+    repo_or_dir: facebookresearch/dinov3
     weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO-B/
     loader: hf
     image_size: [384, 320]
@@ -87,11 +81,12 @@ framework:
     load_live_backbone: true
     force_online: true
     dino_pool: 2
+    current_dino_pool: null
 
   action_model:
     action_dim: 14
     state_dim: 14
-    action_horizon: 16
+    action_horizon: 25
 
 datasets:
   vla_data:
@@ -105,7 +100,7 @@ datasets:
     include_state: true
     action_type: abs_qpos
     action_mode: abs
-    action_horizon: 16
+    action_horizon: 25
     world_model:
       future_stride: 16
     future_valid_requires_full_stride: true
@@ -115,6 +110,8 @@ datasets:
     optional_text_annotations:
       enabled: false
       require_columns: false
+    text_annotations:
+      enabled: false
     sequential_step_sampling: false
     balance_dataset_weights: false
     balance_trajectory_weights: false
@@ -134,6 +131,7 @@ trainer:
   num_warmup_steps: 2000
   save_interval: 10000
   eval_interval: 1000
+  action_eval_enabled: true
   world_validation:
     enabled: false
   pretrained_checkpoint: null

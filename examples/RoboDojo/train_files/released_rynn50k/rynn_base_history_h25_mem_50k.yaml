@@ -1,21 +1,7 @@
-# Qwen3-VL planner with a causal current/future-DINO and action physical flow.
-#
-# Physical token order:
-#   [z0 (clean current DINO), zf(t) (noisy future DINO), af(t) (noisy action)]
-#
-# Mask:
-#   z0 -> z0
-#   zf -> [z0, zf]
-#   af -> [z0, af]
-#
-# z0 uses flow timestep zero and is clamped during every sampling step.
-# World uses 2D spatial RoPE plus current/future frame-type embeddings; action
-# uses 1D horizon RoPE. Experts have independent Q/K/V, FFN and output heads.
-# Every layer mixes their self-attention Q/K/V once; world never reads action.
-# Cross-attention KV is [WORLD_PLAN, state] for world and
-# [ACTION_PLAN, state] for action; neither condition enters the physical stream.
+# H25 full-resolution six-frame history-only recipe for testing the MEM
+# encoder. Autoregressive text planning and its NTP loss stay disabled.
 
-run_id: starvla_qwen3_robodojo_dino_mot_base_50k
+run_id: starvla_rynnbrain11_robodojo_dino_mot_base_history_h25_mem_currenttoken_fullres_50k
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_robodojo
 seed: 42
 wandb_entity: axi-the-cat
@@ -26,29 +12,54 @@ version_id: "0.21"
 framework:
   name: QwenWorldActionMoT
   enable_world_action_mot: true
+  reproduction_profile: robodojo_rynnbrain11_causal_dino_mot_base_history_h25_mem_currenttoken_fullres_50k
 
   qwenvl:
-    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B-Instruct/
-    attn_implementation: flash_attention_2
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/rynnbrain1.1-2B/
+    attn_implementation: sdpa
     require_attn_implementation: true
     enable_gradient_checkpointing: true
+    enable_thinking: false
     vl_hidden_dim: 2048
+    truncate_vlm_layers: 0
+    mem_vision_encoder:
+      enabled: true
+      num_frames: 6
+      spacetime_layer_stride: 4
+      time_embed_base: 100.0
+      match_current_to_history_resolution: true
+      output_token_policy: current_only
 
   planner:
     num_world_queries: 16
-    num_action_queries: 16
+    num_action_queries: 25
     world_placeholder_token: "<WORLD_PLAN>"
     action_placeholder_token: "<ACTION_PLAN>"
     text_supervision:
+      # Strict ablation switch: no text generation, teacher forcing or NTP.
       enabled: false
-      allow_missing_annotations: true
+      # Keep dormant fields identical to the text+MEM control so that only the
+      # enabled switch and text loss differ between the two model recipes.
+      subtask_field: subtask_text
+      completed_subtask_field: completed_subtask_text
+      prompt_template: "Task instruction: {instruction}\nPrevious Finished Task List: {finished_task_list}\nUsing the history observations and current observation, report the current subtask and update the Finished Task List. Preserve every previously finished task and append only tasks that are visibly completed."
+      response_template: "Current subtask: {subtask_text}\nFinished Task List: {completed_subtask_text}"
+      max_new_tokens: 96
+      do_sample: false
+      history:
+        # This remains enabled as a physical MEM input, independently of text.
+        enabled: true
+        image_field: planner_history_images
+        finished_task_list_field: finished_task_list
+        finished_task_list_prefix: "Finished Task List:"
+        empty_finished_task_list: "None"
+        history_image_size: [320, 384]
 
   world_action_mot:
     architecture: causal_dino_mot
     interaction_mode: base
     world_attention_mask_mode: first_frame_causal
 
-    # Dual-expert architecture.
     world_hidden_size: 512
     action_hidden_size: 1024
     world_ffn_dim: 2048
@@ -56,6 +67,7 @@ framework:
     num_layers: 30
     num_attention_heads: 24
     attention_head_dim: 128
+    layerwise_planner_coupling: false
     norm_eps: 1.0e-06
     time_frequency_dim: 256
     world_grid_height: 12
@@ -63,7 +75,6 @@ framework:
     max_world_tokens: 120
     enable_gradient_checkpointing: true
 
-    # Independent continuous-flow schedulers.
     world_train_shift: 5.0
     world_infer_shift: 5.0
     world_num_train_timesteps: 1000
@@ -72,14 +83,20 @@ framework:
     action_num_train_timesteps: 1000
     num_inference_timesteps: 20
 
+    action_prediction_type: velocity
+    action_velocity_target: noise_minus_clean
+    jit_t_eps: 0.05
+    repeated_diffusion_steps: 1
     action_loss_weight: 1.0
     world_loss_weight: 1.0
+    # Strict ablation switch: no text objective.
     text_loss_weight: 0.0
 
   dino:
     name: dinov3_vitb16
     model_size: base
     hf_model_id: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO-B/
+    repo_or_dir: facebookresearch/dinov3
     weights: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/DINO-B/
     loader: hf
     image_size: [384, 320]
@@ -89,17 +106,20 @@ framework:
     load_live_backbone: true
     force_online: true
     dino_pool: 2
+    current_dino_pool: null
 
   action_model:
     action_dim: 14
     state_dim: 14
-    action_horizon: 16
+    action_horizon: 25
 
 datasets:
   vla_data:
     dataset_py: jointflow
     data_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/RoboDojo
-    data_mix: robodojo_v21_language_optional
+    # Keep the identical dataset/sample population used by text+MEM. Text
+    # labels may be loaded but are never consumed when supervision is disabled.
+    data_mix: robodojo_v21_language
     lerobot_version: v2.1
     image_layout: tri_view_composite
     composite_source_view_keys: ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
@@ -107,7 +127,7 @@ datasets:
     include_state: true
     action_type: abs_qpos
     action_mode: abs
-    action_horizon: 16
+    action_horizon: 25
     world_model:
       future_stride: 16
     future_valid_requires_full_stride: true
@@ -117,6 +137,21 @@ datasets:
     optional_text_annotations:
       enabled: false
       require_columns: false
+    text_annotations:
+      # Kept identical solely to decode the same sparse frames and preserve the
+      # sample set. The model's text path and loss are both disabled above.
+      enabled: true
+      fields:
+        subtask_text: subtask_text
+        completed_subtask_text: complete_text
+      history:
+        enabled: true
+        image_field: planner_history_images
+        frame_offsets: [-100, -80, -60, -40, -20]
+        memory_offset: -100
+        finished_task_list_source_field: complete_text
+        finished_task_list_field: finished_task_list
+        empty_finished_task_list: "None"
     sequential_step_sampling: false
     balance_dataset_weights: false
     balance_trajectory_weights: false
@@ -136,6 +171,7 @@ trainer:
   num_warmup_steps: 2000
   save_interval: 10000
   eval_interval: 1000
+  action_eval_enabled: false
   world_validation:
     enabled: false
   pretrained_checkpoint: null

@@ -22,7 +22,10 @@ import numpy as np
 from PIL import Image
 
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
-from examples.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
+try:
+    from examples.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
+except ImportError:
+    AdaptiveEnsembler = None
 
 
 class ModelClient:
@@ -38,7 +41,7 @@ class ModelClient:
         adaptive_ensemble_alpha: float = 0.1,
         host: str = "0.0.0.0",
         port: int = 10095,
-        image_size: Sequence[int] = (224, 224),
+        image_size: Optional[Sequence[int]] = None,
     ) -> None:
         # Connect & receive handshake metadata (action_chunk_size, etc.)
         self.client = WebsocketClientPolicy(host, port)
@@ -46,7 +49,15 @@ class ModelClient:
         self.action_chunk_size = int(meta["action_chunk_size"])
         self._server_metadata = meta
 
-        self.image_size: tuple = tuple(image_size)
+        configured_size = meta.get("obs_image_size", [])
+        if image_size is not None:
+            self.image_size: tuple = tuple(image_size)
+        elif len(configured_size) == 2:
+            # Training config stores PIL order [width, height]; NumPy uses [height, width].
+            self.image_size = (int(configured_size[1]), int(configured_size[0]))
+        else:
+            self.image_size = (224, 224)
+        self.expects_state = bool(meta.get("expects_state", False))
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
         print(
@@ -58,7 +69,7 @@ class ModelClient:
         self.use_ddim = use_ddim
         self.num_ddim_steps = num_ddim_steps
         self.horizon = horizon
-        self.action_ensemble = action_ensemble
+        self.action_ensemble = action_ensemble and (AdaptiveEnsembler is not None)
         self.adaptive_ensemble_alpha = adaptive_ensemble_alpha
         self.action_ensemble_horizon = action_ensemble_horizon
 
@@ -102,7 +113,8 @@ class ModelClient:
         """One env step.
 
         Args:
-            example: dict with keys ``image`` (list of np.uint8 HWC arrays) and ``lang`` (str).
+            example: dict with ``image`` (HWC arrays), ``lang`` and optional
+                8-D ``state``; state is required only when advertised by the checkpoint.
             step: env step counter; used for chunk caching.
 
         Returns:
@@ -126,6 +138,16 @@ class ModelClient:
                     )
                 resized.append(arr)
             example = {**example, "image": resized}
+
+        if self.expects_state:
+            state = np.asarray(example.get("state"), dtype=np.float32).reshape(-1)
+            if state.size != 8:
+                raise ValueError(
+                    f"LIBERO checkpoint expects 8-D state [xyz, axis-angle, gripper2], got {state.shape}"
+                )
+            example = {**example, "state": state.reshape(1, 8)}
+        else:
+            example = {key: value for key, value in example.items() if key != "state"}
 
         # Refresh chunk if needed.
         if step % self.action_chunk_size == 0 or self.raw_actions is None:

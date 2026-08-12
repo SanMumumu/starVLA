@@ -1,17 +1,13 @@
+# Archived legacy query gate fine-tuning recipe; kept for reference.
 #######
-# RobotWin causal action/world query predictor warmup (Stage 1/2).
+# RobotWin causal action/world query Gate finetune (Stage 2/2).
 #
-# One causal Qwen pass produces:
-#   context -> WORLD query x64 -> ACTION query x32
-# ACTION is the final query group and causally attends to WORLD/visual queries.
-# Action DiT is conditioned only on hidden states at ACTION indices.
-# World DiT is conditioned only on hidden states at WORLD indices.
-# Neither branch receives proprio state. The world->action modules are created
-# with closed gates, physically frozen, and bypassed throughout this stage.
-# The optional current-frame DINO-B ablation is disabled by default.
+# Loads the 80k predictor warmup, keeps Qwen and the world predictor frozen,
+# resets every world gate to zero, and trains only the action query/Action DiT
+# plus the world->action adapters and gates. No proprio state is consumed.
 #######
 
-run_id: robotwin_wam_causal_query_warmup_dinob_online_iid_80k
+run_id: robotwin_wam_causal_query_gate_ft_dinob_online_iid_20k
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin_causal_queries
 seed: 42
 wandb_entity: axi-the-cat
@@ -45,11 +41,9 @@ framework:
       action_query_last: true
       exclude_post_query_context: true
 
-      # Stage 1 learns action/world query representations without letting the
-      # newly initialized world->action path perturb the policy.
-      action_world_bypass: true
+      action_world_bypass: false
       world_to_action_enabled: true
-      freeze_world_to_action_in_warmup: true
+      freeze_world_to_action_in_warmup: false
       bridge_source: predicted
       detach_world: true
       detached_prediction_eval_mode: true
@@ -61,13 +55,9 @@ framework:
       separate_world_backbone_pass: false
       detach_action_query_in_world_pass: false
 
-      # Exact causal action/world query condition ABI: indexed query hidden states only.
       world_condition_on_state: false
       include_context_in_action_memory: false
       include_context_in_world_memory: false
-
-      # Ablation only: append projected online DINO-B(current) patch tokens to
-      # the WORLD query condition.  Keep false for the primary experiment.
       concat_current_dino: false
       world_dropout: 0.0
       gate_init: 0.0
@@ -77,9 +67,9 @@ framework:
 
   tasks:
     weights:
-      policy: 0.0
+      policy: 1.0
       passive: 0.0
-      joint_detached: 1.0
+      joint_detached: 0.0
 
   dino:
     name: dinov3_vitb16
@@ -150,8 +140,6 @@ framework:
     flow_time_sampling: gr00t
     clean_target_loss_weight: 1.0
     cosine_loss_weight: 0.1
-    # Keep the primary condition/target path minimal.  Current DINO is encoded
-    # only when concat_current_dino is enabled for the explicit ablation.
     patch_weighting: none
     change_weight_strength: 0.0
 
@@ -176,7 +164,6 @@ datasets:
     sequential_step_sampling: false
     balance_dataset_weights: false
     balance_trajectory_weights: false
-    # 8 machines x 8 GPUs x 16 samples = global batch 1024.
     per_device_batch_size: 16
     load_all_data_for_training: true
     obs_image_size: [320, 384]
@@ -188,13 +175,12 @@ datasets:
 
 trainer:
   seed_before_model_init: true
-  wam_two_stage_phase: predictor_warmup
+  wam_two_stage_phase: gate_ft
   wam_two_stage_recipe: causal_action_world_queries_v1
   expected_global_batch_size: 1024
-  max_train_steps: 80000
-  # "80k" denotes total training steps; retain the established 2k LR ramp.
-  num_warmup_steps: 2000
-  save_interval: 10000
+  max_train_steps: 20000
+  num_warmup_steps: 500
+  save_interval: 5000
   action_eval_enabled: true
   eval_interval: 1000
   world_validation:
@@ -207,22 +193,21 @@ trainer:
     num_samples: 1
     num_inference_timesteps: 10
     seed: 2027
-  pretrained_checkpoint: null
+  pretrained_checkpoint: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_robotwin_causal_queries/robotwin_wam_causal_query_warmup_dinob_online_iid_80k/final_model/pytorch_model.pt
   is_resume: false
+  reset_world_gates_after_pretrained_load: true
   save_full_training_state: true
 
   learning_rate:
     base: 1.0e-05
-    qwen_vl_interface: 1.0e-05
-    action_queries: 1.0e-04
-    action_model: 1.0e-04
-    future_dino_queries: 1.0e-04
-    wam_visual_head: 1.0e-04
+    action_queries: 1.0e-05
+    action_model: 1.0e-05
+    world_gates: 1.0e-04
+    world_to_action_adapters: 1.0e-04
 
-  lr_scheduler_type: cosine_with_min_lr
-  scheduler_specific_kwargs:
-    min_lr: 5.0e-07
-  freeze_modules: 'wam_act_ctx'
+  lr_scheduler_type: constant_with_warmup
+  scheduler_specific_kwargs: {}
+  freeze_modules: 'qwen_vl_interface,wam_visual_head,wam_act_ctx,future_dino_queries'
   loss_scale:
     vla: 1.0
   max_grad_norm: 1.0

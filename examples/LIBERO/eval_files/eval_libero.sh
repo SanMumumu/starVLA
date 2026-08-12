@@ -7,9 +7,9 @@ LIBERO_HOME="${LIBERO_HOME:-/opt/LIBERO}"
 LIBERO_PYTHON="${LIBERO_PYTHON:-/usr/local/bin/python3}"
 LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-${LIBERO_HOME}/libero}"
 
-CKPT="${CKPT:-/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_qwenwam/gr00t/0618_libero4in1_qwen3gr00t/final_model/pytorch_model.pt}"
+CKPT="${CKPT:-}"
 
-HOST="${HOST:-10.237.89.194}"
+HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-6694}"
 
 # TASK_SUITE_NAME=libero_goal bash examples/LIBERO/eval_files/eval_libero.sh
@@ -20,6 +20,11 @@ NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-50}"
 MAX_TASKS="${MAX_TASKS:--1}"
 
 cd "${STARVLA_DIR}"
+
+if [[ -z "${CKPT}" ]]; then
+  echo "[ERROR] set CKPT to the same checkpoint used by run_policy_server.sh" >&2
+  exit 1
+fi
 
 export LIBERO_HOME
 export LIBERO_CONFIG_PATH

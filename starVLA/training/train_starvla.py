@@ -168,10 +168,28 @@ def setup_directories(cfg) -> Path:
     return output_dir
 
 
-def prepare_data(cfg, accelerator, output_dir) -> tuple[DataLoader, DataLoader | None]:
-    """Prepare training data and an optional fixed FastWAM validation split."""
+def prepare_data(
+    cfg, accelerator, output_dir
+) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
+    """Prepare physical, optional semantic-NTP, and optional validation data."""
     logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
     vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
+
+    event_cfg = cfg.datasets.vla_data.get("text_annotations", {}).get(
+        "event_memory", {}
+    )
+    semantic_train_dataloader = None
+    if bool(event_cfg.get("enabled", False)):
+        from starVLA.dataloader.jointflow.joint_dataset import (
+            build_event_memory_dataloader,
+        )
+
+        logger.info(
+            "Creating event-memory semantic NTP stream (phase-aligned 2/2/2 sampler)"
+        )
+        semantic_train_dataloader = build_event_memory_dataloader(
+            cfg, output_dir=output_dir
+        )
 
     world_validation = cfg.trainer.get("world_validation", {})
     vla_val_dataloader = None
@@ -208,7 +226,7 @@ def prepare_data(cfg, accelerator, output_dir) -> tuple[DataLoader, DataLoader |
 
     accelerator.dataloader_config.dispatch_batches = False
     dist.barrier()
-    return vla_train_dataloader, vla_val_dataloader
+    return vla_train_dataloader, semantic_train_dataloader, vla_val_dataloader
 
 
 def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
@@ -264,11 +282,18 @@ class VLATrainer(TrainerUtils):
         optimizer,
         lr_scheduler,
         accelerator,
+        semantic_train_dataloader=None,
         vla_val_dataloader=None,
     ):
         self.config = cfg
         self.model = model
         self.vla_train_dataloader = vla_train_dataloader
+        self.semantic_train_dataloader = semantic_train_dataloader
+        self.semantic_batch_sampler = (
+            semantic_train_dataloader.batch_sampler
+            if semantic_train_dataloader is not None
+            else None
+        )
         self.vla_val_dataloader = vla_val_dataloader
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
@@ -360,6 +385,43 @@ class VLATrainer(TrainerUtils):
         self._using_deepspeed = "DEEPSPEED" in str(getattr(accelerator, "distributed_type", "")).upper()
         self._last_clip_norm = None
         self._grad_warned = False
+        shared_vlm_diag_cfg = cfg.trainer.get(
+            "shared_vlm_gradient_diagnostics", {}
+        )
+        self._shared_vlm_gradient_diagnostics_enabled = bool(
+            hasattr(shared_vlm_diag_cfg, "get")
+            and shared_vlm_diag_cfg.get("enabled", False)
+        )
+        self._shared_vlm_gradient_diagnostics_interval = int(
+            shared_vlm_diag_cfg.get(
+                "interval",
+                cfg.trainer.logging_frequency,
+            )
+            if hasattr(shared_vlm_diag_cfg, "get")
+            else cfg.trainer.logging_frequency
+        )
+        if self._shared_vlm_gradient_diagnostics_enabled:
+            logging_frequency = int(cfg.trainer.logging_frequency)
+            if self._shared_vlm_gradient_diagnostics_interval <= 0:
+                raise ValueError(
+                    "trainer.shared_vlm_gradient_diagnostics.interval must be positive"
+                )
+            if (
+                self._shared_vlm_gradient_diagnostics_interval
+                % logging_frequency
+                != 0
+            ):
+                raise ValueError(
+                    "trainer.shared_vlm_gradient_diagnostics.interval must be "
+                    "a multiple of trainer.logging_frequency so every diagnostic "
+                    "is emitted to W&B"
+                )
+            if int(cfg.trainer.get("gradient_accumulation_steps", 1)) != 1:
+                raise ValueError(
+                    "shared-VLM interface gradient diagnostics currently require "
+                    "trainer.gradient_accumulation_steps=1 so the measured query "
+                    "gradient is exactly the optimizer step's full local batch"
+                )
         #######
 
     def prepare_training(self):
@@ -395,6 +457,10 @@ class VLATrainer(TrainerUtils):
         # also preserves its exact step and per-group LR without changing the
         # established stepping semantics.
         self.accelerator.register_for_checkpointing(self.lr_scheduler)
+        if self.semantic_batch_sampler is not None:
+            self.accelerator.register_for_checkpointing(
+                self.semantic_batch_sampler
+            )
 
         # Full optimizer/scheduler state can only be restored after Accelerate
         # has registered and wrapped every training object.
@@ -419,6 +485,15 @@ class VLATrainer(TrainerUtils):
                 self._log_grad_norms = False
                 self._grad_groups = None
         #######
+        if (
+            self._shared_vlm_gradient_diagnostics_enabled
+            and self.accelerator.is_main_process
+        ):
+            logger.info(
+                "Shared-VLM interface action/world gradient norms: interval=%d "
+                "(weighted physical objectives; text loss excluded)",
+                self._shared_vlm_gradient_diagnostics_interval,
+            )
 
         self._init_wandb()
 
@@ -440,6 +515,10 @@ class VLATrainer(TrainerUtils):
             self.vla_train_dataloader,
         )
         self.model, self.optimizer, self.vla_train_dataloader = prepared
+        if getattr(self, "semantic_train_dataloader", None) is not None:
+            self.semantic_train_dataloader = self.accelerator.prepare_data_loader(
+                self.semantic_train_dataloader
+            )
         if self.vla_val_dataloader is not None:
             self.vla_val_dataloader = self.accelerator.prepare_data_loader(
                 self.vla_val_dataloader
@@ -1105,7 +1184,15 @@ class VLATrainer(TrainerUtils):
 
         if pretrained_checkpoint:
             reload_modules = getattr(self.config.trainer, "reload_modules", None)
-            self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
+            pretrained_strict = bool(
+                getattr(self.config.trainer, "pretrained_strict", False)
+            )
+            self.model = self.load_pretrained_backbones(
+                self.model,
+                pretrained_checkpoint,
+                reload_modules=reload_modules,
+                strict=pretrained_strict,
+            )
             if reset_world_gates:
                 if reload_modules:
                     raise ValueError(
@@ -1362,6 +1449,14 @@ class VLATrainer(TrainerUtils):
     def _create_data_iterators(self):
         """Create data iterators."""
         self.vla_iter = iter(self.vla_train_dataloader)
+        if getattr(self, "semantic_train_dataloader", None) is not None:
+            # The sampler epoch is checkpointed independently.  Seed the loop
+            # counter from the restored value so the first exhaustion after a
+            # resume advances e.g. 17 -> 18 instead of silently resetting to 1.
+            self.semantic_epoch_count = int(
+                getattr(self.semantic_batch_sampler, "epoch", 0)
+            )
+            self.semantic_iter = iter(self.semantic_train_dataloader)
 
     def _get_next_batch(self):
         """Get next batch (automatically handle data loop)."""
@@ -1376,6 +1471,20 @@ class VLATrainer(TrainerUtils):
             batch_vla = next(self.vla_iter)
 
         return batch_vla
+
+    def _get_next_semantic_batch(self):
+        if getattr(self, "semantic_train_dataloader", None) is None:
+            return None
+        try:
+            return next(self.semantic_iter)
+        except StopIteration:
+            if not hasattr(self, "semantic_epoch_count"):
+                self.semantic_epoch_count = 0
+            self.semantic_epoch_count += 1
+            if self.semantic_batch_sampler is not None:
+                self.semantic_batch_sampler.set_epoch(self.semantic_epoch_count)
+            self.semantic_iter = iter(self.semantic_train_dataloader)
+            return next(self.semantic_iter)
 
     #######
     def _sample_jointflow_task(self) -> str | None:
@@ -1469,9 +1578,9 @@ class VLATrainer(TrainerUtils):
                 metrics["train/loss_text_raw"] = float(
                     output_dict.get("text_loss_raw", text_loss).detach()
                 )
-                metrics["train/text_annotated_samples"] = float(
+                metrics["train/text_samples"] = float(
                     output_dict.get(
-                        "text_annotated_samples",
+                        "text_samples",
                         text_loss.new_zeros(()),
                     ).detach()
                 )
@@ -1504,25 +1613,73 @@ class VLATrainer(TrainerUtils):
 
     @staticmethod
     def _build_native_loss_metrics(output_dict: dict, total_loss: torch.Tensor) -> dict:
-        """Build single-objective metrics without changing legacy semantics."""
+        """Expose weighted training objectives plus explicitly named raw losses."""
 
         if "mot_action_loss_raw" in output_dict:
-            return {
+            action_raw = output_dict["mot_action_loss_raw"].detach()
+            world_raw = output_dict["mot_world_loss_raw"].detach()
+            text_raw = output_dict["mot_text_loss_raw"].detach()
+            action_weighted = output_dict.get(
+                "mot_action_loss_weighted",
+                action_raw,
+            ).detach()
+            world_weighted = output_dict.get(
+                "mot_world_loss_weighted",
+                world_raw,
+            ).detach()
+            text_weighted = output_dict.get(
+                "mot_text_loss_weighted",
+                text_raw,
+            ).detach()
+            metrics = {
                 "train/task": "world_action_mot",
                 "train/loss_total": float(total_loss.detach()),
-                "train/action_loss_raw": float(
-                    output_dict["mot_action_loss_raw"].detach()
-                ),
-                "train/world_loss_raw": float(
-                    output_dict["mot_world_loss_raw"].detach()
-                ),
-                "train/text_loss_raw": float(
-                    output_dict["mot_text_loss_raw"].detach()
-                ),
-                "train/text_annotated_count": float(
-                    output_dict["mot_text_annotated_count"].detach()
+                # Un-suffixed curves are the actual weighted objectives used
+                # by backward. Explicit raw curves remain available for loss
+                # scale/debug audits.
+                "train/action_loss": float(action_weighted),
+                "train/world_loss": float(world_weighted),
+                "train/text_loss": float(text_weighted),
+                "train/action_loss_raw": float(action_raw),
+                "train/world_loss_raw": float(world_raw),
+                "train/text_loss_raw": float(text_raw),
+                "train/action_loss_weighted": float(action_weighted),
+                "train/world_loss_weighted": float(world_weighted),
+                "train/text_loss_weighted": float(text_weighted),
+                "train/text_sample_count": float(
+                    output_dict["mot_text_sample_count"].detach()
                 ),
             }
+            for source_key, metric_key in (
+                ("mot_world_loss_weight", "train/world_loss_weight"),
+                ("mot_text_loss_weight", "train/text_loss_weight"),
+                ("mot_text_decision_loss", "train/text_decision_loss"),
+                (
+                    "mot_text_update_body_loss",
+                    "train/text_update_body_loss",
+                ),
+                (
+                    "mot_text_decision_accuracy",
+                    "train/text_decision_accuracy",
+                ),
+                ("mot_text_update_count", "train/text_update_count"),
+                (
+                    "mot_text_scheduled_probability",
+                    "train/text_scheduled_probability",
+                ),
+                (
+                    "mot_text_scheduled_count",
+                    "train/text_scheduled_count",
+                ),
+                (
+                    "mot_text_scheduled_update_count",
+                    "train/text_scheduled_update_count",
+                ),
+            ):
+                value = output_dict.get(source_key)
+                if value is not None:
+                    metrics[metric_key] = float(value.detach())
+            return metrics
         if "coflow_action_loss_raw" not in output_dict:
             value = float(total_loss.detach())
             return {
@@ -1594,6 +1751,184 @@ class VLATrainer(TrainerUtils):
         except Exception:
             pass
         return self._last_clip_norm
+
+    @staticmethod
+    def _shared_vlm_interface_tensors(interface_tensors) -> tuple[torch.Tensor, ...]:
+        if not isinstance(interface_tensors, (tuple, list)):
+            raise TypeError("mot_shared_vlm_interface must be a tuple/list of tensors")
+        tracked = tuple(
+            tensor
+            for tensor in interface_tensors
+            if torch.is_tensor(tensor) and tensor.requires_grad
+        )
+        if not tracked:
+            raise RuntimeError(
+                "shared-VLM interface gradient diagnostics found no differentiable "
+                "planner-query tensors"
+            )
+        return tracked
+
+    @staticmethod
+    def _shared_vlm_interface_metrics_from_gradients(
+        tracked: tuple[torch.Tensor, ...],
+        action_grads,
+        world_grads,
+    ) -> dict[str, float]:
+        if len(action_grads) != len(tracked) or len(world_grads) != len(tracked):
+            raise ValueError("shared-VLM gradient tuples must match interface tensors")
+        squared_norms = torch.zeros(2, device=tracked[0].device, dtype=torch.float32)
+        for action_grad, world_grad in zip(
+            action_grads,
+            world_grads,
+            strict=True,
+        ):
+            if action_grad is None and world_grad is None:
+                continue
+            action_float = (
+                action_grad.detach().float()
+                if action_grad is not None
+                else None
+            )
+            world_float = (
+                world_grad.detach().float()
+                if world_grad is not None
+                else None
+            )
+            if action_float is not None:
+                squared_norms[0] += torch.sum(action_float.square())
+            if world_float is not None:
+                squared_norms[1] += torch.sum(world_float.square())
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(squared_norms, op=dist.ReduceOp.SUM)
+
+        return {
+            "train/shared_vlm_interface_grad_norm_action": float(
+                squared_norms[0].clamp_min(0.0).sqrt()
+            ),
+            "train/shared_vlm_interface_grad_norm_world": float(
+                squared_norms[1].clamp_min(0.0).sqrt()
+            ),
+        }
+
+    @staticmethod
+    def _shared_vlm_interface_gradient_metrics(
+        action_objective: torch.Tensor,
+        world_objective: torch.Tensor,
+        interface_tensors,
+    ) -> dict[str, float]:
+        """Standalone exact metric helper retained for audits and unit tests."""
+
+        if not torch.is_tensor(action_objective) or action_objective.ndim != 0:
+            raise ValueError("mot_action_objective must be a scalar tensor")
+        if not torch.is_tensor(world_objective) or world_objective.ndim != 0:
+            raise ValueError("mot_world_objective must be a scalar tensor")
+        tracked = VLATrainer._shared_vlm_interface_tensors(interface_tensors)
+        action_grads = torch.autograd.grad(
+            action_objective,
+            tracked,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        world_grads = torch.autograd.grad(
+            world_objective,
+            tracked,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        return VLATrainer._shared_vlm_interface_metrics_from_gradients(
+            tracked,
+            action_grads,
+            world_grads,
+        )
+
+    @staticmethod
+    def _prepare_shared_vlm_interface_gradient_probe(
+        action_objective: torch.Tensor,
+        world_objective: torch.Tensor,
+        interface_tensors,
+    ):
+        """Prepare one auxiliary gradient before the real optimizer backward.
+
+        The real backward already produces ``g_action + g_world`` at every
+        retained planner-query tensor.  Computing only ``g_world`` here lets
+        finalization recover ``g_action = g_total - g_world`` exactly, cutting
+        the diagnostic from two auxiliary branch backwards to one.  The world
+        expert is the smaller branch in the RoboDojo MoT recipes.
+        """
+
+        if not torch.is_tensor(action_objective) or action_objective.ndim != 0:
+            raise ValueError("mot_action_objective must be a scalar tensor")
+        if not torch.is_tensor(world_objective) or world_objective.ndim != 0:
+            raise ValueError("mot_world_objective must be a scalar tensor")
+        tracked = VLATrainer._shared_vlm_interface_tensors(interface_tensors)
+        if any(tensor.is_leaf for tensor in tracked):
+            raise RuntimeError(
+                "optimized shared-VLM diagnostics require non-leaf planner-query "
+                "interface tensors so retained gradients cannot alias parameters"
+            )
+        for tensor in tracked:
+            tensor.retain_grad()
+        world_grads = torch.autograd.grad(
+            world_objective,
+            tracked,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        # ``retain_grad`` installs hooks that also observe ``autograd.grad``;
+        # clear those auxiliary values so the subsequent real backward stores
+        # only g_total rather than g_world + g_total.
+        for tensor in tracked:
+            tensor.grad = None
+        return tracked, world_grads
+
+    @staticmethod
+    def _finalize_shared_vlm_interface_gradient_probe(
+        probe,
+    ) -> dict[str, float]:
+        """Recover exact per-task interface gradients after the real backward."""
+
+        tracked, world_grads = probe
+        total_grads = tuple(tensor.grad for tensor in tracked)
+        for tensor in tracked:
+            tensor.grad = None
+
+        action_grads = []
+        for total_grad, world_grad in zip(total_grads, world_grads, strict=True):
+            if total_grad is None:
+                if world_grad is not None:
+                    raise RuntimeError(
+                        "real optimizer backward did not retain a shared-VLM "
+                        "interface gradient required by the diagnostic"
+                    )
+                action_grads.append(None)
+            elif world_grad is None:
+                action_grads.append(total_grad)
+            else:
+                action_grads.append(total_grad - world_grad)
+
+        return VLATrainer._shared_vlm_interface_metrics_from_gradients(
+            tracked,
+            tuple(action_grads),
+            world_grads,
+        )
+
+    def _should_measure_shared_vlm_interface_gradients(
+        self,
+        *,
+        sync_gradients: bool,
+    ) -> bool:
+        return bool(
+            sync_gradients
+            and getattr(
+                self,
+                "_shared_vlm_gradient_diagnostics_enabled",
+                False,
+            )
+            and (self.completed_steps + 1)
+            % int(self._shared_vlm_gradient_diagnostics_interval)
+            == 0
+        )
 
     def _backward_for_current_step(self, loss: torch.Tensor, *, sync: bool) -> None:
         """Backward without letting Accelerate step before strict clipping.
@@ -1749,16 +2084,19 @@ class VLATrainer(TrainerUtils):
         progress_bar = tqdm(
             total=self.config.trainer.max_train_steps,
             initial=self.completed_steps,
-            disable=not self.accelerator.is_local_main_process,
+            # AIDI merges stdout from every node.  ``is_local_main_process``
+            # therefore produced one duplicate progress bar per machine.
+            disable=not self.accelerator.is_main_process,
         )
 
         while self.completed_steps < self.config.trainer.max_train_steps:
             t_start_data = time.perf_counter()
             batch_vla = self._get_next_batch()
+            batch_semantic = self._get_next_semantic_batch()
             t_end_data = time.perf_counter()
 
             t_start_model = time.perf_counter()
-            step_metrics = self._train_step(batch_vla)
+            step_metrics = self._train_step(batch_vla, batch_semantic=batch_semantic)
             t_end_model = time.perf_counter()
             data_elapsed = t_end_data - t_start_data
             model_elapsed = t_end_model - t_start_model
@@ -1772,7 +2110,7 @@ class VLATrainer(TrainerUtils):
             # Show one progress record per optimizer step. With accumulation,
             # printing every micro-batch duplicates the same step number and
             # makes the task stream look like alternating optimization.
-            if did_optimizer_step and self.accelerator.is_local_main_process:
+            if did_optimizer_step and self.accelerator.is_main_process:
                 progress_bar.set_postfix(
                     {
                         "rank": self.accelerator.process_index,
@@ -1926,9 +2264,10 @@ class VLATrainer(TrainerUtils):
         was_training = bool(base_model.training)
         base_model.eval()
         try:
-            output_dict = base_model.predict_action(
-                examples=examples, use_ddim=True, num_ddim_steps=20
-            )
+            # Let each framework use its configured inference schedule.  The
+            # previous hard-coded 20 overrode RoboDojo MoT's train/deploy
+            # contract of 10 steps.
+            output_dict = base_model.predict_action(examples=examples, use_ddim=True)
         finally:
             if was_training:
                 base_model.train()
@@ -1953,13 +2292,25 @@ class VLATrainer(TrainerUtils):
             logger.info(f"  Gradient accumulation steps = {self.accelerator.gradient_accumulation_steps}")
             logger.info(f"  Total batch size = {self.total_batch_size}")
 
-    def _train_step(self, batch_vla, batch_vlm=None):
+    def _train_step(self, batch_vla, batch_vlm=None, batch_semantic=None):
         """Execute single training step."""
         with self.accelerator.accumulate(self.model):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 #######
                 jointflow_task = self._sample_jointflow_task()
-                if jointflow_task is not None:
+                if batch_semantic is not None:
+                    if jointflow_task is not None:
+                        raise RuntimeError(
+                            "Event-memory semantic NTP cannot be combined with the "
+                            "alternating JointFlow task sampler"
+                        )
+                    output_dict = self.model.forward(
+                        batch_vla,
+                        semantic_examples=batch_semantic,
+                        global_step=self.completed_steps,
+                    )
+                    total_loss = output_dict["action_loss"]
+                elif jointflow_task is not None:
                     output_dict = self.model.forward(
                         batch_vla,
                         task=jointflow_task,
@@ -1993,7 +2344,38 @@ class VLATrainer(TrainerUtils):
                 #######
 
             sync = bool(self.accelerator.sync_gradients)
+            will_log = self._is_log_step(sync)
+            shared_vlm_gradient_metrics: dict[str, float] = {}
+            shared_vlm_gradient_probe = None
+            if self._should_measure_shared_vlm_interface_gradients(
+                sync_gradients=sync
+            ):
+                required = (
+                    "mot_action_objective",
+                    "mot_world_objective",
+                    "mot_shared_vlm_interface",
+                )
+                missing = [key for key in required if key not in output_dict]
+                if missing:
+                    raise RuntimeError(
+                        "Shared-VLM gradient diagnostics require World--Action "
+                        f"MoT outputs {missing}; active output keys="
+                        f"{sorted(output_dict)}"
+                    )
+                shared_vlm_gradient_probe = (
+                    self._prepare_shared_vlm_interface_gradient_probe(
+                        output_dict["mot_action_objective"],
+                        output_dict["mot_world_objective"],
+                        output_dict["mot_shared_vlm_interface"],
+                    )
+                )
             self._backward_for_current_step(total_loss, sync=sync)
+            if shared_vlm_gradient_probe is not None:
+                shared_vlm_gradient_metrics = (
+                    self._finalize_shared_vlm_interface_gradient_probe(
+                        shared_vlm_gradient_probe,
+                    )
+                )
 
             #######
             independent_clipping = bool(
@@ -2011,7 +2393,6 @@ class VLATrainer(TrainerUtils):
                     except Exception:
                         self._last_clip_norm = None
 
-            will_log = self._is_log_step(sync)
             if will_log and independent_clip_metrics:
                 action_norm = independent_clip_metrics[
                     "train/grad_norm_preclip/action"
@@ -2063,7 +2444,7 @@ class VLATrainer(TrainerUtils):
                 #######
 
             #######
-            grad_metrics = {}
+            grad_metrics = dict(shared_vlm_gradient_metrics)
             if will_log and independent_clip_metrics:
                 grad_metrics.update(
                     {
@@ -2140,6 +2521,19 @@ def main(cfg) -> None:
     cfg = wrap_config(cfg)
     logger.info("✅ Configuration wrapped for access tracking")
 
+    reproduction_profile = str(
+        cfg.framework.get("reproduction_profile", "") or ""
+    )
+    if reproduction_profile:
+        from starVLA.reproducibility.robodojo_rynn50k import (
+            ROBODOJO_RYNN50K_PROFILE,
+            validate_config as validate_robodojo_rynn50k_config,
+        )
+
+        if reproduction_profile == ROBODOJO_RYNN50K_PROFILE:
+            reproduction_summary = validate_robodojo_rynn50k_config(cfg)
+            logger.info("Frozen reproduction contract verified: %s", reproduction_summary)
+
     output_dir = setup_directories(cfg=cfg)
     if bool(cfg.trainer.get("seed_before_model_init", False)):
         # Opt-in for controlled ablations.  Use one common construction seed
@@ -2150,9 +2544,25 @@ def main(cfg) -> None:
         set_seed(construction_seed)
         logger.info("Deterministic model construction seed=%d", construction_seed)
     vla = build_framework(cfg)
-    vla_train_dataloader, vla_val_dataloader = prepare_data(
+    (
+        vla_train_dataloader,
+        semantic_train_dataloader,
+        vla_val_dataloader,
+    ) = prepare_data(
         cfg=cfg, accelerator=accelerator, output_dir=output_dir
     )
+    if reproduction_profile == "robodojo_rynnbrain11_causal_dino_mot_50k_v1":
+        from starVLA.reproducibility.robodojo_rynn50k import (
+            validate_dataset_statistics as validate_robodojo_rynn50k_statistics,
+        )
+
+        stats_sha256 = validate_robodojo_rynn50k_statistics(
+            output_dir / "dataset_statistics.json"
+        )
+        logger.info(
+            "Frozen RoboDojo v1 statistics verified: sha256=%s",
+            stats_sha256,
+        )
     #######
     action_cfg = getattr(getattr(cfg, "framework", None), "action_model", None)
     if (
@@ -2291,6 +2701,7 @@ def main(cfg) -> None:
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         accelerator=accelerator,
+        semantic_train_dataloader=semantic_train_dataloader,
         vla_val_dataloader=vla_val_dataloader,
     )
 

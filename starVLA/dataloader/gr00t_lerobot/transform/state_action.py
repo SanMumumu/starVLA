@@ -18,9 +18,13 @@ import random
 from typing import Any, ClassVar
 
 import numpy as np
-import pytorch3d.transforms as pt
 import torch
 from pydantic import Field, PrivateAttr, field_validator, model_validator
+
+try:
+    import pytorch3d.transforms as pt
+except ImportError:  # RoboDojo's absolute joint-position recipe does not need it.
+    pt = None
 
 from ..schema import DatasetMetadata, RotationType, StateActionMetadata
 from .base import InvertibleModalityTransform, ModalityTransform
@@ -37,6 +41,11 @@ class RotationTransform:
 
         Always use matrix as intermediate representation.
         """
+        if pt is None:
+            raise ImportError(
+                "pytorch3d is required only when converting rotation representations; "
+                "install pytorch3d or use a state/action schema without rotation conversion"
+            )
         if from_rep.startswith("euler_angles"):
             from_convention = from_rep.split("_")[-1]
             from_rep = "euler_angles"

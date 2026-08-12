@@ -219,7 +219,7 @@ def test_fastwam_checkpoint_sample_and_direct_sampler() -> None:
         checkpoint = run_dir / "checkpoints/steps_1_pytorch_model.pt"
         checkpoint.parent.mkdir(parents=True)
         checkpoint.touch()
-        source_config = REPO_ROOT / "examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam.yaml"
+        source_config = REPO_ROOT / "examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam_old.yaml"
         (run_dir / "config.yaml").write_text(source_config.read_text(encoding="utf-8"), encoding="utf-8")
         (run_dir / "dataset_statistics.json").write_text(stats_path.read_text(encoding="utf-8"), encoding="utf-8")
         from deployment.model_server.policy_norm_processor import PolicyNormProcessor
@@ -359,12 +359,181 @@ def test_fastwam_action_world_coflow_h16_single_future_contract() -> None:
             )
 
 
+def test_fastwam_jointflow_adapter_for_rynn_base_pretraining() -> None:
+    """Rynn pretraining keeps FastWAM stats/order and emits JointFlow fields."""
+
+    from starVLA.dataloader.jointflow.joint_dataset import (
+        JointFastWAMRobotWinDataset,
+        build_joint_dataloader,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_fixture(root)
+        data_cfg = _config(
+            root,
+            data_mix="robotwin_fastwam_h16",
+            image_layout="fastwam_composite",
+            composite_source_view_keys=[
+                "video.cam_high",
+                "video.cam_left_wrist",
+                "video.cam_right_wrist",
+            ],
+            composite_view_key="video.robotwin_composite",
+            include_state=False,
+            action_horizon=16,
+            world_model={"future_stride": 16},
+            future_valid_requires_full_stride=True,
+            decode_future_video=True,
+            online_dino=True,
+            dino_target_latents=False,
+            obs_image_size=[320, 384],
+            per_device_batch_size=2,
+            num_workers=0,
+            pin_memory=False,
+        )
+        cfg = OmegaConf.create(
+            {
+                "seed": 42,
+                "datasets": {"vla_data": OmegaConf.to_container(data_cfg)},
+            }
+        )
+        loader = build_joint_dataloader(cfg)
+        dataset = loader.dataset
+        assert isinstance(dataset, JointFastWAMRobotWinDataset)
+        assert isinstance(loader.sampler, FastWAMEpochSampler)
+        assert dataset.modality_keys["action"] == [
+            "action.left_joints",
+            "action.left_gripper",
+            "action.right_joints",
+            "action.right_gripper",
+        ]
+        assert dataset.delta_indices["action.left_joints"].tolist() == list(
+            range(16)
+        )
+        assert dataset.delta_indices["video.cam_high"].tolist() == [0, 16]
+        _mock_video(dataset)
+
+        sample = dataset._pack_sample(
+            dataset.transforms(dataset.get_step_data(0, 35))
+        )
+        assert sample["action"].shape == (16, 14)
+        assert sample["action"].dtype == np.float32
+        assert sample["action_is_pad"].shape == (16,)
+        assert int(sample["action_is_pad"].sum()) == 11
+        assert sample["image_0"].shape == (1, 384, 320, 3)
+        assert sample["image_1"].shape == (1, 384, 320, 3)
+        assert sample["dino_view_keys"] == ["video.robotwin_composite"]
+        assert sample["future_valid"] is False
+        assert "state" not in sample
+
+        stats_path = root / "jointflow_statistics.json"
+        dataset.save_dataset_statistics(stats_path)
+        stats = json.loads(stats_path.read_text(encoding="utf-8"))
+        action_stats = stats[next(iter(stats))]["action"]
+        assert action_stats["min"] == list(range(14))
+        assert action_stats["mask"] == [True] * 14
+
+
+def test_rynn_h50_config_uses_fastwam_release_abi_and_aligned_world_stride() -> None:
+    """The production RoboTwin Rynn recipe must not fall back to H32 indices."""
+
+    from starVLA.dataloader.gr00t_lerobot.registry import (
+        DATASET_NAMED_MIXTURES,
+        ROBOT_TYPE_CONFIG_MAP,
+    )
+
+    config_path = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h50_50k.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    framework = config["framework"]
+    data = config["datasets"]["vla_data"]
+
+    assert framework["name"] == "QwenWorldActionMoT"
+    assert framework["planner"]["num_action_queries"] == 50
+    assert framework["action_model"]["action_horizon"] == 50
+    assert data["action_horizon"] == 50
+    assert data["world_model"]["future_stride"] == 50
+    assert data["data_mix"] == "robotwin_fastwam_h50"
+    assert data["image_layout"] == "fastwam_composite"
+    assert data["composite_view_key"] == "video.robotwin_composite"
+    assert data["fastwam_direct_frame_sampling"] is True
+    assert data["fastwam_expected_fps"] == 50
+    assert data["fastwam_val_fraction"] == 0.01
+    assert data["fastwam_split_seed"] == 42
+    assert data["per_device_batch_size"] == 16
+    assert config["trainer"]["expected_global_batch_size"] == 1024
+
+    robot_type = DATASET_NAMED_MIXTURES["robotwin_fastwam_h50"][0][2]
+    assert robot_type == "robotwin_fastwam_h50"
+    h50_data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
+    assert h50_data_config.action_indices == list(range(50))
+    assert h50_data_config.action_keys == [
+        "action.left_joints",
+        "action.left_gripper",
+        "action.right_joints",
+        "action.right_gripper",
+    ]
+
+
+def test_fastwam_jointflow_h50_emits_aligned_action_and_world_indices() -> None:
+    from starVLA.dataloader.jointflow.joint_dataset import (
+        JointFastWAMRobotWinDataset,
+        build_joint_dataloader,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_fixture(root)
+        data_cfg = _config(
+            root,
+            data_mix="robotwin_fastwam_h50",
+            image_layout="fastwam_composite",
+            composite_source_view_keys=[
+                "video.cam_high",
+                "video.cam_left_wrist",
+                "video.cam_right_wrist",
+            ],
+            composite_view_key="video.robotwin_composite",
+            include_state=True,
+            action_horizon=50,
+            world_model={"future_stride": 50},
+            future_valid_requires_full_stride=True,
+            decode_future_video=True,
+            online_dino=True,
+            dino_target_latents=False,
+            obs_image_size=[320, 384],
+            per_device_batch_size=2,
+            num_workers=0,
+            pin_memory=False,
+        )
+        cfg = OmegaConf.create(
+            {
+                "seed": 42,
+                "datasets": {"vla_data": OmegaConf.to_container(data_cfg)},
+            }
+        )
+        dataset = build_joint_dataloader(cfg).dataset
+        assert isinstance(dataset, JointFastWAMRobotWinDataset)
+        assert dataset.delta_indices["action.left_joints"].tolist() == list(range(50))
+        assert dataset.delta_indices["video.cam_high"].tolist() == [0, 50]
+        _mock_video(dataset)
+
+        sample = dataset._pack_sample(dataset.transforms(dataset.get_step_data(0, 35)))
+        assert sample["action"].shape == (50, 14)
+        assert sample["action_is_pad"].shape == (50,)
+        assert int(sample["action_is_pad"].sum()) == 45
+        assert sample["state"].shape == (1, 14)
+        assert sample["image_0"].shape == (1, 384, 320, 3)
+        assert sample["image_1"].shape == (1, 384, 320, 3)
+        assert sample["future_valid"] is False
+
+
 def test_fastwam_train_infer_order_and_contract() -> None:
     from deployment.model_server.policy_wrapper import PolicyServerWrapper
     from examples.Robotwin.eval_files.model2robotwin_fastwam_interface import FastWAMRobotWinModelClient
     from examples.Robotwin.eval_files.model2robotwin_interface import resolve_replan_steps
 
-    config_path = REPO_ROOT / "examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam.yaml"
+    config_path = REPO_ROOT / "examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam_old.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert PolicyServerWrapper._config_expects_state(config)
     assert resolve_replan_steps(24, 32) == 24
@@ -660,7 +829,7 @@ def test_robotwin_causal_query_and_coflow_yaml_contracts() -> None:
 
     config_dir = REPO_ROOT / "examples/Robotwin/train_files"
     cfg = yaml.safe_load(
-        (config_dir / "robotwin_wam_query_warmup.yaml").read_text(encoding="utf-8")
+        (config_dir / "robotwin_wam_query_warmup_old.yaml").read_text(encoding="utf-8")
     )
     action_cfg = cfg["framework"]["action_model"]
     dino_cfg = cfg["framework"]["dino"]
@@ -756,7 +925,7 @@ def test_coflow_checkpoint_verifier_accepts_only_h16_single_bridge() -> None:
 
 
 def test_robodojo_train_and_deploy_contracts() -> None:
-    """RoboDojo must keep one 25 Hz state/image/action ABI end to end."""
+    """RoboDojo must keep one 25 Hz image/action ABI end to end."""
 
     from starVLA.dataloader.gr00t_lerobot.registry import (
         DATASET_NAMED_MIXTURES,
@@ -764,81 +933,94 @@ def test_robodojo_train_and_deploy_contracts() -> None:
     )
     from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
 
-    train_dir = REPO_ROOT / "examples/RoboDojo/train_files"
+    train_dir = REPO_ROOT / "examples/RoboDojo/train_files/released_rynn50k"
+    config_contracts = {
+        "rynn_base_h25_50k.yaml": (False, False, True, False, False),
+        "rynn_base_history_h25_mem_50k.yaml": (False, True, False, False, True),
+        "rynn_base_text_h25_mem_50k.yaml": (True, True, False, True, False),
+        "rynn_base_text_h25_mem_bf16_50k.yaml": (True, True, False, False, False),
+    }
     configs = {
         name: yaml.safe_load((train_dir / name).read_text(encoding="utf-8"))
-        for name in (
-            "starvla_qwengroot_robodojo_baseline.yaml",
-            "mot_base.yaml",
-            "mot_joint.yaml",
-            "rynn_base.yaml",
-            "rynn_joint.yaml",
-        )
+        for name in config_contracts
     }
     source_views = ["video.cam_high", "video.cam_left_wrist", "video.cam_right_wrist"]
-    for cfg in configs.values():
+    for name, cfg in configs.items():
+        (
+            planner_text_enabled,
+            data_text_enabled,
+            action_eval_enabled,
+            fp32_shell,
+            mem_encoder,
+        ) = config_contracts[name]
         action_cfg = cfg["framework"]["action_model"]
         data_cfg = cfg["datasets"]["vla_data"]
+        trainer_cfg = cfg["trainer"]
+        physical_cfg = cfg["framework"]["world_action_mot"]
         assert action_cfg["action_dim"] == 14
-        assert action_cfg["action_horizon"] == 16
+        assert action_cfg["action_horizon"] == 25
         assert data_cfg["data_root_dir"] == "/horizon-bucket/robot_lab/users/sen.wang-labs/RoboDojo"
         assert data_cfg["video_backend"] == "pyav"
         assert data_cfg["composite_source_view_keys"] == source_views
         assert data_cfg["obs_image_size"] == [320, 384]
-
-    baseline = configs["starvla_qwengroot_robodojo_baseline.yaml"]
-    mot_configs = [
-        configs["mot_base.yaml"],
-        configs["mot_joint.yaml"],
-        configs["rynn_base.yaml"],
-        configs["rynn_joint.yaml"],
-    ]
-    assert baseline["datasets"]["vla_data"]["data_mix"] == "robodojo_v21"
-    assert baseline["datasets"]["vla_data"]["dataset_py"] == "lerobot_datasets"
-    assert baseline["datasets"]["vla_data"]["image_layout"] == "fastwam_composite"
-    assert baseline["datasets"]["vla_data"]["composite_view_key"] == "video.fastwam_composite"
-    assert baseline["framework"]["action_model"]["state_dim"] == 14
-    assert baseline["datasets"]["vla_data"]["include_state"] is True
-    assert "correlation_cholesky_path" not in baseline["framework"]["action_model"]
-    for cfg in mot_configs:
+        assert data_cfg["per_device_batch_size"] == 12
+        assert trainer_cfg["expected_global_batch_size"] == 768
+        assert trainer_cfg["max_train_steps"] == 50000
         assert cfg["framework"]["name"] == "QwenWorldActionMoT"
         assert cfg["framework"]["enable_world_action_mot"] is True
         assert "wam" not in cfg["framework"]
-        assert cfg["framework"]["world_action_mot"]["architecture"] == "causal_dino_mot"
-        assert cfg["framework"]["world_action_mot"]["world_hidden_size"] == 512
-        assert cfg["framework"]["world_action_mot"]["world_ffn_dim"] == 2048
-        assert cfg["framework"]["world_action_mot"]["action_hidden_size"] == 1024
-        assert cfg["framework"]["world_action_mot"]["action_ffn_dim"] == 4096
-        assert cfg["framework"]["world_action_mot"]["num_layers"] == 30
-        assert cfg["framework"]["world_action_mot"]["num_attention_heads"] == 24
-        assert cfg["framework"]["world_action_mot"]["attention_head_dim"] == 128
+        assert physical_cfg["architecture"] == "causal_dino_mot"
+        assert physical_cfg["interaction_mode"] == "base"
+        assert physical_cfg["world_hidden_size"] == 512
+        assert physical_cfg["world_ffn_dim"] == 2048
+        assert physical_cfg["action_hidden_size"] == 1024
+        assert physical_cfg["action_ffn_dim"] == 4096
+        assert physical_cfg["num_layers"] == 30
+        assert physical_cfg["num_attention_heads"] == 24
+        assert physical_cfg["attention_head_dim"] == 128
+        assert physical_cfg["layerwise_planner_coupling"] is False
+        assert "world_condition_on_state" not in physical_cfg
+        assert cfg["framework"]["qwenvl"]["truncate_vlm_layers"] == 0
+        assert physical_cfg["action_prediction_type"] == "velocity"
+        assert physical_cfg["action_velocity_target"] == "noise_minus_clean"
+        assert physical_cfg["repeated_diffusion_steps"] == 1
+        assert physical_cfg["action_loss_weight"] == 1.0
+        assert physical_cfg["world_loss_weight"] == 1.0
         assert cfg["framework"]["action_model"]["state_dim"] == 14
         assert cfg["datasets"]["vla_data"]["include_state"] is True
-        assert cfg["datasets"]["vla_data"]["data_mix"] == "robodojo_v21_language_optional"
+        expected_mix = (
+            "robodojo_v21_language"
+            if data_text_enabled
+            else "robodojo_v21_language_optional"
+        )
+        assert cfg["datasets"]["vla_data"]["data_mix"] == expected_mix
         assert cfg["datasets"]["vla_data"]["dataset_py"] == "jointflow"
         assert cfg["datasets"]["vla_data"]["image_layout"] == "tri_view_composite"
         assert cfg["datasets"]["vla_data"]["composite_view_key"] == "video.tri_view_composite"
-        assert cfg["datasets"]["vla_data"]["action_horizon"] == 16
+        assert cfg["datasets"]["vla_data"]["action_horizon"] == 25
         assert cfg["datasets"]["vla_data"]["world_model"]["future_stride"] == 16
         assert cfg["datasets"]["vla_data"]["future_valid_requires_full_stride"] is True
         assert cfg["framework"]["dino"]["image_size"] == [384, 320]
         assert cfg["framework"]["dino"]["dino_pool"] == 2
         assert cfg["framework"]["dino"]["force_online"] is True
         assert cfg["framework"]["dino"]["weights"].endswith("/DINO-B/")
-        assert cfg["framework"]["world_action_mot"]["world_num_train_timesteps"] == 1000
-        assert cfg["framework"]["world_action_mot"]["action_num_train_timesteps"] == 1000
-        assert cfg["framework"]["planner"]["text_supervision"]["enabled"] is False
-        assert cfg["framework"]["world_action_mot"]["text_loss_weight"] == 0.0
-        assert cfg["datasets"]["vla_data"]["optional_text_annotations"]["enabled"] is False
-        assert cfg["datasets"]["vla_data"]["optional_text_annotations"]["require_columns"] is False
+        assert physical_cfg["world_num_train_timesteps"] == 1000
+        assert physical_cfg["action_num_train_timesteps"] == 1000
+        assert bool(cfg["framework"]["planner"]["text_supervision"]["enabled"]) is planner_text_enabled
+        assert bool(cfg["datasets"]["vla_data"]["text_annotations"]["enabled"]) is data_text_enabled
+        assert physical_cfg["text_loss_weight"] == (
+            0.005 if planner_text_enabled else 0.0
+        )
+        assert physical_cfg.get("action_precision_mode", "inherit") == (
+            "fp32_shell" if fp32_shell else "inherit"
+        )
+        assert (
+            "mem_vision_encoder" in cfg["framework"]["qwenvl"]
+        ) is mem_encoder
         assert cfg["trainer"]["seed_before_model_init"] is True
         assert cfg["trainer"]["pretrained_checkpoint"] is None
-        assert cfg["trainer"]["max_train_steps"] == 50000
-        assert cfg["trainer"]["expected_global_batch_size"] == 768
-    assert configs["mot_base.yaml"]["framework"]["world_action_mot"]["interaction_mode"] == "base"
-    assert configs["rynn_base.yaml"]["framework"]["world_action_mot"]["interaction_mode"] == "base"
-    assert configs["mot_joint.yaml"]["framework"]["world_action_mot"]["interaction_mode"] == "joint"
-    assert configs["rynn_joint.yaml"]["framework"]["world_action_mot"]["interaction_mode"] == "joint"
+        assert cfg["trainer"]["is_resume"] is False
+        assert cfg["trainer"]["action_eval_enabled"] is action_eval_enabled
 
     data_config = ROBOT_TYPE_CONFIG_MAP["robodojo_arx_x5"]
     expected_state = [
@@ -854,8 +1036,8 @@ def test_robodojo_train_and_deploy_contracts() -> None:
     assert DATASET_NAMED_MIXTURES["robodojo_v21"] == [
         ("RoboDojo_lerobot_v21_video", 1.0, "robodojo_arx_x5")
     ]
-    assert DATASET_NAMED_MIXTURES["robodojo_v21_language_optional"] == [
-        ("RoboDojo_lerobot_v21_language_v1", 1.0, "robodojo_arx_x5")
+    assert DATASET_NAMED_MIXTURES["robodojo_v21_language"] == [
+        ("RoboDojo_lerobot_v21_language_v2", 1.0, "robodojo_arx_x5")
     ]
     normalization = [
         transform
@@ -873,7 +1055,7 @@ def test_robodojo_train_and_deploy_contracts() -> None:
     model_script = (eval_dir / "robodojo_model.py").read_text(encoding="utf-8")
     assert "build_robotwin_composite" in model_script
     assert "task_instruction" in model_script
-    assert '"state": state' in model_script
+    assert 'converted["state"] = state' in model_script
     assert "Third_github" not in eval_script
 
 
@@ -882,7 +1064,7 @@ def test_robodojo_checkpoint_preflight() -> None:
 
     from examples.RoboDojo.eval_files.verify_robodojo_checkpoint_contract import verify
 
-    source = REPO_ROOT / "examples/RoboDojo/train_files/starvla_qwengroot_robodojo_baseline.yaml"
+    source = REPO_ROOT / "执行脚本/starvla_qwengroot_robodojo_baseline.yaml"
     zeros = [0.0] * 14
     stats = {
         "new_embodiment": {
@@ -929,6 +1111,7 @@ if __name__ == "__main__":
     test_fastwam_checkpoint_sample_and_direct_sampler()
     test_fastwam_split_domain_and_wam_composite_target()
     test_fastwam_action_world_coflow_h16_single_future_contract()
+    test_fastwam_jointflow_adapter_for_rynn_base_pretraining()
     test_fastwam_train_infer_order_and_contract()
     test_policy_server_metadata_exposes_loaded_gate_ft_contract()
     test_fastwam_real_cluster_config_snapshots()

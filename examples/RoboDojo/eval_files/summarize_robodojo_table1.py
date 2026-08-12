@@ -142,33 +142,106 @@ def _task_from_relative_parts(parts: tuple[str, ...]) -> str | None:
     return None
 
 
-def _matches_seed_and_checkpoint(parts: tuple[str, ...], seed: int, ckpt_name: str) -> bool:
+def _matches_legacy_seed_and_checkpoint(
+    parts: tuple[str, ...],
+    seed: int,
+    ckpt_name: str,
+) -> bool:
     prefix = f"{seed}_"
     marker = f"ckpt_name={ckpt_name},"
     return any(part.startswith(prefix) and marker in part for part in parts)
 
 
+def _nearest_run_metadata(
+    path: Path,
+    eval_root: Path,
+    cache: dict[Path, dict[str, Any] | None],
+) -> dict[str, Any] | None:
+    for parent in path.parents:
+        if parent == eval_root.parent:
+            break
+        metadata_path = parent / "run_metadata.json"
+        if metadata_path in cache:
+            metadata = cache[metadata_path]
+        elif metadata_path.is_file():
+            try:
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                metadata = payload if isinstance(payload, dict) else None
+            except (OSError, json.JSONDecodeError, TypeError):
+                metadata = None
+            cache[metadata_path] = metadata
+        else:
+            cache[metadata_path] = None
+            metadata = None
+        if metadata is not None:
+            return metadata
+        if parent == eval_root:
+            break
+    return None
+
+
+def _metadata_matches(
+    metadata: dict[str, Any],
+    *,
+    checkpoint: Path,
+    ckpt_name: str,
+    seed: int,
+) -> bool:
+    try:
+        metadata_checkpoint = Path(str(metadata["checkpoint"])).expanduser().resolve()
+        metadata_seed = int(metadata["seed"])
+    except (KeyError, TypeError, ValueError, OSError):
+        return False
+    return (
+        metadata_checkpoint == checkpoint
+        and metadata_seed == seed
+        and str(metadata.get("ckpt_name", "")) == ckpt_name
+    )
+
+
 def scan_candidates(
     eval_root: Path,
     *,
-    checkpoint_stem: str,
+    checkpoint: Path,
     ckpt_name: str,
     seed: int,
 ) -> dict[str, Candidate]:
     selected: dict[str, Candidate] = {}
     if not eval_root.is_dir():
         return selected
+    checkpoint = checkpoint.expanduser().resolve()
+    checkpoint_stem = checkpoint.stem
     run_marker = f"_{checkpoint_stem}_"
+    metadata_cache: dict[Path, dict[str, Any] | None] = {}
     for path in eval_root.rglob("_result.json"):
         try:
             relative = path.relative_to(eval_root)
         except ValueError:
             continue
         parts = relative.parts
-        if not parts or run_marker not in parts[0]:
-            continue
+        metadata = _nearest_run_metadata(path, eval_root, metadata_cache)
+        if metadata is not None:
+            if not _metadata_matches(
+                metadata,
+                checkpoint=checkpoint,
+                ckpt_name=ckpt_name,
+                seed=seed,
+            ):
+                continue
+        else:
+            # Backward compatibility for existing long-form result trees.
+            if (
+                not parts
+                or run_marker not in parts[0]
+                or not _matches_legacy_seed_and_checkpoint(
+                    parts,
+                    seed,
+                    ckpt_name,
+                )
+            ):
+                continue
         task = _task_from_relative_parts(parts)
-        if task is None or not _matches_seed_and_checkpoint(parts, seed, ckpt_name):
+        if task is None:
             continue
         episodes = load_episodes(path)
         if not episodes:
@@ -402,6 +475,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--ckpt-name", required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for table1_seedN.{md,csv,json}; defaults to eval-root.",
+    )
     return parser.parse_args()
 
 
@@ -409,21 +488,25 @@ def main() -> None:
     args = parse_args()
     checkpoint = args.checkpoint.expanduser().resolve()
     eval_root = args.eval_root.expanduser().resolve()
-    checkpoint_stem = checkpoint.stem
+    output_dir = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else eval_root
+    )
     selected = scan_candidates(
         eval_root,
-        checkpoint_stem=checkpoint_stem,
+        checkpoint=checkpoint,
         ckpt_name=args.ckpt_name,
         seed=args.seed,
     )
     task_metrics, task_status = collect_task_metrics(selected)
     dimensions = aggregate_dimensions(task_metrics)
 
-    prefix = eval_root / f"table1_{checkpoint_stem}_seed{args.seed}"
+    prefix = output_dir / f"table1_seed{args.seed}"
     markdown_path = prefix.with_suffix(".md")
     csv_path = prefix.with_suffix(".csv")
     json_path = prefix.with_suffix(".json")
-    eval_root.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     markdown = build_markdown(
         checkpoint=checkpoint,

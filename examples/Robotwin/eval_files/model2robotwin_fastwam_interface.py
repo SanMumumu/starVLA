@@ -48,9 +48,9 @@ class FastWAMRobotWinModelClient(StandardModelClient):
                 f"requested={requested_checkpoint!r}, served={served_checkpoint!r}. "
                 "Use the HOST/port belonging to this checkpoint's server job."
             )
-        if self.action_chunk_size not in {16, 32}:
+        if self.action_chunk_size not in {16, 32, 50}:
             raise RuntimeError(
-                "FastWAM adapter supports H16 closed-loop or legacy H32 checkpoints, got "
+                "FastWAM adapter supports H16 closed-loop, legacy H32, or Rynn H50 checkpoints, got "
                 f"action_chunk_size={self.action_chunk_size}"
             )
         expects_state = self.server_meta.get("expects_state")

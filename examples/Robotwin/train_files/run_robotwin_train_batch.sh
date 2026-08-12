@@ -1,80 +1,47 @@
-#!/bin/bash
-#SBATCH --job-name=ebench_baseline
-#SBATCH -p ebench_t
-#SBATCH -N 6
+#!/usr/bin/env bash
+#SBATCH --job-name=rynn_robotwin_h50_bs1024
+#SBATCH --partition=ebench_t
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=128
 #SBATCH --gres=gpu:8
-#SBATCH --output=/mnt/petrelfs/gaoning/trash/%x-%j.out
-#SBATCH --error=/mnt/petrelfs/gaoning/trash/%x-%j.err
-#SBATCH --exclude=HOST-10-140-66-29
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
 
-set -e
+set -euo pipefail
 
-# -------------------- NCCL / Networking --------------------
-export NCCL_SOCKET_IFNAME=bond0
-# For multi-node, list all available mlx5 interfaces for stability (adjust for your cluster)
-export NCCL_IB_HCA=mlx5_2,mlx5_3,mlx5_4,mlx5_5
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-export NCCL_BLOCKING_WAIT=1
-export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_TIMEOUT=3600
+if [[ "${SLURM_NNODES:?Submit this script with sbatch}" != "8" ]]; then
+  echo "[Robotwin train][ERROR] expected 8 Slurm nodes, got ${SLURM_NNODES}" >&2
+  exit 1
+fi
 
-# -------------------- Required distributed environment --------------------
+export NUM_MACHINES=8
 export GPUS_PER_NODE=8
-export TOTAL_GPUS=$((GPUS_PER_NODE * SLURM_NNODES))
+export NUM_PROCESSES=64
+if [[ -z "${MASTER_ADDR:-}" ]]; then
+  read -r MASTER_ADDR < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
+fi
+export MASTER_ADDR
+export MASTER_PORT="${MASTER_PORT:-29500}"
 
-export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
-export MASTER_PORT=$((20000 + RANDOM % 10000))
+# Cluster-specific defaults remain overridable at sbatch submission time.
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-bond0}"
+export NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_2,mlx5_3,mlx5_4,mlx5_5}"
+export NCCL_BLOCKING_WAIT="${NCCL_BLOCKING_WAIT:-1}"
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
+export NO_ALBUMENTATIONS_UPDATE="${NO_ALBUMENTATIONS_UPDATE:-1}"
 
-echo "SLURM_NNODES=$SLURM_NNODES  GPUS_PER_NODE=$GPUS_PER_NODE  TOTAL_GPUS=$TOTAL_GPUS"
-echo "MASTER_ADDR=$MASTER_ADDR  MASTER_PORT=$MASTER_PORT"
+echo "[Robotwin train] nodes=${NUM_MACHINES} gpus_per_node=${GPUS_PER_NODE} total_gpus=${NUM_PROCESSES}"
+echo "[Robotwin train] master=${MASTER_ADDR}:${MASTER_PORT}"
+echo "[Robotwin train] data=${ROBOTWIN_DATA_ROOT:-YAML default} output=${RUN_ROOT_DIR:-YAML default}"
 
-# -------------------- Your original config --------------------
-Framework_name=QwenOFT
-freeze_module_list=''
-base_vlm=playground/Pretrained_models/Qwen3-VL-4B-Instruct
-config_yaml=./examples/Robotwin/train_files/starvla_cotrain_robotwin_abs.yaml
-run_root_dir=./results/Checkpoints
-data_mix=robotwin_all_50
-run_id=0214_${data_mix}_abs_qwen3OFT_all
-
-export HF_ENDPOINT=https://hf-mirror.com
-
-output_dir=${run_root_dir}/${run_id}
-mkdir -p "${output_dir}"
-cp "$0" "${output_dir}/"
-
-source /mnt/petrelfs/gaoning/miniconda3/bin/activate
-conda activate starvla
-
-# -------------------- Key: launch accelerate once per node --------------------
-srun --jobid "$SLURM_JOBID" bash -c '
-  set -e
-  echo "Host=$(hostname)  SLURM_PROCID=$SLURM_PROCID"
-
-  accelerate launch \
-    --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-    --main_process_ip '"$MASTER_ADDR"' \
-    --main_process_port '"$MASTER_PORT"' \
-    --machine_rank $SLURM_PROCID \
-    --num_machines '"$SLURM_NNODES"' \
-    --num_processes '"$TOTAL_GPUS"' \
-    starVLA/training/train_starvla.py \
-    --config_yaml '"$config_yaml"' \
-    --framework.name '"$Framework_name"' \
-    --framework.qwenvl.base_vlm '"$base_vlm"' \
-    --datasets.vla_data.per_device_batch_size 4 \
-    --datasets.vla_data.action_type abs_qpos \
-    --datasets.vla_data.action_mode abs \
-    --datasets.vla_data.data_mix '"$data_mix"' \
-    --trainer.freeze_modules '"$freeze_module_list"' \
-    --trainer.max_train_steps 150000 \
-    --trainer.save_interval 10000 \
-    --trainer.logging_frequency 50 \
-    --trainer.eval_interval 1000 \
-    --run_root_dir '"$run_root_dir"' \
-    --run_id '"$run_id"' \
-    --wandb_project starVLA_Robotwin \
-    --wandb_entity axi-the-cat
-'
+# One launcher task per node; Accelerate starts eight local workers per task.
+srun \
+  --nodes="${NUM_MACHINES}" \
+  --ntasks="${NUM_MACHINES}" \
+  --ntasks-per-node=1 \
+  bash "${REPO_ROOT}/examples/Robotwin/train_files/run_robotwin_train.sh"

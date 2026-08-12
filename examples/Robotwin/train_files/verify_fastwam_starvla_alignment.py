@@ -12,7 +12,7 @@ import yaml
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 RUNBOOK_DIR_NAME = "\u6267\u884c\u811a\u672c"
-IID_PATH = HERE / "starvla_qwengroot_robotwin_fastwam.yaml"
+IID_PATH = HERE / "starvla_qwengroot_robotwin_fastwam_old.yaml"
 DEPLOY_PATH = REPO_ROOT / "examples/Robotwin/eval_files/deploy_policy_fastwam.yml"
 
 
@@ -104,7 +104,7 @@ def main() -> None:
     run_script = job.get("REQUIRED", {}).get("RUN_SCRIPTS")
     expected_run_script = (
         "EXPECTED_NUM_MACHINES=8 ${WORKING_PATH}/run_aidi_rbtw.sh "
-        "examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam.yaml"
+        "examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam_old.yaml"
     )
     if run_script != expected_run_script:
         errors.append(f"AIDI job launches the wrong config: {run_script!r}")

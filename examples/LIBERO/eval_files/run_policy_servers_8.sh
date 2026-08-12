@@ -8,7 +8,7 @@ CKPT="${CKPT:?Please set CKPT}"
 BASE_PORT="${BASE_PORT:-6698}"
 NUM_SERVERS="${NUM_SERVERS:-8}"
 USE_BF16="${USE_BF16:-1}"
-STRIP_DINO_KEYS="${STRIP_DINO_KEYS:-1}"
+STRIP_DINO_KEYS="${STRIP_DINO_KEYS:-0}"
 LOG_DIR="${LOG_DIR:-${STARVLA_DIR}/logs/libero_policy_servers_8}"
 
 mkdir -p "${LOG_DIR}"

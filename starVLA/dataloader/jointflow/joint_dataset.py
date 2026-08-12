@@ -32,6 +32,15 @@ from starVLA.dataloader.gr00t_lerobot.registry import EmbodimentTag, ROBOT_TYPE_
 from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
 from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionToTensor, StateActionTransform
 from starVLA.dataloader.jointflow.mix_registry import resolve_data_mix
+from starVLA.dataloader.jointflow.event_memory import (
+    SemanticBoundaryBatchSampler,
+    build_or_load_semantic_index,
+    event_memory_from_trajectory,
+)
+from starVLA.dataloader.jointflow.text_history import (
+    text_history_frame_offsets,
+    text_history_memory_from_trajectory,
+)
 from starVLA.dataloader.lerobot_datasets import collate_fn
 
 
@@ -50,8 +59,8 @@ def _cfg_get(cfg, key: str, default=None):
     return getattr(cfg, key, default)
 
 
-def _optional_text_value(value: Any) -> str:
-    """Normalize one optional parquet text cell without inventing a label."""
+def _text_value(value: Any) -> str:
+    """Normalize one parquet text cell without inventing a label."""
 
     if value is None:
         return ""
@@ -63,8 +72,8 @@ def _optional_text_value(value: Any) -> str:
     return str(value).strip()
 
 
-def optional_text_annotation_from_row(row, config) -> dict[str, Any]:
-    """Read optional current/completed-subtask labels from one parquet row."""
+def text_annotation_from_row(row, config) -> dict[str, str]:
+    """Read required current/completed-subtask labels from one parquet row."""
 
     fields = _cfg_get(
         config,
@@ -72,17 +81,18 @@ def optional_text_annotation_from_row(row, config) -> dict[str, Any]:
         {"subtask_text": "subtask_text", "completed_subtask_text": "complete_text"},
     )
     fields = dict(fields) if hasattr(fields, "items") else {}
+    if not fields:
+        raise ValueError("text_annotations.fields must contain at least one mapping")
     result = {
-        output_name: _optional_text_value(row.get(str(column_name), ""))
+        output_name: _text_value(row.get(str(column_name), ""))
         for output_name, column_name in fields.items()
     }
-    missing_values = {
-        str(value).strip().lower()
-        for value in _cfg_get(config, "missing_values", [""])
-    }
-    result["text_annotation_available"] = any(
-        value.strip().lower() not in missing_values for value in result.values()
-    )
+    missing = sorted(name for name, value in result.items() if not value)
+    if missing:
+        raise ValueError(
+            "Text-supervised RoboDojo data requires every configured annotation "
+            f"to be non-empty; missing={missing}"
+        )
     return result
 
 
@@ -185,22 +195,83 @@ class JointLiberoDataset(LeRobotSingleDataset):
         self._last_video_frames = None
         data_cfg = kwargs.get("data_cfg")
         self._action_pack_dtype = np.dtype(str(_cfg_get(data_cfg, "action_pack_dtype", "float32")))
-        self._optional_text_config = _cfg_get(data_cfg, "optional_text_annotations", {})
+        self._text_config = _cfg_get(data_cfg, "text_annotations", {})
+        self._text_history_offsets = text_history_frame_offsets(self._text_config)
         if self._action_pack_dtype not in {np.dtype("float16"), np.dtype("float32")}:
             raise ValueError(f"action_pack_dtype must be float16 or float32, got {self._action_pack_dtype}")
         super().__init__(*args, **kwargs)
 
-        if bool(_cfg_get(self._optional_text_config, "enabled", False)) and bool(
-            _cfg_get(self._optional_text_config, "require_columns", True)
-        ):
-            fields = dict(_cfg_get(self._optional_text_config, "fields", {}))
+        text_enabled = bool(_cfg_get(self._text_config, "enabled", False))
+        if text_enabled:
+            fields = dict(_cfg_get(self._text_config, "fields", {}))
+            if not fields:
+                raise ValueError(
+                    "text_annotations.enabled=true requires non-empty fields mapping"
+                )
             available = set(self.lerobot_info_meta.get("features", {}))
             missing = sorted(str(column) for column in fields.values() if str(column) not in available)
             if missing:
                 raise ValueError(
-                    "Optional text supervision requires parquet columns declared in meta/info.json; "
+                    "Text supervision requires parquet columns declared in meta/info.json; "
                     f"missing={missing}, dataset={self.dataset_path}"
                 )
+            history = _cfg_get(self._text_config, "history", {})
+            event_memory = _cfg_get(self._text_config, "event_memory", {})
+            if bool(_cfg_get(event_memory, "enabled", False)):
+                if bool(_cfg_get(history, "enabled", False)):
+                    raise ValueError(
+                        "Event-driven semantic memory and planner RGB history are "
+                        "mutually exclusive in the no-history recipe"
+                    )
+                semantic_offset = int(
+                    _cfg_get(event_memory, "semantic_offset", -10)
+                )
+                replan_interval = int(
+                    _cfg_get(event_memory, "replan_interval", 10)
+                )
+                replan_phase = int(_cfg_get(event_memory, "replan_phase", 0))
+                if semantic_offset >= 0 or abs(semantic_offset) != replan_interval:
+                    raise ValueError(
+                        "event_memory requires semantic_offset=-replan_interval, "
+                        f"got offset={semantic_offset}, interval={replan_interval}"
+                    )
+                if not 0 <= replan_phase < replan_interval:
+                    raise ValueError(
+                        "event_memory.replan_phase must lie in [0, interval), "
+                        f"got phase={replan_phase}, interval={replan_interval}"
+                    )
+            if bool(_cfg_get(history, "enabled", False)):
+                fields = dict(_cfg_get(self._text_config, "fields", {}))
+                memory_source = str(
+                    _cfg_get(
+                        history,
+                        "finished_task_list_source_field",
+                        fields.get("completed_subtask_text", "complete_text"),
+                    )
+                )
+                if memory_source not in available:
+                    raise ValueError(
+                        "Finished Task List history requires its source parquet "
+                        f"column in meta/info.json; missing={memory_source!r}, "
+                        f"dataset={self.dataset_path}"
+                    )
+                memory_offset = int(_cfg_get(history, "memory_offset", 0))
+                if memory_offset >= 0:
+                    raise ValueError(
+                        "text_annotations.history.memory_offset must be negative, "
+                        f"got {memory_offset}"
+                    )
+                image_layout = str(
+                    _cfg_get(data_cfg, "image_layout", "separate_views")
+                ).lower()
+                if image_layout not in {
+                    FASTWAM_COMPOSITE_LAYOUT,
+                    TRI_VIEW_COMPOSITE_LAYOUT,
+                }:
+                    raise ValueError(
+                        "Planner image history currently requires a composite image "
+                        f"layout, got {image_layout!r}"
+                    )
 
     @property
     def dino_dir(self) -> Path:
@@ -501,9 +572,23 @@ class JointLiberoDataset(LeRobotSingleDataset):
             "future_stride": np.int64(future_stride),
         }
 
-        if bool(_cfg_get(self._optional_text_config, "enabled", False)):
+        if bool(_cfg_get(self._text_config, "enabled", False)):
             row = self.curr_traj_data.iloc[int(self._last_base_index)]
-            sample.update(optional_text_annotation_from_row(row, self._optional_text_config))
+            sample.update(text_annotation_from_row(row, self._text_config))
+            sample.update(
+                text_history_memory_from_trajectory(
+                    self.curr_traj_data,
+                    base_index,
+                    self._text_config,
+                )
+            )
+            sample.update(
+                event_memory_from_trajectory(
+                    self.curr_traj_data,
+                    base_index,
+                    self._text_config,
+                )
+            )
 
         if self.online_dino:
             source_view_keys = list(self.modality_keys.get("video", []))
@@ -512,11 +597,36 @@ class JointLiberoDataset(LeRobotSingleDataset):
             decode_future = bool(_cfg_get(self.data_cfg, "decode_future_video", True))
             image_layout = str(_cfg_get(self.data_cfg, "image_layout", "separate_views")).lower()
             current_views, future_views = [], []
+            video_offsets = [
+                int(offset) for offset in self.delta_indices[source_view_keys[0]]
+            ]
+            for key in source_view_keys[1:]:
+                key_offsets = [int(offset) for offset in self.delta_indices[key]]
+                if key_offsets != video_offsets:
+                    raise ValueError(
+                        "All video views must share planner/history delta indices; "
+                        f"{source_view_keys[0]}={video_offsets}, {key}={key_offsets}"
+                    )
+            if 0 not in video_offsets:
+                raise ValueError(
+                    f"Decoded RGB offsets must contain the current frame, got {video_offsets}"
+                )
+            current_position = video_offsets.index(0)
+            future_position = (
+                video_offsets.index(future_stride)
+                if decode_future and future_stride in video_offsets
+                else None
+            )
             for key in source_view_keys:
                 frames = np.asarray(self._last_video_frames[key])  # [T,H,W,C]
-                current_views.append(frames[0])
+                current_views.append(frames[current_position])
                 if decode_future:
-                    future_views.append(frames[min(1, frames.shape[0] - 1)])
+                    if future_position is None:
+                        raise ValueError(
+                            "Decoded future video offset is missing from modality "
+                            f"indices: future_stride={future_stride}, offsets={video_offsets}"
+                        )
+                    future_views.append(frames[future_position])
 
             if image_layout in {
                 FASTWAM_COMPOSITE_LAYOUT,
@@ -552,6 +662,36 @@ class JointLiberoDataset(LeRobotSingleDataset):
                     [np.asarray(build_robotwin_composite(future_views), dtype=np.uint8)] if decode_future else []
                 )
                 view_keys = [composite_view_key]
+                if self._text_history_offsets:
+                    history_cfg = _cfg_get(self._text_config, "history", {})
+                    history_image_field = str(
+                        _cfg_get(
+                            history_cfg,
+                            "image_field",
+                            "planner_history_images",
+                        )
+                    )
+                    history_images = []
+                    for offset in self._text_history_offsets:
+                        if offset not in video_offsets:
+                            raise ValueError(
+                                f"Planner history offset {offset} missing from video offsets {video_offsets}"
+                            )
+                        position = video_offsets.index(offset)
+                        history_views = [
+                            np.asarray(self._last_video_frames[key])[position]
+                            for key in source_view_keys
+                        ]
+                        history_images.append(
+                            np.asarray(
+                                build_robotwin_composite(history_views),
+                                dtype=np.uint8,
+                            )
+                        )
+                    sample[history_image_field] = np.stack(
+                        history_images,
+                        axis=0,
+                    )
             else:
                 img0, img1 = [], []
                 target_size = _cfg_get(self.data_cfg, "obs_image_size", None)
@@ -612,6 +752,226 @@ class JointLiberoDataset(LeRobotSingleDataset):
 
 
 ######### // code // ##########
+class JointFastWAMRobotWinDataset(JointLiberoDataset):
+    """JointFlow sample ABI over FastWAM's aggregate RoboTwin release.
+
+    The aggregate release has a single global statistics file instead of the
+    per-task metadata layout consumed by ``JointLiberoDataset``.  This adapter
+    preserves FastWAM's release-order z-score contract and direct frame index,
+    while reusing JointFlow's current/future composite packing required by
+    ``QwenWorldActionMoT``.
+    """
+
+    _STAT_NAMES = ("min", "max", "mean", "std", "q01", "q99")
+
+    def __init__(self, *args, **kwargs) -> None:
+        data_cfg = kwargs.get("data_cfg")
+        configured_stats = _cfg_get(data_cfg, "fastwam_dataset_stats_path", None)
+        self._fastwam_stats_path = Path(str(configured_stats)) if configured_stats else None
+        self._fastwam_expected_fps = float(
+            _cfg_get(data_cfg, "fastwam_expected_fps", 50.0)
+        )
+        self._fastwam_val_fraction = float(
+            _cfg_get(data_cfg, "fastwam_val_fraction", 0.0)
+        )
+        self._fastwam_split = str(
+            _cfg_get(data_cfg, "fastwam_split", "all")
+        ).lower()
+        self._fastwam_split_seed = int(
+            _cfg_get(data_cfg, "fastwam_split_seed", 42)
+        )
+        self._fastwam_domain = str(
+            _cfg_get(data_cfg, "fastwam_domain", "all")
+        ).lower()
+        if not 0.0 <= self._fastwam_val_fraction < 1.0:
+            raise ValueError(
+                "fastwam_val_fraction must be in [0,1), got "
+                f"{self._fastwam_val_fraction}"
+            )
+        if self._fastwam_split not in {"all", "train", "val", "validation"}:
+            raise ValueError(f"Unsupported fastwam_split={self._fastwam_split!r}")
+        if self._fastwam_domain not in {"all", "clean", "random", "randomized"}:
+            raise ValueError(f"Unsupported fastwam_domain={self._fastwam_domain!r}")
+        super().__init__(*args, **kwargs)
+        self._trajectory_index_by_id = {
+            int(trajectory_id): index
+            for index, trajectory_id in enumerate(self.trajectory_ids)
+        }
+
+    def _get_metadata(self, embodiment_tag: EmbodimentTag):
+        from starVLA.dataloader.fastwam_robotwin_dataset import (
+            build_fastwam_dataset_metadata,
+        )
+
+        stats_path = self._fastwam_stats_path
+        if stats_path is not None and not stats_path.is_absolute():
+            stats_path = self.dataset_path / stats_path
+        return build_fastwam_dataset_metadata(
+            self.dataset_path,
+            embodiment_tag,
+            stats_path=stats_path,
+            expected_fps=self._fastwam_expected_fps,
+        )
+
+    def _get_lerobot_modality_meta(self):
+        from starVLA.dataloader.fastwam_robotwin_dataset import (
+            _build_modality_metadata,
+        )
+
+        return _build_modality_metadata()
+
+    def _get_trajectories(self) -> tuple[np.ndarray, np.ndarray]:
+        from starVLA.dataloader.fastwam_robotwin_dataset import _episode_domain
+
+        episodes_path = self.dataset_path / "meta" / "episodes.jsonl"
+        with episodes_path.open("r", encoding="utf-8") as handle:
+            episodes = [json.loads(line) for line in handle if line.strip()]
+
+        wanted_domain = (
+            "randomized"
+            if self._fastwam_domain == "random"
+            else self._fastwam_domain
+        )
+        if wanted_domain != "all":
+            classified = [
+                (episode, _episode_domain(episode)) for episode in episodes
+            ]
+            unknown = [
+                episode.get("episode_index")
+                for episode, domain in classified
+                if domain is None
+            ]
+            if unknown:
+                raise ValueError(
+                    "fastwam_domain filtering requires Clean/Randomized "
+                    "provenance in meta/episodes.jsonl; "
+                    f"{len(unknown)} episodes are unclassified, first={unknown[:5]}"
+                )
+            episodes = [
+                episode
+                for episode, domain in classified
+                if domain == wanted_domain
+            ]
+
+        if not episodes:
+            raise ValueError(
+                "No FastWAM episodes remain after "
+                f"fastwam_domain={self._fastwam_domain}"
+            )
+
+        if self._fastwam_split != "all" and self._fastwam_val_fraction > 0:
+            split_index = int(
+                len(episodes) * (1.0 - self._fastwam_val_fraction)
+            )
+            order = list(range(len(episodes)))
+            rng = np.random.default_rng(self._fastwam_split_seed)
+            rng.shuffle(order)
+            chosen = (
+                order[:split_index]
+                if self._fastwam_split == "train"
+                else order[split_index:]
+            )
+            episodes = [episodes[index] for index in chosen]
+
+        trajectory_ids = np.asarray(
+            [int(episode["episode_index"]) for episode in episodes],
+            dtype=np.int64,
+        )
+        trajectory_lengths = np.asarray(
+            [int(episode["length"]) for episode in episodes],
+            dtype=np.int64,
+        )
+        return trajectory_ids, trajectory_lengths
+
+    def _get_all_steps(self):
+        from starVLA.dataloader.fastwam_robotwin_dataset import LazyEpisodeSteps
+
+        return LazyEpisodeSteps(self.trajectory_ids, self.trajectory_lengths)
+
+    def _pack_sample(self, data: dict) -> dict:
+        sample = super()._pack_sample(data)
+        trajectory_id = int(self._last_trajectory_id)
+        base_index = int(self._last_base_index)
+        trajectory_index = self.get_trajectory_index(trajectory_id)
+        trajectory_length = int(self.trajectory_lengths[trajectory_index])
+        action_key = self.modality_keys["action"][0]
+        action_offsets = np.asarray(self.delta_indices[action_key], dtype=np.int64)
+        sample["action_is_pad"] = (
+            base_index + action_offsets >= trajectory_length
+        )
+        return sample
+
+    def save_dataset_statistics(
+        self,
+        save_path: Path | str,
+        format: str = "json",  # noqa: A002 - public dataset API
+    ) -> None:
+        """Save statistics in the exact release-order deployment contract."""
+
+        if format.lower() != "json":
+            raise ValueError(f"Unsupported statistics format: {format}")
+
+        def combine(modality: str) -> dict[str, list]:
+            stats = getattr(self.metadata.statistics, modality)
+            keys = [
+                key.split(".", 1)[1]
+                for key in self.modality_keys[modality]
+            ]
+            return {
+                stat_name: np.concatenate(
+                    [
+                        np.asarray(
+                            getattr(stats[key], stat_name),
+                            dtype=np.float64,
+                        )
+                        for key in keys
+                    ]
+                ).tolist()
+                for stat_name in self._STAT_NAMES
+            }
+
+        action_stats = combine("action")
+        action_stats["mask"] = [True] * sum(
+            int(np.prod(self.metadata.modalities.action[key].shape))
+            for key in [
+                name.split(".", 1)[1]
+                for name in self.modality_keys["action"]
+            ]
+        )
+        payload = {
+            self.tag: {
+                "action": action_stats,
+                "state": combine("state"),
+                "num_transitions": len(self),
+                "num_trajectories": len(self.trajectory_ids),
+            }
+        }
+        path = Path(save_path)
+        if path.suffix != ".json":
+            path = path.with_suffix(".json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+        print(f"FastWAM JointFlow statistics saved to: {path}")
+
+    def get_trajectory_index(self, trajectory_id: int) -> int:
+        try:
+            return self._trajectory_index_by_id[int(trajectory_id)]
+        except AttributeError:
+            # Initialization queries trajectories before this lookup exists.
+            return int(super().get_trajectory_index(trajectory_id))
+        except KeyError as exc:
+            raise ValueError(f"Unknown trajectory id: {trajectory_id}") from exc
+
+    def get_trajectory_data(self, trajectory_id: int):
+        trajectory_id = int(trajectory_id)
+        data = super().get_trajectory_data(trajectory_id)
+        self.curr_traj_id = trajectory_id
+        self.curr_traj_data = data
+        return data
+
+
+######### // code // ##########
 def _make_joint_single_dataset(
     dataset_path: Path, robot_type: str, data_cfg, online_dino: bool | None = None
 ) -> JointLiberoDataset:
@@ -629,7 +989,21 @@ def _make_joint_single_dataset(
     future_stride = max(int(future_stride), 1)
     if "video" in modality_config:
         decode_future_video = bool(_cfg_get(data_cfg, "decode_future_video", True))
-        video_delta = ([0, future_stride] if decode_future_video else [0]) if online_dino else [0, 1]
+        text_config = _cfg_get(data_cfg, "text_annotations", {})
+        history_offsets = text_history_frame_offsets(text_config)
+        base_video_delta = (
+            ([0, future_stride] if decode_future_video else [0])
+            if online_dino
+            else [0, 1]
+        )
+        video_delta = list(
+            dict.fromkeys(
+                [
+                    *history_offsets,
+                    *base_video_delta,
+                ]
+            )
+        )
         modality_config["video"] = ModalityConfig(
             delta_indices=video_delta,
             modality_keys=modality_config["video"].modality_keys,
@@ -654,6 +1028,20 @@ def _make_joint_single_dataset(
     transforms = _append_state_norm_if_needed(transforms, state_config.modality_keys, state_norm_modes)
 
     embodiment_tag = getattr(data_config, "embodiment_tag", None) or EmbodimentTag.NEW_EMBODIMENT
+    if hasattr(data_config, "make_joint_dataset"):
+        return data_config.make_joint_dataset(
+            dataset_path=dataset_path,
+            modality_configs=modality_config,
+            transforms=transforms,
+            embodiment_tag=embodiment_tag,
+            video_backend=_cfg_get(data_cfg, "video_backend", "torchvision_av"),
+            delete_pause_frame=bool(_cfg_get(data_cfg, "delete_pause_frame", False)),
+            data_cfg=data_cfg,
+            online_dino=online_dino,
+            dino_feature_dir=_cfg_get(data_cfg, "dino_feature_dir", "latents"),
+            dino_episode_cache_size=int(_cfg_get(data_cfg, "dino_episode_cache_size", 2)),
+            dino_target_latents=bool(_cfg_get(data_cfg, "dino_target_latents", False)),
+        )
     return JointLiberoDataset(
         dataset_path=dataset_path,
         modality_configs=modality_config,
@@ -922,7 +1310,7 @@ def _validate_io_shortcuts(cfg) -> None:
             raise ValueError("load_current_dino_target=false requires WAM world_target=absolute.")
 
 
-def build_joint_dataset(cfg, mode: str = "train") -> LeRobotMixtureDataset:
+def build_joint_dataset(cfg, mode: str = "train"):
     _validate_io_shortcuts(cfg)
     vla_cfg = cfg.datasets.vla_data
     mixture_spec = resolve_data_mix(vla_cfg.data_mix)
@@ -940,6 +1328,14 @@ def build_joint_dataset(cfg, mode: str = "train") -> LeRobotMixtureDataset:
             (_make_joint_single_dataset(dataset_path, robot_type, vla_cfg, online_dino=online_dino), weight)
         )
 
+    if bool(_cfg_get(vla_cfg, "fastwam_direct_frame_sampling", False)):
+        if len(dataset_mixture) != 1:
+            raise ValueError(
+                "fastwam_direct_frame_sampling requires exactly one JointFlow "
+                f"dataset entry, got {len(dataset_mixture)}"
+            )
+        return dataset_mixture[0][0]
+
     return LeRobotMixtureDataset(
         dataset_mixture,
         mode=mode,
@@ -956,6 +1352,20 @@ def build_joint_dataloader(cfg, mode: str = "train") -> DataLoader:
     prefetch_factor = int(cfg.datasets.vla_data.get("prefetch_factor", 2)) if workers > 0 else None
     persistent_workers = bool(cfg.datasets.vla_data.get("persistent_workers", workers > 0)) if workers > 0 else False
     pin_memory = bool(cfg.datasets.vla_data.get("pin_memory", True))
+    loader_kwargs = {}
+    if bool(_cfg_get(cfg.datasets.vla_data, "fastwam_direct_frame_sampling", False)):
+        from starVLA.dataloader.fastwam_robotwin_dataset import FastWAMEpochSampler
+
+        loader_kwargs["sampler"] = FastWAMEpochSampler(
+            dataset,
+            seed=int(
+                _cfg_get(
+                    cfg.datasets.vla_data,
+                    "fastwam_split_seed",
+                    getattr(cfg, "seed", 42),
+                )
+            ),
+        )
     return DataLoader(
         dataset,
         batch_size=int(cfg.datasets.vla_data.per_device_batch_size),
@@ -964,6 +1374,115 @@ def build_joint_dataloader(cfg, mode: str = "train") -> DataLoader:
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
+        **loader_kwargs,
+    )
+
+
+def build_event_memory_dataloader(
+    cfg,
+    *,
+    output_dir: str | Path | None = None,
+) -> DataLoader | None:
+    """Build the opt-in semantic NTP stream used by event-memory training.
+
+    The physical dataloader remains untouched.  This second stream decodes only
+    the current RGB observation and uses an exact 2/2/2 boundary sampler.  A
+    single dataset is required because sampler indices address one episode-local
+    frame table directly; the RoboDojo text recipe intentionally satisfies this
+    contract.
+    """
+
+    vla_cfg = cfg.datasets.vla_data
+    text_cfg = _cfg_get(vla_cfg, "text_annotations", {})
+    event_cfg = _cfg_get(text_cfg, "event_memory", {})
+    if not bool(_cfg_get(event_cfg, "enabled", False)):
+        return None
+
+    mixture_spec = resolve_data_mix(vla_cfg.data_mix)
+    unique_entries: list[tuple[str, str]] = []
+    seen = set()
+    for data_name, _weight, robot_type in mixture_spec:
+        key = (str(data_name), str(robot_type))
+        if key not in seen:
+            seen.add(key)
+            unique_entries.append(key)
+    if len(unique_entries) != 1:
+        raise ValueError(
+            "Event-memory semantic sampling currently requires exactly one "
+            f"dataset/embodiment entry, got {unique_entries}"
+        )
+
+    # Do not mutate the physical recipe.  The semantic stream has no future
+    # world target and needs only the current observation plus parquet labels.
+    if OmegaConf.is_config(vla_cfg):
+        semantic_payload = OmegaConf.to_container(vla_cfg, resolve=True)
+    elif callable(getattr(vla_cfg, "to_dict", None)):
+        semantic_payload = vla_cfg.to_dict(resolve=True)
+    elif hasattr(vla_cfg, "items"):
+        semantic_payload = dict(vla_cfg.items())
+    else:
+        raise TypeError(
+            "datasets.vla_data must be an OmegaConf/config mapping for the "
+            "event-memory semantic stream"
+        )
+    semantic_data_cfg = OmegaConf.create(semantic_payload)
+    semantic_data_cfg.online_dino = True
+    semantic_data_cfg.decode_future_video = False
+    semantic_data_cfg.action_horizon = 1
+    semantic_data_cfg.future_action_window_size = 1
+    semantic_data_cfg.load_current_dino_target = False
+    semantic_data_cfg.dino_target_latents = False
+    semantic_data_cfg.require_precomputed_dino_targets = False
+
+    data_name, robot_type = unique_entries[0]
+    dataset = _make_joint_single_dataset(
+        Path(semantic_data_cfg.data_root_dir) / data_name,
+        robot_type,
+        semantic_data_cfg,
+        online_dino=True,
+    )
+
+    cache_root = Path(output_dir or getattr(cfg, "output_dir", "."))
+    index_name = str(_cfg_get(event_cfg, "index_cache_name", "semantic_index_v1.npz"))
+    pools = build_or_load_semantic_index(
+        dataset,
+        semantic_data_cfg.text_annotations,
+        cache_root / index_name,
+    )
+    sampler_cfg = _cfg_get(event_cfg, "sampler", {})
+    sampler = SemanticBoundaryBatchSampler(
+        pools,
+        seed=int(_cfg_get(sampler_cfg, "seed", getattr(cfg, "seed", 42))),
+        update_per_batch=int(_cfg_get(sampler_cfg, "update_per_batch", 2)),
+        hard_keep_per_batch=int(_cfg_get(sampler_cfg, "hard_keep_per_batch", 2)),
+        random_keep_per_batch=int(_cfg_get(sampler_cfg, "random_keep_per_batch", 2)),
+    )
+    expected_batch = int(_cfg_get(sampler_cfg, "per_device_batch_size", 6))
+    if sampler.batch_size != expected_batch:
+        raise ValueError(
+            "Semantic sampler category counts must sum to per_device_batch_size: "
+            f"counts={sampler.batch_size}, configured={expected_batch}"
+        )
+
+    workers = int(_cfg_get(sampler_cfg, "num_workers", 4))
+    loader_kwargs: dict[str, Any] = {
+        "num_workers": workers,
+        "pin_memory": bool(_cfg_get(sampler_cfg, "pin_memory", True)),
+        "persistent_workers": bool(
+            _cfg_get(sampler_cfg, "persistent_workers", workers > 0)
+        )
+        if workers > 0
+        else False,
+    }
+    if workers > 0:
+        loader_kwargs["prefetch_factor"] = int(
+            _cfg_get(sampler_cfg, "prefetch_factor", 2)
+        )
+    return DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=collate_fn,
+        **loader_kwargs,
     )
 
 

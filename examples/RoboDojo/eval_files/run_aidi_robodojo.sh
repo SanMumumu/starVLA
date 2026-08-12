@@ -12,11 +12,18 @@ STARVLA_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 export STARVLA_ROOT
 export ROBODOJO_ROOT="${ROBODOJO_ROOT:-/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/RoboDojo}"
 export STARVLA_CKPT_PATH="${STARVLA_CKPT_PATH:-/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_robodojo/starvla_qwengroot_robodojo_baseline_h16_jitx_corrnoise_zscore/checkpoints/steps_80000_pytorch_model.pt}"
+export ROBODOJO_REPLAN_STEPS="${ROBODOJO_REPLAN_STEPS:-12}"
+if [[ -z "${ROBODOJO_CKPT_NAME:-}" ]]; then
+  checkpoint_stem="$(basename "${STARVLA_CKPT_PATH}")"
+  checkpoint_stem="${checkpoint_stem%.*}"
+  checkpoint_run="$(basename "$(dirname "$(dirname "${STARVLA_CKPT_PATH}")")")"
+  export ROBODOJO_CKPT_NAME="${checkpoint_run}_${checkpoint_stem}"
+fi
 
 exec bash "${SCRIPT_DIR}/eval_robodojo.sh" \
   RoboDojo \
   "${ROBODOJO_TASK:-stack_bowls}" \
-  "${ROBODOJO_CKPT_NAME:-robodojo_baseline_steps80000_h16_state_zscore}" \
+  "${ROBODOJO_CKPT_NAME}" \
   "${ROBODOJO_ENV_CFG:-arx_x5}" \
   joint \
   "${ROBODOJO_SEED:-0}" \

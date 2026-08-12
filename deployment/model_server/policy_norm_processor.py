@@ -42,6 +42,14 @@ from starVLA.model.framework.share_tools import read_mode_config
 
 logger = logging.getLogger(__name__)
 
+# Some released/private checkpoints retain a training-time mixture alias that
+# is not present in every source snapshot's auto-discovered registry.  Dataset
+# paths and sampling weights are irrelevant during deployment; only the robot
+# type is needed to reconstruct the state/action normalization transform.
+_DEPLOYMENT_DATA_MIX_ROBOT_TYPE_ALIASES = {
+    "robodojo_v21_language_optional": "robodojo_arx_x5",
+}
+
 
 def _resolve_robot_type(
     model_cfg: dict,
@@ -69,6 +77,14 @@ def _resolve_robot_type(
         ) from e
 
     if data_mix not in DATASET_NAMED_MIXTURES:
+        robot_type = _DEPLOYMENT_DATA_MIX_ROBOT_TYPE_ALIASES.get(data_mix)
+        if robot_type is not None:
+            logger.info(
+                "Resolved deployment-only data_mix alias %r to robot_type=%r",
+                data_mix,
+                robot_type,
+            )
+            return robot_type
         raise KeyError(
             f"data_mix={data_mix!r} not in DATASET_NAMED_MIXTURES "
             f"(available: {sorted(DATASET_NAMED_MIXTURES.keys())[:20]} ...). "

@@ -120,9 +120,15 @@ DATASET_NAMED_MIXTURES = {
     "robodojo_v21": [
         ("RoboDojo_lerobot_v21_video", 1.0, "robodojo_arx_x5"),
     ],
-    # One dataset contains both annotated and unannotated tasks. Optional
-    # per-frame subtask fields are masked sample-by-sample by the joint loader.
+    # Frozen compatibility alias used by the released/high-score RynnBrain
+    # causal-DINO MoT 50k run.  Keep this pointed at language_v1: changing it
+    # to v2 changes the sampled trajectories/statistics even when text loss is
+    # disabled, so it would no longer reproduce that checkpoint family.
     "robodojo_v21_language_optional": [
         ("RoboDojo_lerobot_v21_language_v1", 1.0, "robodojo_arx_x5"),
+    ],
+    # Every row in the language-v2 dataset has both planning annotations.
+    "robodojo_v21_language": [
+        ("RoboDojo_lerobot_v21_language_v2", 1.0, "robodojo_arx_x5"),
     ],
 }

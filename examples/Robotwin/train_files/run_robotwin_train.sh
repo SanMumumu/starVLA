@@ -1,68 +1,61 @@
-export NCCL_SOCKET_IFNAME=bond0
-export NCCL_IB_HCA=mlx5_2,mlx5_3
+#!/usr/bin/env bash
+set -euo pipefail
 
-# used for check save when communication
-export NCCL_BLOCKING_WAIT=1
-export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_TIMEOUT=1000  # timeout set to 1 hour (unit: seconds)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+cd "${REPO_ROOT}"
 
-###########################################################################################
-# === Please modify the following paths according to your environment ===
-Framework_name=QwenOFT
-freeze_module_list=''
-base_vlm=playground/Pretrained_models/Qwen3-VL-4B-Instruct
-config_yaml=./examples/Robotwin/train_files/starvla_cotrain_robotwin_abs.yaml
-run_root_dir=./results/Checkpoints
-data_mix=robotwin_all_50
-run_id=0129_${data_mix}_qwen3OFT_all
-# === End of environment variable configuration ===
-###########################################################################################
+CONFIG_YAML="${CONFIG_YAML:-examples/Robotwin/train_files/rynn_base_h50_50k.yaml}"
+NUM_MACHINES="${NUM_MACHINES:-${SLURM_NNODES:-8}}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
+NUM_PROCESSES="${NUM_PROCESSES:-$((NUM_MACHINES * GPUS_PER_NODE))}"
+MACHINE_RANK="${MACHINE_RANK:-${SLURM_PROCID:-}}"
+MASTER_ADDR="${MASTER_ADDR:-}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+DATA_ROOT="${ROBOTWIN_DATA_ROOT:-}"
+DATASET_STATS="${ROBOTWIN_DATASET_STATS_PATH:-}"
+BASE_VLM="${RYNN_BASE_VLM:-}"
+RUN_ROOT_DIR="${RUN_ROOT_DIR:-}"
+RUN_ID="${RUN_ID:-}"
 
+if [[ ! -f "${CONFIG_YAML}" ]]; then
+  echo "[Robotwin train][ERROR] config does not exist: ${CONFIG_YAML}" >&2
+  exit 1
+fi
+if [[ "${NUM_MACHINES}" != "8" || "${GPUS_PER_NODE}" != "8" || "${NUM_PROCESSES}" != "64" ]]; then
+  echo "[Robotwin train][ERROR] this YAML is batch-locked to 8 nodes x 8 GPUs (16 x 64 = 1024)." >&2
+  echo "Got NUM_MACHINES=${NUM_MACHINES}, GPUS_PER_NODE=${GPUS_PER_NODE}, NUM_PROCESSES=${NUM_PROCESSES}." >&2
+  exit 1
+fi
+if [[ -z "${MACHINE_RANK}" || -z "${MASTER_ADDR}" ]]; then
+  echo "[Robotwin train][ERROR] set MACHINE_RANK and MASTER_ADDR, or launch through run_robotwin_train_batch.sh under Slurm." >&2
+  exit 1
+fi
 
-# export WANDB_MODE=disabled
+export NCCL_BLOCKING_WAIT="${NCCL_BLOCKING_WAIT:-1}"
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
+export NO_ALBUMENTATIONS_UPDATE="${NO_ALBUMENTATIONS_UPDATE:-1}"
 
-output_dir=${run_root_dir}/${run_id}
-mkdir -p ${output_dir}
-# mv this script to the output dir
-cp $0 ${output_dir}/
+args=(
+  accelerate launch
+  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml
+  --main_process_ip "${MASTER_ADDR}"
+  --main_process_port "${MASTER_PORT}"
+  --machine_rank "${MACHINE_RANK}"
+  --num_machines "${NUM_MACHINES}"
+  --num_processes "${NUM_PROCESSES}"
+  starVLA/training/train_starvla.py
+  --config_yaml "${CONFIG_YAML}"
+)
+[[ -n "${DATA_ROOT}" ]] && args+=(--datasets.vla_data.data_root_dir "${DATA_ROOT}")
+if [[ -z "${DATASET_STATS}" && -n "${DATA_ROOT}" ]]; then
+  DATASET_STATS="${DATA_ROOT%/}/dataset_stats.json"
+fi
+[[ -n "${DATASET_STATS}" ]] && args+=(--datasets.vla_data.fastwam_dataset_stats_path "${DATASET_STATS}")
+[[ -n "${BASE_VLM}" ]] && args+=(--framework.qwenvl.base_vlm "${BASE_VLM}")
+[[ -n "${RUN_ROOT_DIR}" ]] && args+=(--run_root_dir "${RUN_ROOT_DIR}")
+[[ -n "${RUN_ID}" ]] && args+=(--run_id "${RUN_ID}")
 
-
-accelerate launch \
-  --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  --num_processes 8 \
-  starVLA/training/train_starvla.py \
-  --config_yaml ${config_yaml} \
-  --framework.name ${Framework_name} \
-  --framework.qwenvl.base_vlm ${base_vlm} \
-  --datasets.vla_data.per_device_batch_size 4 \
-  --datasets.vla_data.data_mix ${data_mix} \
-  --trainer.freeze_modules ${freeze_module_list} \
-  --trainer.max_train_steps 150000 \
-  --trainer.save_interval 10000 \
-  --trainer.logging_frequency 100 \
-  --trainer.eval_interval 1000 \
-  --run_root_dir ${run_root_dir} \
-  --run_id ${run_id} \
-  --wandb_project starVLA_Robotwin \
-  --wandb_entity axi-the-cat \
-  # --is_debug True
-
-
-
-##### Multi-Server Multi-GPU training script #####
-  # accelerate launch \
-  #   --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
-  #   --main_process_ip $MASTER_ADDR \
-  #   --main_process_port $MASTER_PORT \
-  #   --machine_rank $SLURM_PROCID \
-  #   --num_machines $SLURM_NNODES \
-  #   --num_processes=${TOTAL_GPUS} \
-  #   starVLA/training/train_starvla.py \
-  #   --config_yaml ${config_yaml} \
-  #   --framework.name ${Framework_name} \
-  #   --framework.qwenvl.base_vlm ${base_vlm} \
-  #   --run_root_dir ${run_root_dir} \
-  #   --run_id ${run_id} \
-  #   --wandb_project your_project \
-  #   --wandb_entity your_name
-##### Multi-Server Multi-GPU training script #####
+echo "[Robotwin train] host=$(hostname) rank=${MACHINE_RANK}/${NUM_MACHINES} config=${CONFIG_YAML} GPUs=${NUM_PROCESSES} global_bs=1024 FastWAM_ABI H50 world_t+50"
+"${args[@]}"

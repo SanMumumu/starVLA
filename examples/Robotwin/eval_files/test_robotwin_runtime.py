@@ -14,6 +14,8 @@ import pytest
 
 EVAL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EVAL_DIR.parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def _fake_robotwin(root: Path) -> None:
@@ -150,6 +152,33 @@ def test_fastwam_client_requires_the_requested_gate_checkpoint_and_phase() -> No
                 policy_ckpt_path=requested,
                 wam_expected_phase="gate_ft",
             )
+
+
+def test_fastwam_client_accepts_rynn_h50_release_order_contract() -> None:
+    sys.path.insert(0, str(EVAL_DIR))
+    try:
+        import model2robotwin_fastwam_interface as adapter
+    finally:
+        sys.path.pop(0)
+
+    requested = "/models/rynn_h50/checkpoints/steps_50000_pytorch_model.pt"
+
+    def fake_standard_init(self, *args, **kwargs):
+        self.action_chunk_size = 50
+        self.replan_steps = 20
+        self.server_meta = {
+            "ckpt_path": kwargs.get("policy_ckpt_path"),
+            "action_chunk_size": 50,
+            "expects_state": True,
+            "framework_name": "QwenWorldActionMoT",
+        }
+
+    with patch.object(adapter.StandardModelClient, "__init__", fake_standard_init):
+        client = adapter.FastWAMRobotWinModelClient(policy_ckpt_path=requested)
+
+    assert client.action_chunk_size == 50
+    assert client.replan_steps == 20
+    assert client.expects_state is True
 
 
 def test_fastwam_client_rejects_wrong_world_to_action_architecture() -> None:

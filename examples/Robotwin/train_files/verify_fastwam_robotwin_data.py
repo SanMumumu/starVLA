@@ -287,12 +287,22 @@ def main() -> None:
     valid_layouts = {
         (32, "robotwin_fastwam"),
         (16, "robotwin_fastwam_h16"),
+        (50, "robotwin_fastwam_h50"),
     }
     if (action_horizon, data_mix) not in valid_layouts:
         raise ValueError(
-            "FastWAM config must use (H32,robotwin_fastwam) or "
-            f"(H16,robotwin_fastwam_h16), got H={action_horizon}, data_mix={data_mix!r}"
+            "FastWAM config must use a horizon-specific mixture: "
+            "(H16,robotwin_fastwam_h16), (H32,robotwin_fastwam), or "
+            f"(H50,robotwin_fastwam_h50); got H={action_horizon}, data_mix={data_mix!r}"
         )
+    world_model = data_config.get("world_model")
+    if world_model is not None:
+        future_stride = int(world_model.get("future_stride", -1))
+        if future_stride != action_horizon:
+            raise ValueError(
+                "FastWAM world target must align with the action chunk: "
+                f"future_stride={future_stride}, action_horizon={action_horizon}"
+            )
     expected_config = {
         "fastwam_expected_fps": 50,
         "fastwam_val_fraction": 0.01,

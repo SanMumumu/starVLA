@@ -573,14 +573,10 @@ class Qwen_GR00T(baseframework):
                 )
             if phase != "predictor_warmup":
                 problems.append("text supervision is supported only during predictor_warmup")
-            if not bool(text_supervision.get("allow_missing_annotations", False)):
+            text_annotations = vla_cfg.get("text_annotations", {})
+            if not bool(text_annotations.get("enabled", False)):
                 problems.append(
-                    "mixed annotated/unannotated RoboDojo training requires allow_missing_annotations=true"
-                )
-            optional_text = vla_cfg.get("optional_text_annotations", {})
-            if not bool(optional_text.get("enabled", False)):
-                problems.append(
-                    "text supervision requires datasets.vla_data.optional_text_annotations.enabled=true"
+                    "text supervision requires datasets.vla_data.text_annotations.enabled=true"
                 )
             for key in ("subtask_field", "completed_subtask_field", "response_template"):
                 if not str(text_supervision.get(key, "")).strip():
@@ -2037,19 +2033,28 @@ class Qwen_GR00T(baseframework):
         return views, future_main
 
     def _wam_text_target(self, example: dict) -> tuple[str, str] | None:
-        """Return the prompt/answer pair for one annotated RoboDojo sample."""
+        """Return the required prompt/answer pair for one RoboDojo sample."""
 
         cfg = self.wam_text_supervision
         if not bool(cfg.get("enabled", False)):
-            return None
-        if example.get("text_annotation_available", None) is False:
             return None
         subtask_field = str(cfg.get("subtask_field", "subtask_text"))
         completed_field = str(cfg.get("completed_subtask_field", "completed_subtask_text"))
         subtask = str(example.get(subtask_field, "") or "").strip()
         completed = str(example.get(completed_field, "") or "").strip()
-        if not subtask and not completed:
-            return None
+        missing = [
+            field
+            for field, value in (
+                (subtask_field, subtask),
+                (completed_field, completed),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "Text-supervised WAM requires non-empty annotations for every row; "
+                f"missing={missing}"
+            )
         prompt_template = str(
             cfg.get(
                 "prompt_template",
@@ -2094,21 +2099,18 @@ class Qwen_GR00T(baseframework):
             labels[row, : min(max(answer_start, 0), width)] = -100
         return labels
 
-    def _wam_optional_text_loss(
+    def _wam_text_loss(
         self,
         examples: List[dict],
-        reference: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        """Compute assistant-only LM loss for annotated rows; mask missing rows."""
+        """Compute assistant-only LM loss for every row in the batch."""
 
         selected: list[tuple[dict, str, str]] = []
         for example in examples:
             target = self._wam_text_target(example)
-            if target is not None:
-                selected.append((example, target[0], target[1]))
-        if not selected:
-            zero = reference.new_zeros(())
-            return zero, zero, 0
+            if target is None:
+                raise RuntimeError("_wam_text_loss requires text supervision to be enabled")
+            selected.append((example, target[0], target[1]))
 
         user_messages = []
         full_messages = []
@@ -3688,14 +3690,13 @@ class Qwen_GR00T(baseframework):
                 "world_cosine_loss_raw": world_details["cosine_loss_raw"],
             }
             if bool(getattr(self, "wam_text_supervision", {}).get("enabled", False)):
-                text_loss, raw_text_loss, annotated_samples = self._wam_optional_text_loss(
+                text_loss, raw_text_loss, text_samples = self._wam_text_loss(
                     examples,
-                    action_loss,
                 )
                 output["text_loss"] = text_loss
                 output["text_loss_raw"] = raw_text_loss
-                output["text_annotated_samples"] = action_loss.detach().new_tensor(
-                    float(annotated_samples)
+                output["text_samples"] = action_loss.detach().new_tensor(
+                    float(text_samples)
                 )
             output.update(self._wam_world_to_action_metrics(action_loss))
             return output
@@ -3964,7 +3965,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config_yaml",
         type=str,
-        default="examples/LIBERO/train_files/starvla_cotrain_libero.yaml",
+        default="examples/LIBERO/train_files/starvla_cotrain_libero_old.yaml",
         help="Path to YAML config",
     )
     args, clipargs = parser.parse_known_args()

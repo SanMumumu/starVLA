@@ -1,6 +1,7 @@
+# Archived legacy WAM experiment; kept for reference.
 #######
 #######
-run_id: starvla_wam_exp4_4task
+run_id: starvla_wam_exp7_2b_bigbs_policy_fdm_nolang
 run_root_dir: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_wam_libero_w_grad
 seed: 42
 wandb_entity: your_wandb_entity
@@ -11,7 +12,7 @@ version_id: "0.21"
 framework:
   name: QwenGR00T
   qwenvl:
-    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-4B-Instruct/
+    base_vlm: /horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/CKPTS/Qwen3-VL-2B-Instruct/
     attn_implementation: sdpa
     enable_gradient_checkpointing: true
     vl_hidden_dim: 2048
@@ -19,14 +20,16 @@ framework:
   wam:
     enabled: true
     placeholder_token: "<ACT_PH>"
-    dino_loss_weight: 0.05
+    dino_loss_weight: 0.01
+    #######
+    fdm_delta_dino: true
+    world_model_no_language: true
+    #######
   #######
   tasks:
     weights:
       policy: 1.0
-      passive: 1.0
-      fdm: 1.0
-      idm: 1.0
+      fdm: 0.2
   #######
   dino:
     name: dinov3_vits16
@@ -48,9 +51,9 @@ framework:
     action_horizon: 8
     n_action_query: 32
     #######
-    use_correlated_noise: false
+    use_correlated_noise: true
     correlation_beta: 0.5
-    flow_matching_steps: 1
+    flow_matching_steps: 20
     #######
     add_pos_embed: true
     max_seq_len: 1024
@@ -96,7 +99,9 @@ datasets:
     sequential_step_sampling: false
     include_state: false
     CoT_prompt: "Your task is {instruction}. To identify the key objects for your task. Locate their bounding boxes in [x1,y1,x2,y2] format."
-    per_device_batch_size: 8
+    #######
+    per_device_batch_size: 16
+    #######
     load_all_data_for_training: true
     video_backend: torchvision_av
     online_dino: true
@@ -105,9 +110,11 @@ datasets:
       future_stride: 8
 
 trainer:
-  max_train_steps: 100000
-  num_warmup_steps: 5000
-  save_interval: 10000
+  #######
+  max_train_steps: 60000
+  num_warmup_steps: 3000
+  save_interval: 5000
+  #######
   eval_interval: 1000000
   learning_rate:
     base: 2.5e-05
@@ -122,9 +129,7 @@ trainer:
   max_grad_norm: 1.0
   weight_decay: 0.0
   logging_frequency: 100
-  #######
   log_grad_norms: true
-  #######
   gradient_clipping: 1.0
   gradient_accumulation_steps: 8
   gradient_checkpointing: true

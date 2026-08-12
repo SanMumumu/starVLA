@@ -14,14 +14,14 @@ if [[ -z "${STARVLA_PYTHON:-}" ]]; then
   fi
 fi
 
-CKPT="${CKPT:-/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_qwenwam/gr00t/0618_libero4in1_qwen3gr00t/final_model/pytorch_model.pt}"
+CKPT="${CKPT:-}"
 
 # GPU_ID=1 PORT=6696 CKPT=xxx bash examples/LIBERO/eval_files/run_policy_server.sh
 GPU_ID="${GPU_ID:-0}"
 PORT="${PORT:-6694}"
 USE_BF16="${USE_BF16:-1}"
 
-STRIP_DINO_KEYS="${STRIP_DINO_KEYS:-1}"
+STRIP_DINO_KEYS="${STRIP_DINO_KEYS:-0}"
 
 cd "${STARVLA_DIR}"
 
@@ -37,6 +37,10 @@ echo "[POLICY SERVER] PORT=${PORT}"
 echo "[POLICY SERVER] USE_BF16=${USE_BF16}"
 echo "[POLICY SERVER] STRIP_DINO_KEYS=${STRIP_DINO_KEYS}"
 
+if [[ -z "${CKPT}" ]]; then
+  echo "[ERROR] set CKPT to a trained checkpoint path" >&2
+  exit 1
+fi
 if [[ ! -f "${CKPT}" ]]; then
   echo "[ERROR] CKPT not found: ${CKPT}"
   exit 1

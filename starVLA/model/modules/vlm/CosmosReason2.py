@@ -103,7 +103,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config_yaml",
         type=str,
-        default="examples/LIBERO/train_files/starvla_cotrain_libero.yaml",
+        default="examples/LIBERO/train_files/starvla_cotrain_libero_old.yaml",
         help="Path to YAML config",
     )
     args, clipargs = parser.parse_known_args()
@@ -155,5 +155,4 @@ if __name__ == "__main__":
     print(SEPARATOR)
 
     print("Done!")
-
 

@@ -131,8 +131,125 @@ class PolicyServerWrapper:
             framework,
             contract_cfg,
         )
+        planner_cfg = (contract_cfg.get("framework") or {}).get("planner") or {}
+        text_cfg = planner_cfg.get("text_supervision") or {}
+        self._text_planning_enabled = bool(
+            getattr(
+                framework,
+                "text_planning_enabled",
+                text_cfg.get("enabled", False),
+            )
+        )
+        self._event_memory_enabled = bool(
+            getattr(
+                framework,
+                "event_memory_enabled",
+                str(text_cfg.get("mode", "")).lower()
+                == "event_driven_memory_ntp",
+            )
+        )
+        self._planner_text_cache_supported = bool(
+            self._text_planning_enabled
+            and not self._event_memory_enabled
+            and hasattr(framework, "_cached_or_generated_planner_hidden")
+        )
+        self._event_semantic_fields = dict(
+            getattr(framework, "event_semantic_fields", {}) or {}
+        )
+        event_data_cfg = dict(
+            getattr(framework, "event_data_config", {}) or {}
+        )
+        self._event_empty_memory = str(
+            event_data_cfg.get("empty_memory", "None.")
+        )
+        self._event_empty_cached_subtask = str(
+            event_data_cfg.get("empty_cached_subtask", "None.")
+        )
+        self._event_semantic_offset = int(
+            event_data_cfg.get("semantic_offset", -10)
+        )
+        self._event_replan_interval = int(
+            event_data_cfg.get("replan_interval", 10)
+        )
+        history_cfg = text_cfg.get("history") or {}
+        self._text_history_enabled = bool(
+            getattr(
+                framework,
+                "text_history_enabled",
+                self._text_planning_enabled
+                and history_cfg.get("enabled", False),
+            )
+        )
+        self._text_history_frame_offsets = list(
+            getattr(
+                framework,
+                "text_history_frame_offsets",
+                (
+                    ((contract_cfg.get("datasets") or {}).get("vla_data") or {})
+                    .get("text_annotations", {})
+                    .get("history", {})
+                    .get("frame_offsets", [])
+                ),
+            )
+            or []
+        )
+        self._text_history_memory_offset = int(
+            getattr(
+                framework,
+                "text_history_memory_offset",
+                (
+                    ((contract_cfg.get("datasets") or {}).get("vla_data") or {})
+                    .get("text_annotations", {})
+                    .get("history", {})
+                    .get("memory_offset", 0)
+                ),
+            )
+        )
+        self._text_history_image_field = str(
+            history_cfg.get("image_field", "planner_history_images")
+        )
+        self._finished_task_list_field = str(
+            history_cfg.get("finished_task_list_field", "finished_task_list")
+        )
+        self._empty_finished_task_list = str(
+            history_cfg.get("empty_finished_task_list", "None")
+        )
+        self._text_history_image_size = list(
+            history_cfg.get("history_image_size", []) or []
+        )
+        configured_mem = (
+            (contract_framework_cfg.get("qwenvl") or {}).get(
+                "mem_vision_encoder"
+            )
+            or {}
+        )
+        runtime_mem = getattr(
+            getattr(framework, "qwen_vl_interface", None),
+            "mem_vision_encoder",
+            {},
+        )
+        self._mem_vision_encoder = {
+            **dict(configured_mem),
+            **dict(runtime_mem or {}),
+        }
+        if bool(configured_mem.get("enabled", False)) != bool(
+            self._mem_vision_encoder.get("enabled", False)
+        ):
+            raise RuntimeError(
+                "Checkpoint MEM vision configuration does not match the active "
+                "Rynn encoder"
+            )
+        if (
+            self._text_planning_enabled
+            and not self._event_memory_enabled
+            and not self._planner_text_cache_supported
+        ):
+            raise RuntimeError(
+                "Text-planning checkpoint does not support cached planner text inference"
+            )
         contract_vla_cfg = (contract_cfg.get("datasets") or {}).get("vla_data") or {}
         self._image_layout = str(contract_vla_cfg.get("image_layout", "separate_views"))
+        self._obs_image_size = list(contract_vla_cfg.get("obs_image_size", []) or [])
         self._composite_view_key = contract_vla_cfg.get("composite_view_key")
         self._composite_source_view_keys = list(contract_vla_cfg.get("composite_source_view_keys", []) or [])
         self._state_normalizer: Optional[ComposedModalityTransform] = None
@@ -590,9 +707,153 @@ class PolicyServerWrapper:
                 16 if self._framework_name == "QwenActionWorldCoFlow" else None
             ),
             "image_layout": self._image_layout,
+            "obs_image_size": list(getattr(self, "_obs_image_size", []) or []),
             "composite_view_key": self._composite_view_key,
             "composite_source_view_keys": self._composite_source_view_keys,
+            "text_planning_enabled": self._text_planning_enabled,
+            "planner_text_cache_supported": self._planner_text_cache_supported,
+            "event_memory_enabled": bool(
+                getattr(self, "_event_memory_enabled", False)
+            ),
+            "event_semantic_fields": dict(
+                getattr(self, "_event_semantic_fields", {}) or {}
+            ),
+            "event_empty_memory": str(
+                getattr(self, "_event_empty_memory", "None.")
+            ),
+            "event_empty_cached_subtask": str(
+                getattr(self, "_event_empty_cached_subtask", "None.")
+            ),
+            "event_semantic_offset": int(
+                getattr(self, "_event_semantic_offset", -10)
+            ),
+            "event_replan_interval": int(
+                getattr(self, "_event_replan_interval", 10)
+            ),
+            "qwen35_causal_conv1d_backend": getattr(
+                getattr(self._framework, "qwen_vl_interface", None),
+                "causal_conv1d_backend",
+                None,
+            ),
+            "qwen35_fla_backend": getattr(
+                getattr(self._framework, "qwen_vl_interface", None),
+                "fla_backend",
+                None,
+            ),
+            "qwen35_attn_implementation_source": getattr(
+                getattr(self._framework, "qwen_vl_interface", None),
+                "attn_implementation_source",
+                None,
+            ),
+            "rynn_mem_vision_encoder": dict(
+                getattr(self, "_mem_vision_encoder", {}) or {}
+            ),
+            "text_history_enabled": bool(
+                getattr(self, "_text_history_enabled", False)
+            ),
+            "text_history_frame_offsets": list(
+                getattr(self, "_text_history_frame_offsets", []) or []
+            ),
+            "text_history_memory_offset": int(
+                getattr(self, "_text_history_memory_offset", 0)
+            ),
+            "text_history_image_field": str(
+                getattr(
+                    self,
+                    "_text_history_image_field",
+                    "planner_history_images",
+                )
+            ),
+            "text_history_image_size": list(
+                getattr(self, "_text_history_image_size", []) or []
+            ),
+            "finished_task_list_field": str(
+                getattr(
+                    self,
+                    "_finished_task_list_field",
+                    "finished_task_list",
+                )
+            ),
+            "empty_finished_task_list": str(
+                getattr(self, "_empty_finished_task_list", "None")
+            ),
         }
+        if self._framework_name == "QwenWorldActionMoT":
+            physical = getattr(self._framework, "action_model", None)
+            base.update(
+                {
+                    "planner_query_mask_contract": getattr(
+                        self._framework,
+                        "planner_query_mask_contract",
+                        None,
+                    ),
+                    "mot_contract_version": getattr(
+                        physical,
+                        "checkpoint_contract_version",
+                        None,
+                    ),
+                    "mot_interaction_mode": getattr(
+                        physical,
+                        "interaction_mode",
+                        None,
+                    ),
+                    "mot_layerwise_planner_coupling": bool(
+                        getattr(
+                            physical,
+                            "layerwise_planner_coupling",
+                            False,
+                        )
+                    ),
+                    "mot_num_inference_timesteps": int(
+                        getattr(physical, "inference_steps", 0) or 0
+                    ),
+                    "mot_action_prediction_type": getattr(
+                        physical,
+                        "action_prediction_type",
+                        None,
+                    ),
+                    "mot_action_velocity_target": getattr(
+                        physical,
+                        "action_velocity_target",
+                        None,
+                    ),
+                    "mot_rtc_supported": bool(
+                        getattr(physical, "rtc_guidance_supported", False)
+                    ),
+                    "mot_multires_world_input": bool(
+                        getattr(
+                            physical,
+                            "multires_world_input",
+                            False,
+                        )
+                    ),
+                    "mot_current_dino_tokens": getattr(
+                        physical,
+                        "current_world_tokens",
+                        None,
+                    ),
+                    "mot_future_dino_tokens": getattr(
+                        physical,
+                        "future_world_tokens",
+                        None,
+                    )
+                    or getattr(physical, "world_tokens", None),
+                    # Backward-compatible metadata aliases for older clients.
+                    # There is no separate action-memory branch in the v3
+                    # FastWAM-style layout.
+                    "mot_action_dino_memory_enabled": False,
+                    "mot_action_dino_tokens": getattr(
+                        physical,
+                        "current_world_tokens",
+                        None,
+                    ),
+                    "mot_world_dino_tokens": getattr(
+                        physical,
+                        "world_tokens",
+                        None,
+                    ),
+                }
+            )
         base.update(self._wam_runtime_metadata)
         # Enrich with per-embodiment keys when a default processor already exists.
         if self._default_unnorm_key is not None:
@@ -639,10 +900,26 @@ class PolicyServerWrapper:
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
-        result = {"actions": unnorm}
+        # RTC feeds the old chunk's tail back into the flow sampler in the
+        # training-time normalized coordinate system. Existing clients keep
+        # consuming only the unnormalized ``actions`` field.
+        result = {"actions": unnorm, "normalized_actions": normalized}
         # Unified text planners expose their low-frequency AR plan alongside
         # the action chunk.  Existing clients remain compatible because the
         # actions field is unchanged and the metadata is optional.
         if "planner_text" in out:
             result["planner_text"] = out["planner_text"]
+        if "planner_text_refreshed" in out:
+            result["planner_text_refreshed"] = out["planner_text_refreshed"]
+        if "planner_finished_task_list" in out:
+            result["planner_finished_task_list"] = out[
+                "planner_finished_task_list"
+            ]
+        for key in (
+            "semantic_decision",
+            "semantic_memory_add",
+            "semantic_current_subtask",
+        ):
+            if key in out:
+                result[key] = out[key]
         return result

@@ -36,7 +36,7 @@ def test_verifier_does_not_import_training_dataloader(tmp_path, monkeypatch) -> 
     checkpoint.touch()
     config = (
         REPO_ROOT
-        / "examples/Robotwin/train_files/robotwin_wam_query_warmup.yaml"
+        / "examples/Robotwin/train_files/robotwin_wam_query_warmup_old.yaml"
     ).read_text(encoding="utf-8")
     (run_dir / "config.yaml").write_text(config, encoding="utf-8")
     (run_dir / "config.full.yaml").write_text(config, encoding="utf-8")
@@ -79,7 +79,7 @@ def test_verifier_distinguishes_gate_ft_from_warmup(tmp_path) -> None:
     checkpoint.parent.mkdir(parents=True)
     checkpoint.touch()
     config = (
-        REPO_ROOT / "examples/Robotwin/train_files/robotwin_wam_query_gate_ft.yaml"
+        REPO_ROOT / "examples/Robotwin/train_files/robotwin_wam_query_gate_ft_old.yaml"
     ).read_text(encoding="utf-8")
     (run_dir / "config.yaml").write_text(config, encoding="utf-8")
     (run_dir / "config.full.yaml").write_text(config, encoding="utf-8")
@@ -122,8 +122,8 @@ def test_verifier_distinguishes_gate_ft_from_warmup(tmp_path) -> None:
 @pytest.mark.parametrize(
     ("config_name", "phase", "step"),
     [
-        ("robotwin_wam_query_warmup.yaml", "predictor_warmup", 80000),
-        ("robotwin_wam_query_gate_ft.yaml", "gate_ft", 20000),
+        ("robotwin_wam_query_warmup_old.yaml", "predictor_warmup", 80000),
+        ("robotwin_wam_query_gate_ft_old.yaml", "gate_ft", 20000),
     ],
 )
 def test_verifier_accepts_causal_query_two_stage_contract(
@@ -194,7 +194,7 @@ def test_verifier_accepts_causal_query_warmup_contract(tmp_path) -> None:
     checkpoint.touch()
     config = (
         REPO_ROOT
-        / "examples/Robotwin/train_files/robotwin_wam_query_warmup.yaml"
+        / "examples/Robotwin/train_files/robotwin_wam_query_warmup_old.yaml"
     ).read_text(encoding="utf-8")
     (run_dir / "config.yaml").write_text(config, encoding="utf-8")
     (run_dir / "config.full.yaml").write_text(config, encoding="utf-8")
