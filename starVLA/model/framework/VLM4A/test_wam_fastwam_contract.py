@@ -227,6 +227,10 @@ def test_dino_preserves_fastwam_composite_as_24_by_20_grid() -> None:
     assert tensor.shape == (1, 3, 384, 320)
     assert backbone(tensor).shape == (1, 480, 8)
 
+    square = backbone.preprocess_batch([image], image_size=[256, 256])
+    assert square.shape == (1, 3, 256, 256)
+    assert backbone(square).shape == (1, 256, 8)
+
 
 def test_mot_current_dino_encodes_full_480_token_clean_prefix_once() -> None:
     class Harness:
@@ -237,6 +241,7 @@ def test_mot_current_dino_encodes_full_480_token_clean_prefix_once() -> None:
         def __init__(self) -> None:
             self.dino_pool = 2
             self.current_dino_pool = 1
+            self.num_current_world_views = 1
             self._dino_spec = {
                 "image_size": [384, 320],
                 "patch_size": 16,
@@ -245,7 +250,8 @@ def test_mot_current_dino_encodes_full_480_token_clean_prefix_once() -> None:
             self._dino_std = torch.ones(8)
             self.calls = 0
 
-        def _encode_dino_raw(self, batch_views):
+        def _encode_dino_raw(self, batch_views, *, expected_views=None):
+            assert expected_views == 1
             self.calls += 1
             batch = len(batch_views)
             raw = torch.arange(
@@ -262,6 +268,52 @@ def test_mot_current_dino_encodes_full_480_token_clean_prefix_once() -> None:
         current[0],
         torch.arange(480 * 8, dtype=torch.float32).reshape(480, 8),
     )
+
+
+def test_mot_uses_two_current_views_and_one_future_view() -> None:
+    class Harness:
+        _pool_dino = QwenWorldActionMoT._pool_dino
+        _finalize_dino = QwenWorldActionMoT._finalize_dino
+        _encode_dino = QwenWorldActionMoT._encode_dino
+        _encode_current_dino = QwenWorldActionMoT._encode_current_dino
+
+        def __init__(self) -> None:
+            self.dino_pool = 1
+            self.current_dino_pool = None
+            self.num_world_views = 1
+            self.num_current_world_views = 2
+            self.future_dino_image_size = (224, 224)
+            self._dino_spec = {
+                "image_size": (224, 224),
+                "patch_size": 16,
+            }
+            self._dino_mean = torch.zeros(8)
+            self._dino_std = torch.ones(8)
+
+        def _encode_dino_raw(
+            self,
+            batch_views,
+            *,
+            image_size=None,
+            expected_views=None,
+        ):
+            size = self._dino_spec["image_size"] if image_size is None else image_size
+            rows, columns = dino_patch_grid(size, self._dino_spec["patch_size"])
+            views = len(batch_views[0])
+            assert views == expected_views
+            return (
+                torch.zeros(len(batch_views) * views, rows * columns, 8),
+                views,
+            )
+
+    harness = Harness()
+    current = harness._encode_current_dino(
+        [[object(), object()], [object(), object()]]
+    )
+    future = harness._encode_dino([[object()], [object()]])
+
+    assert current.shape == (2, 392, 8)
+    assert future.shape == (2, 196, 8)
 
 
 def test_frozen_dino_teacher_is_not_checkpointed() -> None:

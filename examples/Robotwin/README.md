@@ -1,58 +1,57 @@
-# Current Rynn H32 recipe (Fast-WAM-aligned)
+# Current Rynn H32 recipe (FastWAM data ABI)
 
-The canonical training config is `train_files/rynn_base_h50_50k.yaml`. It
-keeps the current Rynn model/optimizer implementation and adopts the released
-FastWAM RoboTwin data ABI directly: 50 Hz metadata,
+The canonical training config is
+`train_files/rynn_base_h32_current_dino_fullres_50k.yaml`. It keeps the Rynn
+model/optimizer implementation and adopts the released FastWAM RoboTwin data
+ABI directly: 50 Hz metadata,
 14-D absolute actions/state in release order, global z-score normalization,
 the exact 320x384 head+wrist composite, and seeded global-frame sampling
-without replacement. Both the action chunk and world target use **H32/t+32**.
-Evaluation replans after **24** actions, matching Fast-WAM.
+without replacement. Matching FastWAM's 33-frame sample contract, the action
+chunk and world target use **H32/t+32**. Evaluation replans after **24** actions.
 
-Non-model train controls follow the Fast-WAM baseline
-`starvla_qwengroot_robotwin_fastwam_jitx_corrnoise` (demo_clean **91.88%**):
-`include_state=true`, **H32**, **replan=24**, **80K** steps, warmup 2K, action LR 1e-4,
-empty freeze list, logging 200, `num_workers=8`. Model ABI stays Rynn MoT +
-`robotwin_fastwam` (H32 indices).
+The maintained controls are `include_state=true`, **H32**, **replan=24**,
+**50K** steps, warmup 2K, action LR 1e-4, empty freeze list, logging 200, and
+`num_workers=8`. Model ABI stays Rynn MoT + `robotwin_fastwam`.
 
 Submit the maintained 8-node, 8-GPU-per-node AIDI recipe:
 
 ```bash
 cd /home/users/sen02.wang/workspace/starvla_dev/RBT
-aidi-inf-cli job submit -f job_base_h50_50k.yaml \
+aidi-inf-cli job submit -f job_base_h32_current_dino_fullres_50k.yaml \
     -q project-ppu-robot-lab-acloud-bj
 ```
 
 The YAML and AIDI launcher are deliberately locked to
-`16 per GPU x 8 nodes x 8 GPUs x 1 accumulation = global batch 1024`.
+`12 per GPU x 8 nodes x 8 GPUs x 1 accumulation = global batch 768`.
 
 ## Dense-current-DINO variant
 
-`train_files/rynn_base_h50_current_dino_fullres_50k.yaml` is the matching
-ablation with no DINO downsampling on the current frame. It sets
+`train_files/rynn_base_h32_current_dino_fullres_50k.yaml` is the maintained
+recipe with no DINO downsampling on the current frame. It sets
 `current_dino_pool: 1`, so the current prefix retains the full 24x20 grid
 (480 tokens), while `dino_pool: 2` keeps the future target at 12x10
-(120 tokens). All other training settings are identical to the canonical
-H32 recipe.
+(120 tokens). `train_files/rynn_base_h32_50k.yaml` remains the pooled-current
+control config.
 
 Submit its maintained 8-node training job with:
 
 ```bash
 cd /home/users/sen02.wang/workspace/starvla_dev/RBT
-aidi-inf-cli job submit -f job_base_h50_current_dino_fullres_50k.yaml \
+aidi-inf-cli job submit -f job_base_h32_current_dino_fullres_50k.yaml \
     -q project-ppu-robot-lab-acloud-bj
 ```
 
 The job runs
-`examples/Robotwin/train_files/run_rynn_base_h50_current_dino_fullres_50k.sh`.
+`examples/Robotwin/train_files/run_rynn_base_h32_current_dino_fullres_50k.sh`.
 To validate the recipe locally without starting distributed training:
 
 ```bash
-python3 examples/Robotwin/train_files/verify_rynn_h50_recipe.py \
-    --config examples/Robotwin/train_files/rynn_base_h50_50k.yaml \
+python3 examples/Robotwin/train_files/verify_rynn_h32_recipe.py \
+    --config examples/Robotwin/train_files/rynn_base_h32_current_dino_fullres_50k.yaml \
     --num-processes 64
 
 VERIFY_ONLY=1 \
-bash examples/Robotwin/train_files/run_rynn_base_h50_current_dino_fullres_50k.sh
+bash examples/Robotwin/train_files/run_rynn_base_h32_current_dino_fullres_50k.sh
 ```
 
 For full 8-way evaluation, run the policy servers in the StarVLA environment:
@@ -71,7 +70,7 @@ CKPT=/path/to/steps_50000_pytorch_model.pt \
 HOST=127.0.0.1 \
 ROBOTWIN_PATH=/path/to/RoboTwin \
 BASE_PORT=6698 REPLAN_STEPS=24 \
-bash examples/Robotwin/eval_files/eval_robotwin_8clients_rynn_fastwam_h50.sh
+bash examples/Robotwin/eval_files/eval_robotwin_8clients_rynn_fastwam_h32.sh
 ```
 
 For a checkpoint trained with the dense-current-DINO variant, keep the same
@@ -82,7 +81,7 @@ CKPT=/path/to/steps_50000_pytorch_model.pt \
 HOST=127.0.0.1 \
 ROBOTWIN_PATH=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/RoboTwin \
 BASE_PORT=6698 REPLAN_STEPS=24 \
-bash examples/Robotwin/eval_files/eval_robotwin_8clients_rynn_fastwam_h50_current_dino_fullres.sh
+bash examples/Robotwin/eval_files/eval_robotwin_8clients_rynn_fastwam_h32_current_dino_fullres.sh
 ```
 
 Superseded Robotwin training recipes and launchers have been removed; the H32
@@ -490,14 +489,14 @@ REPLAN_STEPS=24 \
 CKPT=/path/to/checkpoint.pt \
 HOST=policy-server-host \
 ROBOTWIN_PATH=/path/to/RoboTwin \
-bash examples/Robotwin/eval_files/eval_robotwin_8clients_rynn_fastwam_h50.sh
+bash examples/Robotwin/eval_files/eval_robotwin_8clients_rynn_fastwam_h32.sh
 ```
 
-The current Rynn default is `24` for an H32 checkpoint (Fast-WAM matched).
+The current Rynn default is `24` for an H32 checkpoint, matching FastWAM.
 For a 32-action checkpoint, `REPLAN_STEPS=32` executes the full predicted chunk.
 Values larger than the checkpoint action horizon are rejected. The world model
-predicts `t+32` to align with its H32 action chunk when evaluation replans
-after 24 actions.
+predicts `t+32` at the end of the H32 action chunk; evaluation executes the
+first 24 actions and then requests a fresh chunk.
 
 ### Runtime output
 
@@ -544,7 +543,7 @@ These environment variables are read when the corresponding flag is not set:
 | `ROBOTWIN_SERVER_TIMEOUT` | `600` | Server startup timeout in seconds (overridden by `--server-timeout`) |
 | `ROBOTWIN_AUTO_INSTALL_DEPS` | `0` | Set to `1` to bootstrap pip deps (overridden by `--install-deps`) |
 | `ROBOTWIN_LOG_ROOT` | auto | Override the log output directory |
-| `REPLAN_STEPS` | model chunk (`24` in replan launcher) | Number of cached actions to execute before a fresh inference |
+| `REPLAN_STEPS` | `24` in the FastWAM-aligned Rynn H32 launcher | Number of cached actions to execute before a fresh inference |
 
 The launcher does **not** use `conda activate`. Instead, it locates the Python binary directly from the conda env directory. It searches `CONDA_EXE`, `CONDA_PREFIX`, `~/miniconda3/envs/`, `~/anaconda3/envs/`, etc. If auto-detection fails, set `STARVLA_PYTHON` and `ROBOTWIN_PYTHON` explicitly.
 

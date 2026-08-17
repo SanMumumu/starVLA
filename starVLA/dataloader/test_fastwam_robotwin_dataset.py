@@ -219,7 +219,7 @@ def test_fastwam_checkpoint_sample_and_direct_sampler() -> None:
         checkpoint = run_dir / "checkpoints/steps_1_pytorch_model.pt"
         checkpoint.parent.mkdir(parents=True)
         checkpoint.touch()
-        source_config = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h50_50k.yaml"
+        source_config = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h32_50k.yaml"
         (run_dir / "config.yaml").write_text(source_config.read_text(encoding="utf-8"), encoding="utf-8")
         (run_dir / "dataset_statistics.json").write_text(stats_path.read_text(encoding="utf-8"), encoding="utf-8")
         from deployment.model_server.policy_norm_processor import PolicyNormProcessor
@@ -431,14 +431,14 @@ def test_fastwam_jointflow_adapter_for_rynn_base_pretraining() -> None:
 
 
 def test_rynn_h32_config_uses_fastwam_release_abi_and_aligned_world_stride() -> None:
-    """The production RoboTwin Rynn recipe must use the Fast-WAM H32 ABI."""
+    """The production RoboTwin Rynn recipe must use FastWAM's H32 ABI."""
 
     from starVLA.dataloader.gr00t_lerobot.registry import (
         DATASET_NAMED_MIXTURES,
         ROBOT_TYPE_CONFIG_MAP,
     )
 
-    config_path = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h50_50k.yaml"
+    config_path = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h32_50k.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     framework = config["framework"]
     data = config["datasets"]["vla_data"]
@@ -455,11 +455,11 @@ def test_rynn_h32_config_uses_fastwam_release_abi_and_aligned_world_stride() -> 
     assert data["fastwam_expected_fps"] == 50
     assert data["fastwam_val_fraction"] == 0.01
     assert data["fastwam_split_seed"] == 42
-    assert data["per_device_batch_size"] == 16
+    assert data["per_device_batch_size"] == 12
     assert data["include_state"] is True
     assert data["num_workers"] == 8
-    assert config["trainer"]["expected_global_batch_size"] == 1024
-    assert config["trainer"]["max_train_steps"] == 80000
+    assert config["trainer"]["expected_global_batch_size"] == 768
+    assert config["trainer"]["max_train_steps"] == 50000
     assert config["trainer"]["num_warmup_steps"] == 2000
     assert config["trainer"]["freeze_modules"] == ""
     assert config["trainer"]["logging_frequency"] == 200
@@ -468,7 +468,7 @@ def test_rynn_h32_config_uses_fastwam_release_abi_and_aligned_world_stride() -> 
     assert robot_type == "robotwin_fastwam"
     h32_data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
     assert h32_data_config.action_indices == list(range(32))
-    assert h50_data_config.action_keys == [
+    assert h32_data_config.action_keys == [
         "action.left_joints",
         "action.left_gripper",
         "action.right_joints",
@@ -479,10 +479,10 @@ def test_rynn_h32_config_uses_fastwam_release_abi_and_aligned_world_stride() -> 
 def test_rynn_h32_fullres_current_dino_variant_only_changes_current_pool() -> None:
     """The ablation keeps dense current tokens without changing future targets."""
 
-    base_path = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h50_50k.yaml"
+    base_path = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h32_50k.yaml"
     variant_path = (
         REPO_ROOT
-        / "examples/Robotwin/train_files/rynn_base_h50_current_dino_fullres_50k.yaml"
+        / "examples/Robotwin/train_files/rynn_base_h32_current_dino_fullres_50k.yaml"
     )
     base = yaml.safe_load(base_path.read_text(encoding="utf-8"))
     variant = yaml.safe_load(variant_path.read_text(encoding="utf-8"))
@@ -498,7 +498,8 @@ def test_rynn_h32_fullres_current_dino_variant_only_changes_current_pool() -> No
     assert mot["max_world_tokens"] == 120
     assert variant["framework"]["action_model"]["action_horizon"] == 32
     assert data["world_model"]["future_stride"] == 32
-    assert variant["trainer"]["expected_global_batch_size"] == 1024
+    assert variant["trainer"]["expected_global_batch_size"] == 768
+    assert variant["trainer"]["max_train_steps"] == 50000
 
     expected = copy.deepcopy(base)
     expected["run_id"] = variant["run_id"]
@@ -506,7 +507,7 @@ def test_rynn_h32_fullres_current_dino_variant_only_changes_current_pool() -> No
     assert variant == expected
 
 
-def test_fastwam_jointflow_h50_emits_aligned_action_and_world_indices() -> None:
+def test_fastwam_jointflow_h32_emits_aligned_action_and_world_indices() -> None:
     from starVLA.dataloader.jointflow.joint_dataset import (
         JointFastWAMRobotWinDataset,
         build_joint_dataloader,
@@ -517,7 +518,7 @@ def test_fastwam_jointflow_h50_emits_aligned_action_and_world_indices() -> None:
         _write_fixture(root)
         data_cfg = _config(
             root,
-            data_mix="robotwin_fastwam_h50",
+            data_mix="robotwin_fastwam",
             image_layout="fastwam_composite",
             composite_source_view_keys=[
                 "video.cam_high",
@@ -526,8 +527,8 @@ def test_fastwam_jointflow_h50_emits_aligned_action_and_world_indices() -> None:
             ],
             composite_view_key="video.robotwin_composite",
             include_state=True,
-            action_horizon=50,
-            world_model={"future_stride": 50},
+            action_horizon=32,
+            world_model={"future_stride": 32},
             future_valid_requires_full_stride=True,
             decode_future_video=True,
             online_dino=True,
@@ -545,14 +546,14 @@ def test_fastwam_jointflow_h50_emits_aligned_action_and_world_indices() -> None:
         )
         dataset = build_joint_dataloader(cfg).dataset
         assert isinstance(dataset, JointFastWAMRobotWinDataset)
-        assert dataset.delta_indices["action.left_joints"].tolist() == list(range(50))
-        assert dataset.delta_indices["video.cam_high"].tolist() == [0, 50]
+        assert dataset.delta_indices["action.left_joints"].tolist() == list(range(32))
+        assert dataset.delta_indices["video.cam_high"].tolist() == [0, 32]
         _mock_video(dataset)
 
         sample = dataset._pack_sample(dataset.transforms(dataset.get_step_data(0, 35)))
-        assert sample["action"].shape == (50, 14)
-        assert sample["action_is_pad"].shape == (50,)
-        assert int(sample["action_is_pad"].sum()) == 45
+        assert sample["action"].shape == (32, 14)
+        assert sample["action_is_pad"].shape == (32,)
+        assert int(sample["action_is_pad"].sum()) == 27
         assert sample["state"].shape == (1, 14)
         assert sample["image_0"].shape == (1, 384, 320, 3)
         assert sample["image_1"].shape == (1, 384, 320, 3)
@@ -564,7 +565,7 @@ def test_fastwam_train_infer_order_and_contract() -> None:
     from examples.Robotwin.eval_files.model2robotwin_fastwam_interface import FastWAMRobotWinModelClient
     from examples.Robotwin.eval_files.model2robotwin_interface import resolve_replan_steps
 
-    config_path = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h50_50k.yaml"
+    config_path = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h32_50k.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert PolicyServerWrapper._config_expects_state(config)
     assert resolve_replan_steps(24, 32) == 24

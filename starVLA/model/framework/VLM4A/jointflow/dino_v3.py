@@ -309,8 +309,26 @@ class DINOv3Backbone(nn.Module):
 
     ######### // code // ##########
     @torch.no_grad()
-    def preprocess_batch(self, images: Sequence) -> torch.Tensor:
+    def preprocess_batch(
+        self,
+        images: Sequence,
+        *,
+        image_size: int | Sequence[int] | None = None,
+    ) -> torch.Tensor:
+        """Normalize a batch at the requested DINO resolution.
+
+        ``image_size=None`` preserves the checkpoint's canonical input size.
+        An explicit size lets a shared frozen DINO backbone encode a rectangular
+        current-observation composite and a square future target without
+        stretching the future camera into the current composite geometry.
+        """
+
         device = next(self.parameters()).device
+        target_size = (
+            self.image_size
+            if image_size is None
+            else normalize_dino_image_size(image_size)
+        )
         tensors = []
         for img in images:
             if isinstance(img, Image.Image):
@@ -331,10 +349,10 @@ class DINOv3Backbone(nn.Module):
             if float(t.max()) > 1.5:  # uint8 / [0,255] -> [0,1]
                 t = t / 255.0
             t = t.unsqueeze(0)
-            if tuple(t.shape[-2:]) != self.image_size:
+            if tuple(t.shape[-2:]) != target_size:
                 t = F.interpolate(
                     t,
-                    size=self.image_size,
+                    size=target_size,
                     mode="bilinear",
                     align_corners=False,
                     antialias=True,

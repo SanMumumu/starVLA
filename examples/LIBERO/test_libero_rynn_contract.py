@@ -12,24 +12,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from deployment.libero_image import (
-    LIBERO_COMPOSITE_LAYOUT,
-    LIBERO_COMPOSITE_SIZE,
-    LIBERO_COMPOSITE_SOURCE_VIEW_KEYS,
-    LIBERO_COMPOSITE_VIEW_KEY,
-    build_libero_composite,
-)
 from examples.LIBERO.eval_files import model2libero_interface
 from examples.LIBERO.train_files.verify_rynn_h8_recipe import verify
 
 
-CONFIG_PATH = REPO_ROOT / "examples/LIBERO/train_files/rynn_base_h8_50k.yaml"
-FULLRES_CONFIG_PATH = (
+CONFIG_PATH = (
     REPO_ROOT
     / "examples/LIBERO/train_files/rynn_base_h8_current_dino_fullres_50k.yaml"
 )
 TRAIN_FILES_DIR = CONFIG_PATH.parent
-EXEC_DIR = REPO_ROOT.parent / "LIBERO"
+EXEC_DIR = REPO_ROOT / "执行脚本" / "LIBERO"
 
 
 def load_config() -> dict:
@@ -39,77 +31,93 @@ def load_config() -> dict:
 def server_metadata() -> dict:
     return {
         "action_chunk_size": 8,
-        "image_layout": LIBERO_COMPOSITE_LAYOUT,
-        "obs_image_size": list(LIBERO_COMPOSITE_SIZE),
-        "composite_view_key": LIBERO_COMPOSITE_VIEW_KEY,
-        "composite_source_view_keys": list(
-            LIBERO_COMPOSITE_SOURCE_VIEW_KEYS
-        ),
+        "image_layout": "separate_views",
+        "obs_image_size": [224, 224],
+        "composite_view_key": None,
+        "composite_source_view_keys": [],
         "expects_state": False,
     }
 
 
-def test_libero_composite_preserves_camera_order_and_pixels() -> None:
-    third = np.zeros((256, 256, 3), dtype=np.uint8)
-    third[..., 0] = 255
-    wrist = np.zeros((256, 256, 3), dtype=np.uint8)
-    wrist[..., 2] = 255
+def test_libero_uses_official_separate_view_contract() -> None:
+    from starVLA.dataloader.gr00t_lerobot.data_config import (
+        Libero4in1DataConfig,
+    )
 
-    composite = np.asarray(build_libero_composite([third, wrist]))
-    assert composite.shape == (256, 512, 3)
-    assert np.all(composite[:, :256] == third)
-    assert np.all(composite[:, 256:] == wrist)
-
-    with pytest.raises(ValueError, match="third_person, wrist"):
-        build_libero_composite([third])
-
-
-def test_jointflow_routes_libero_layout_to_shared_compositor() -> None:
-    from starVLA.dataloader.jointflow.joint_dataset import _composite_contract
-
-    size, view_key, builder = _composite_contract(LIBERO_COMPOSITE_LAYOUT)
-    assert size == LIBERO_COMPOSITE_SIZE
-    assert view_key == LIBERO_COMPOSITE_VIEW_KEY
-    assert builder is build_libero_composite
+    config = load_config()
+    data = config["datasets"]["vla_data"]
+    assert Libero4in1DataConfig.video_keys == [
+        "video.primary_image",
+        "video.wrist_image",
+    ]
+    assert data["image_layout"] == "separate_views"
+    assert data["obs_image_size"] == [224, 224]
+    assert "composite_source_view_keys" not in data
+    assert "composite_view_key" not in data
 
 
-@pytest.mark.parametrize(
-    ("num_processes", "accumulation"),
-    [(1, 64), (16, 1)],
-)
-def test_libero_recipe_has_fixed_bs256_topologies(
-    num_processes: int,
-    accumulation: int,
-) -> None:
-    summary = verify(load_config(), num_processes=num_processes)
-    assert summary["global_batch_size"] == 256
-    assert summary["gradient_accumulation_steps"] == accumulation
-    assert summary["max_train_steps"] == 60000
+def test_jointflow_selects_only_future_third_person() -> None:
+    from starVLA.dataloader.jointflow.joint_dataset import (
+        _select_future_target_views,
+    )
+
+    third = np.full((256, 256, 3), [255, 0, 0], dtype=np.uint8)
+    wrist = np.full((256, 256, 3), [0, 0, 255], dtype=np.uint8)
+    views, keys = _select_future_target_views(
+        ["video.primary_image", "video.wrist_image"],
+        [third, wrist],
+        {"future_target_view_keys": ["video.primary_image"]},
+    )
+
+    assert keys == ["video.primary_image"]
+    assert len(views) == 1
+    assert np.array_equal(views[0], third)
+
+
+def test_libero_recipe_has_fixed_bs128_no_accumulation() -> None:
+    summary = verify(load_config(), num_processes=16)
+    assert summary["global_batch_size"] == 128
+    assert summary["micro_batch_size"] == 8
+    assert summary["gradient_accumulation_steps"] == 1
+    assert summary["max_train_steps"] == 50000
     assert summary["save_interval"] == 5000
-    assert summary["pooled_dino_grid"] == [8, 16]
+    assert summary["future_target_view_keys"] == ["video.primary_image"]
+    assert summary["future_dino_image_size"] == [224, 224]
+    assert summary["current_view_count"] == 2
+    assert summary["future_view_count"] == 1
+    assert summary["pooled_dino_grid"] == [14, 14]
+
+    with pytest.raises(ValueError, match="exactly 16 processes"):
+        verify(load_config(), num_processes=1)
 
 
-def test_libero_fullres_current_dino_variant_only_changes_current_pool() -> None:
-    base = load_config()
-    variant = yaml.safe_load(FULLRES_CONFIG_PATH.read_text(encoding="utf-8"))
-    summary = verify(variant, num_processes=16)
+def test_libero_fullres_dino_uses_two_current_and_one_future_view() -> None:
+    config = load_config()
+    summary = verify(config, num_processes=16)
 
-    assert variant["framework"]["dino"]["current_dino_pool"] == 1
-    assert variant["framework"]["dino"]["dino_pool"] == 2
-    assert summary["current_dino_grid"] == [16, 32]
-    assert summary["pooled_dino_grid"] == [8, 16]
-    assert summary["global_batch_size"] == 256
-
-    expected = deepcopy(base)
-    expected["run_id"] = variant["run_id"]
-    expected["framework"]["dino"]["current_dino_pool"] = 1
-    assert variant == expected
+    assert config["framework"]["dino"]["current_dino_pool"] is None
+    assert config["framework"]["dino"]["dino_pool"] == 1
+    assert config["framework"]["world_action_mot"]["num_current_world_views"] == 2
+    assert summary["current_dino_grid"] == [28, 14]
+    assert summary["pooled_dino_grid"] == [14, 14]
+    assert summary["global_batch_size"] == 128
 
 
-def test_libero_recipe_rejects_camera_order_drift() -> None:
+def test_libero_recipe_rejects_composite_layout_drift() -> None:
     config = deepcopy(load_config())
-    config["datasets"]["vla_data"]["composite_source_view_keys"].reverse()
-    with pytest.raises(ValueError, match="composite_source_view_keys"):
+    config["datasets"]["vla_data"]["image_layout"] = (
+        "libero_dual_view_composite"
+    )
+    with pytest.raises(ValueError, match="image_layout"):
+        verify(config, num_processes=16)
+
+
+def test_libero_recipe_rejects_future_target_view_drift() -> None:
+    config = deepcopy(load_config())
+    config["datasets"]["vla_data"]["future_target_view_keys"] = [
+        "video.wrist_image"
+    ]
+    with pytest.raises(ValueError, match="future_target_view_keys"):
         verify(config, num_processes=16)
 
 
@@ -137,7 +145,7 @@ def test_libero_recipe_rejects_upstream_control_drift() -> None:
         verify(config, num_processes=16)
 
 
-def test_libero_client_builds_the_same_composite(monkeypatch) -> None:
+def test_libero_client_preserves_separate_official_views(monkeypatch) -> None:
     requests = []
 
     class FakePolicy:
@@ -179,20 +187,22 @@ def test_libero_client_builds_the_same_composite(monkeypatch) -> None:
     )
 
     sent = requests[0]["examples"][0]
-    assert len(sent["image"]) == 1
-    composite = np.asarray(sent["image"][0])
-    assert composite.shape == (256, 512, 3)
-    assert np.all(composite[:, :256] == third)
-    assert np.all(composite[:, 256:] == wrist)
+    assert len(sent["image"]) == 2
+    primary_sent = np.asarray(sent["image"][0])
+    wrist_sent = np.asarray(sent["image"][1])
+    assert primary_sent.shape == (224, 224, 3)
+    assert wrist_sent.shape == (224, 224, 3)
+    assert np.all(primary_sent == [255, 0, 0])
+    assert np.all(wrist_sent == [0, 0, 255])
     assert "state" not in sent
 
 
 def test_libero_recipe_matches_wam_exp5_nostate_contract() -> None:
-    """WAM exp5 alignment: no proprio, 60K schedule, empty freeze list."""
+    """Maintained contract: no proprio, 50K schedule, empty freeze list."""
     config = load_config()
     assert config["datasets"]["vla_data"]["include_state"] is False
     assert config["framework"]["action_model"]["state_dim"] == 0
-    assert config["trainer"]["max_train_steps"] == 60000
+    assert config["trainer"]["max_train_steps"] == 50000
     assert config["trainer"]["num_warmup_steps"] == 3000
     assert config["trainer"]["learning_rate"]["action_model"] == 5.0e-05
     assert config["trainer"]["freeze_modules"] == ""
@@ -202,9 +212,6 @@ def test_libero_recipe_matches_wam_exp5_nostate_contract() -> None:
 
 
 def test_libero_aidi_jobs_use_16gpu_train_and_8gpu_eval() -> None:
-    train = yaml.safe_load(
-        (EXEC_DIR / "job_train_16gpu.yaml").read_text(encoding="utf-8")
-    )
     fullres_train = yaml.safe_load(
         (EXEC_DIR / "job_train_16gpu_current_dino_fullres.yaml").read_text(
             encoding="utf-8"
@@ -218,8 +225,6 @@ def test_libero_aidi_jobs_use_16gpu_train_and_8gpu_eval() -> None:
             encoding="utf-8"
         )
     )
-    assert train["REQUIRED"]["WORKER_MIN_NUM"] == 1
-    assert train["REQUIRED"]["GPU_PER_WORKER"] == 16
     assert fullres_train["REQUIRED"]["WORKER_MIN_NUM"] == 1
     assert fullres_train["REQUIRED"]["GPU_PER_WORKER"] == 16
     assert "rynn_base_h8_current_dino_fullres_50k.yaml" in fullres_train["REQUIRED"][
@@ -229,8 +234,13 @@ def test_libero_aidi_jobs_use_16gpu_train_and_8gpu_eval() -> None:
     assert client["REQUIRED"]["GPU_PER_WORKER"] == 8
     assert client["REQUIRED"]["environment"]["NUM_CLIENTS"] == "8"
     assert not (EXEC_DIR / "job_train_1gpu.yaml").exists()
-    assert "launcher.sh" in train["REQUIRED"]["RUN_SCRIPTS"]
+    assert not (EXEC_DIR / "job_train_16gpu.yaml").exists()
+    assert not (
+        TRAIN_FILES_DIR / "rynn_base_h8_50k.yaml"
+    ).exists()
     assert "launcher.sh" in fullres_train["REQUIRED"]["RUN_SCRIPTS"]
+    assert "bs128-50k" in fullres_train["REQUIRED"]["JOB_NAME"]
+    assert "dino-fullres" in fullres_train["REQUIRED"]["JOB_NAME"]
     launcher = (EXEC_DIR / "run.sh").read_text(encoding="utf-8")
     assert "run_policy_servers_8.sh" in launcher
     assert "eval_libero_plus_8.sh" in launcher

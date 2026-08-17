@@ -1,12 +1,13 @@
-# Current Rynn H8 recipe (WAM-exp5-aligned hypers)
+# Current Rynn H8 recipe (official separate views, BS128, 50K)
 
-The canonical config is `train_files/rynn_base_h8_50k.yaml`. Model ABI is Rynn:
-third-person + wrist → one 512x256 `[third-person | wrist]` composite, 7-D
-`delta_qpos`, H8 full-chunk execution. Non-model train controls follow WAM
-`0620_wam_exp5_2b_bigbs_policy` (LIBERO-plus ~81.7%): **`include_state: false`**,
-**60K steps**, warmup 3K, action LR `5e-5`, empty `freeze_modules`, logging 100.
-Text / subtask supervision stays **off**. Global batch remains **256** on one
-16-GPU node (`16 × 16 × 1`); WAM's `accum=8` is not copied (Rynn MoT OOM risk).
+The canonical config is
+`train_files/rynn_base_h8_current_dino_fullres_50k.yaml`. Model ABI is Rynn:
+the third-person and wrist observations remain two independent `224x224`
+images, matching official StarVLA. Future world supervision uses only the
+third-person camera. Actions are 7-D `delta_qpos` with H8 full-chunk execution.
+State and text/subtask supervision are off. The maintained run is **50K**
+steps, warmup 3K, action LR `5e-5`, and global batch **128** on one 16-GPU
+node (`8 × 16 × 1`); gradient accumulation is deliberately 1.
 
 Train on one 16-GPU node from the repository root:
 
@@ -18,18 +19,15 @@ RUN_ROOT_DIR=/path/to/outputs \
 bash examples/LIBERO/train_files/run_libero_train.sh
 ```
 
-The maintained contract is global batch 256, **60K** steps, and a checkpoint every
-5K steps. The default topology is `16 x 16 GPUs x 1 accumulation = 256`; use
-`NUM_PROCESSES=1` for the supported `4 x 1 x 64 = 256` single-GPU mode.
+The maintained contract is global batch 128, **50K** steps, and a checkpoint
+every 5K steps. The only supported topology is
+`8 micro-batch x 16 GPUs x 1 accumulation = 128`.
 
-## Dense-current-DINO variant
+## Full-resolution DINO
 
-`train_files/rynn_base_h8_current_dino_fullres_50k.yaml` is the single-variable
-variant without DINO pooling on the current observation. Its clean current
-prefix retains the full 16x32 grid (512 tokens), while the future denoising
-target keeps `dino_pool: 2` and the original 8x16 grid (128 tokens). H8, 60K
-steps, WAM-aligned optimizer settings, nostate data ABI, and global batch 256
-are unchanged.
+The current primary and wrist images retain two full 14x14 grids (392 tokens).
+The future denoising target is only the third-person image and also retains its
+full 14x14 grid (196 tokens); `dino_pool` is 1 throughout.
 
 Train it directly with:
 
@@ -73,11 +71,11 @@ evaluation.
 The LIBERO recipe deliberately does not set an action FP32/BF16 override.
 Model precision inherits the standard StarVLA training and serving runtime.
 
-## Upstream / WAM control-variable alignment
+## Upstream / WAM control-variable comparison
 
 Comparable optimizer fields still match StarVLA's upstream
-`starvla_cotrain_libero.yaml`. Schedule and state conditioning follow WAM
-exp5 (`0620_wam_exp5_2b_bigbs_policy`) instead of the older Rynn 50K+state recipe.
+`starvla_cotrain_libero.yaml`. State conditioning and action LR follow WAM
+exp5; batch and schedule use the confirmed effective BS128/50K contract.
 
 | Contract | WAM exp5 (81.7%) | Maintained Rynn recipe |
 | --- | --- | --- |
@@ -85,17 +83,17 @@ exp5 (`0620_wam_exp5_2b_bigbs_policy`) instead of the older Rynn 50K+state recip
 | state | `include_state: false` | same |
 | data | `libero_all`, no sequential sampling | same |
 | text / subtask loss | none for LIBERO-plus | `text_supervision` / `text_annotations` false |
-| VLA micro-batch | 16/GPU | same on the 16-GPU topology |
-| steps / warmup / save | 60K / 3K / 5K | same |
+| VLA micro-batch | serialized as 16/GPU | 8/GPU |
+| steps / warmup / save | serialized as 60K / 3K / 5K | 50K / 3K / 5K |
 | base / interface / action LR | 2.5e-5 / 1e-5 / **5e-5** | same |
 | freeze | effectively empty | `freeze_modules: ""` |
 | logging | 100 | same |
-| observation | WAM default views | Rynn 512x256 dual-view composite (model ABI) |
+| observation | separate current views; future primary | separate primary+wrist 224x224; future primary 224x224 |
 | backbone | Qwen3-VL-2B + WAM | RynnBrain1.1 + causal-DINO MoT (model ABI) |
-| effective batch | yaml `accum=8` (GPU-count dependent) | fixed **256** (`accum=1` on 16 GPU) |
+| effective batch | confirmed **128**; serialized accumulation was ineffective | fixed **128** (`8x16x1`) |
 
-Global batch is the intentional non-copy: WAM's `accum=8` on a full node would
-push Rynn MoT far past the maintained 256 contract and likely OOM.
+The launcher does not rely on accumulation: it uses the physical micro-batch
+and 16 processes directly to obtain global batch 128.
 
 ---
 

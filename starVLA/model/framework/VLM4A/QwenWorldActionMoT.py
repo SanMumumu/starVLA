@@ -30,6 +30,7 @@ from starVLA.model.framework.share_tools import merge_framework_config
 from starVLA.model.framework.VLM4A.jointflow.dino_v3 import (
     DINOv3Backbone,
     dino_patch_grid,
+    normalize_dino_image_size,
     resolve_dino_spec,
 )
 from starVLA.model.framework.VLM4A.world_action_mot import (
@@ -149,6 +150,8 @@ class QwenWorldActionMoTDefaultConfig:
             "weights": None,
             "loader": "auto",
             "image_size": [384, 320],
+            # Optional future-target resolution. None reuses image_size.
+            "future_image_size": None,
             "patch_size": 16,
             "embed_dim": 768,
             "stats_path": None,
@@ -210,7 +213,11 @@ class QwenWorldActionMoTDefaultConfig:
             "dropout": 0.1,
             "time_frequency_dim": 256,
             "max_world_tokens": 512,
+            # num_world_views is the denoising-target view count. Current
+            # observations may contain additional policy views (for example,
+            # official LIBERO uses primary + wrist but predicts primary only).
             "num_world_views": 1,
+            "num_current_world_views": None,
             "enable_gradient_checkpointing": True,
             "num_inference_timesteps": 10,
             "repeated_diffusion_steps": 1,
@@ -441,6 +448,15 @@ class QwenWorldActionMoT(baseframework):
         self._dino_spec = resolve_dino_spec(framework.dino)
         self.dino_dim = int(self._dino_spec["embed_dim"])
         self.dino_pool = int(framework.dino.get("dino_pool", 1))
+        configured_future_image_size = framework.dino.get(
+            "future_image_size",
+            None,
+        )
+        self.future_dino_image_size = normalize_dino_image_size(
+            self._dino_spec["image_size"]
+            if configured_future_image_size is None
+            else configured_future_image_size
+        )
         configured_current_dino_pool = framework.dino.get(
             "current_dino_pool",
             None,
@@ -450,24 +466,39 @@ class QwenWorldActionMoT(baseframework):
             if configured_current_dino_pool is None
             else int(configured_current_dino_pool)
         )
-        rows, columns = dino_patch_grid(
+        current_rows, current_columns = dino_patch_grid(
             self._dino_spec["image_size"], self._dino_spec["patch_size"]
         )
-        if self.dino_pool <= 0 or rows % self.dino_pool or columns % self.dino_pool:
+        future_rows, future_columns = dino_patch_grid(
+            self.future_dino_image_size,
+            self._dino_spec["patch_size"],
+        )
+        if (
+            self.dino_pool <= 0
+            or future_rows % self.dino_pool
+            or future_columns % self.dino_pool
+        ):
             raise ValueError(
-                f"dino_pool={self.dino_pool} must divide DINO grid {(rows, columns)}"
+                "dino_pool="
+                f"{self.dino_pool} must divide future DINO grid "
+                f"{(future_rows, future_columns)}"
+            )
+        current_pool = (
+            self.dino_pool
+            if self.current_dino_pool is None
+            else self.current_dino_pool
+        )
+        if (
+            current_pool <= 0
+            or current_rows % current_pool
+            or current_columns % current_pool
+        ):
+            raise ValueError(
+                "current DINO pool="
+                f"{current_pool} must divide current DINO grid "
+                f"{(current_rows, current_columns)}"
             )
         if self.current_dino_pool is not None:
-            if (
-                self.current_dino_pool <= 0
-                or rows % self.current_dino_pool
-                or columns % self.current_dino_pool
-            ):
-                raise ValueError(
-                    "current_dino_pool="
-                    f"{self.current_dino_pool} must divide DINO grid "
-                    f"{(rows, columns)}"
-                )
             if self.current_dino_pool >= self.dino_pool:
                 raise ValueError(
                     "current_dino_pool must be smaller than dino_pool so the "
@@ -482,16 +513,35 @@ class QwenWorldActionMoT(baseframework):
             raise ValueError(
                 f"world_action_mot.num_world_views must be positive, got {self.num_world_views}"
             )
-        pooled_rows = rows // self.dino_pool
-        pooled_columns = columns // self.dino_pool
+        configured_current_views = framework.world_action_mot.get(
+            "num_current_world_views",
+            None,
+        )
+        self.num_current_world_views = (
+            self.num_world_views
+            if configured_current_views is None
+            else int(configured_current_views)
+        )
+        if self.num_current_world_views <= 0:
+            raise ValueError(
+                "world_action_mot.num_current_world_views must be positive, "
+                f"got {self.num_current_world_views}"
+            )
+        pooled_rows = future_rows // self.dino_pool
+        pooled_columns = future_columns // self.dino_pool
         pooled_tokens = self.num_world_views * pooled_rows * pooled_columns
+        resolved_current_grid = (
+            self.num_current_world_views * (current_rows // current_pool),
+            current_columns // current_pool,
+        )
+        resolved_future_grid = (
+            self.num_world_views * pooled_rows,
+            pooled_columns,
+        )
         current_grid = (
             None
-            if self.current_dino_pool is None
-            else (
-                self.num_world_views * (rows // self.current_dino_pool),
-                columns // self.current_dino_pool,
-            )
+            if resolved_current_grid == resolved_future_grid
+            else resolved_current_grid
         )
         max_world_tokens = int(framework.world_action_mot.get("max_world_tokens", 512))
         if pooled_tokens > max_world_tokens:
@@ -1355,14 +1405,21 @@ class QwenWorldActionMoT(baseframework):
         self,
         features: torch.Tensor,
         pool: int | None = None,
+        image_size=None,
     ) -> torch.Tensor:
         pool = self.dino_pool if pool is None else int(pool)
         if pool == 1:
             return features
         rows, columns = dino_patch_grid(
-            self._dino_spec["image_size"], self._dino_spec["patch_size"]
+            self._dino_spec["image_size"] if image_size is None else image_size,
+            self._dino_spec["patch_size"],
         )
         batch, _, dim = features.shape
+        if features.shape[1] != rows * columns:
+            raise ValueError(
+                "DINO feature/grid mismatch: "
+                f"features={features.shape[1]}, grid={(rows, columns)}"
+            )
         features = features.reshape(batch, rows, columns, dim)
         features = features.reshape(
             batch, rows // pool, pool, columns // pool, pool, dim
@@ -1373,19 +1430,27 @@ class QwenWorldActionMoT(baseframework):
     def _encode_dino_raw(
         self,
         batch_views: list[list[Image.Image]],
+        *,
+        image_size=None,
+        expected_views: int | None = None,
     ) -> tuple[torch.Tensor, int]:
         teacher = self._ensure_dino()
         view_counts = {len(views) for views in batch_views}
         if len(view_counts) != 1:
             raise ValueError(f"all examples must have the same view count, got {view_counts}")
         views_per_example = next(iter(view_counts))
-        if views_per_example != self.num_world_views:
+        expected_views = (
+            self.num_world_views
+            if expected_views is None
+            else int(expected_views)
+        )
+        if views_per_example != expected_views:
             raise ValueError(
                 "current/future image view count does not match the checkpoint contract: "
-                f"got={views_per_example}, configured={self.num_world_views}"
+                f"got={views_per_example}, configured={expected_views}"
             )
         flat = [image for views in batch_views for image in views]
-        tensor = teacher.preprocess_batch(flat)
+        tensor = teacher.preprocess_batch(flat, image_size=image_size)
         features = teacher(tensor).float()
         return features, views_per_example
 
@@ -1396,8 +1461,13 @@ class QwenWorldActionMoT(baseframework):
         batch_size: int,
         views_per_example: int,
         pool: int,
+        image_size=None,
     ) -> torch.Tensor:
-        features = self._pool_dino(features, pool=pool)
+        features = self._pool_dino(
+            features,
+            pool=pool,
+            image_size=image_size,
+        )
         features = features.reshape(
             int(batch_size),
             int(views_per_example) * features.shape[1],
@@ -1409,12 +1479,17 @@ class QwenWorldActionMoT(baseframework):
     def _encode_dino(self, batch_views: list[list[Image.Image]]) -> torch.Tensor:
         """Encode the pooled world-model DINO grid (legacy public helper)."""
 
-        features, views_per_example = self._encode_dino_raw(batch_views)
+        features, views_per_example = self._encode_dino_raw(
+            batch_views,
+            image_size=self.future_dino_image_size,
+            expected_views=self.num_world_views,
+        )
         return self._finalize_dino(
             features,
             batch_size=len(batch_views),
             views_per_example=views_per_example,
             pool=self.dino_pool,
+            image_size=self.future_dino_image_size,
         )
 
     @torch.no_grad()
@@ -1424,7 +1499,10 @@ class QwenWorldActionMoT(baseframework):
     ) -> torch.Tensor:
         """Encode the clean current-observation grid at its configured resolution."""
 
-        features, views_per_example = self._encode_dino_raw(batch_views)
+        features, views_per_example = self._encode_dino_raw(
+            batch_views,
+            expected_views=self.num_current_world_views,
+        )
         pool = (
             self.dino_pool
             if self.current_dino_pool is None
@@ -1435,6 +1513,7 @@ class QwenWorldActionMoT(baseframework):
             batch_size=len(batch_views),
             views_per_example=views_per_example,
             pool=pool,
+            image_size=self._dino_spec["image_size"],
         )
 
     def _stack_actions(self, examples: List[dict], dtype: torch.dtype) -> torch.Tensor:
@@ -2733,10 +2812,7 @@ class QwenWorldActionMoT(baseframework):
             self._current_views(example)
             for example in examples
         ]
-        if getattr(self, "current_dino_pool", None) is None:
-            current_world = self._encode_dino(current_views)
-        else:
-            current_world = self._encode_current_dino(current_views)
+        current_world = self._encode_current_dino(current_views)
         target_world = self._encode_dino([self._future_views(example) for example in examples])
         model_dtype = next(self.action_model.parameters()).dtype
         action_dtype_getter = getattr(self.action_model, "action_flow_dtype", None)
@@ -2882,10 +2958,7 @@ class QwenWorldActionMoT(baseframework):
             self._current_views(example)
             for example in examples
         ]
-        if getattr(self, "current_dino_pool", None) is None:
-            current_world = self._encode_dino(current_views)
-        else:
-            current_world = self._encode_current_dino(current_views)
+        current_world = self._encode_current_dino(current_views)
         model_dtype = next(self.action_model.parameters()).dtype
         action_dtype_getter = getattr(self.action_model, "action_flow_dtype", None)
         action_dtype = (

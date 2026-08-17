@@ -50,7 +50,7 @@ class FastWAMRobotWinModelClient(StandardModelClient):
             )
         if self.action_chunk_size not in {16, 32, 50}:
             raise RuntimeError(
-                "FastWAM adapter supports H16 closed-loop, legacy H32, or Rynn H50 checkpoints, got "
+                "FastWAM adapter supports H16, FastWAM/Rynn H32, or legacy Rynn H50 checkpoints, got "
                 f"action_chunk_size={self.action_chunk_size}"
             )
         expects_state = self.server_meta.get("expects_state")

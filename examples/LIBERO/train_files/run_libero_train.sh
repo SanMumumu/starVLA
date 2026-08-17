@@ -5,25 +5,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-CONFIG_YAML="${CONFIG_YAML:-examples/LIBERO/train_files/rynn_base_h8_50k.yaml}"
+CONFIG_YAML="${CONFIG_YAML:-examples/LIBERO/train_files/rynn_base_h8_current_dino_fullres_50k.yaml}"
 NUM_PROCESSES="${NUM_PROCESSES:-16}"
 DATA_ROOT="${LIBERO_DATA_ROOT:-}"
 BASE_VLM="${RYNN_BASE_VLM:-}"
 RUN_ROOT_DIR="${RUN_ROOT_DIR:-}"
 RUN_ID="${RUN_ID:-}"
-GLOBAL_BATCH_SIZE=256
+GLOBAL_BATCH_SIZE=128
 
 case "${NUM_PROCESSES}" in
-  1)
-    MICRO_BATCH_SIZE=4
-    GRAD_ACCUM_STEPS=64
-    ;;
   16)
-    MICRO_BATCH_SIZE=16
+    MICRO_BATCH_SIZE=8
     GRAD_ACCUM_STEPS=1
     ;;
   *)
-    echo "[LIBERO train][ERROR] supported topologies are 1 GPU or one 16-GPU node; got NUM_PROCESSES=${NUM_PROCESSES}." >&2
+    echo "[LIBERO train][ERROR] this no-accumulation recipe requires one 16-GPU node; got NUM_PROCESSES=${NUM_PROCESSES}." >&2
     exit 1
     ;;
 esac
@@ -43,11 +39,7 @@ PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" python \
   --num-processes "${NUM_PROCESSES}"
 
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-  if [[ "${NUM_PROCESSES}" == "1" ]]; then
-    export CUDA_VISIBLE_DEVICES=0
-  else
-    export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
-  fi
+  export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 fi
 
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"

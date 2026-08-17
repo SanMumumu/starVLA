@@ -154,21 +154,21 @@ def test_fastwam_client_requires_the_requested_gate_checkpoint_and_phase() -> No
             )
 
 
-def test_fastwam_client_accepts_rynn_h50_release_order_contract() -> None:
+def test_fastwam_client_accepts_rynn_h32_release_order_contract() -> None:
     sys.path.insert(0, str(EVAL_DIR))
     try:
         import model2robotwin_fastwam_interface as adapter
     finally:
         sys.path.pop(0)
 
-    requested = "/models/rynn_h50/checkpoints/steps_50000_pytorch_model.pt"
+    requested = "/models/rynn_h32/checkpoints/steps_50000_pytorch_model.pt"
 
     def fake_standard_init(self, *args, **kwargs):
-        self.action_chunk_size = 50
-        self.replan_steps = 20
+        self.action_chunk_size = 32
+        self.replan_steps = 24
         self.server_meta = {
             "ckpt_path": kwargs.get("policy_ckpt_path"),
-            "action_chunk_size": 50,
+            "action_chunk_size": 32,
             "expects_state": True,
             "framework_name": "QwenWorldActionMoT",
         }
@@ -176,8 +176,8 @@ def test_fastwam_client_accepts_rynn_h50_release_order_contract() -> None:
     with patch.object(adapter.StandardModelClient, "__init__", fake_standard_init):
         client = adapter.FastWAMRobotWinModelClient(policy_ckpt_path=requested)
 
-    assert client.action_chunk_size == 50
-    assert client.replan_steps == 20
+    assert client.action_chunk_size == 32
+    assert client.replan_steps == 24
     assert client.expects_state is True
 
 

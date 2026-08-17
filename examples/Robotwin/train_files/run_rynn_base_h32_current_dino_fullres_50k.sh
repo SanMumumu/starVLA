@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-CONFIG_PATH="${SCRIPT_DIR}/rynn_base_h50_current_dino_fullres_50k.yaml"
+CONFIG_PATH="${SCRIPT_DIR}/rynn_base_h32_current_dino_fullres_50k.yaml"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 [[ -f "${CONFIG_PATH}" ]] || {
@@ -39,12 +39,17 @@ assert mot["world_grid_width"] == 10
 assert mot["max_world_tokens"] == 120
 assert planner["num_action_queries"] == 32
 assert action["action_horizon"] == 32
+assert data["data_mix"] == "robotwin_fastwam"
 assert data["action_horizon"] == 32
 assert data["world_model"]["future_stride"] == 32
-assert trainer["expected_global_batch_size"] == 1024
+assert data["per_device_batch_size"] == 12
+assert trainer["expected_global_batch_size"] == 768
+assert trainer["gradient_accumulation_steps"] == 1
+assert trainer["max_train_steps"] == 50000
 print(
     "[RoboTwin fullres] recipe PASS: current=24x20/480 tokens, "
-    "future=12x10/120 tokens, H32, global_batch=1024"
+    "future=12x10/120 tokens, H32/t+32, replan=24, "
+    "global_batch=768, steps=50000"
 )
 PY
 

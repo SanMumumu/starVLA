@@ -96,6 +96,42 @@ def _composite_contract(image_layout: str):
     raise ValueError(f"Unknown composite image layout: {image_layout!r}")
 
 
+def _select_future_target_views(
+    source_view_keys: list[str],
+    future_views: list[np.ndarray],
+    data_cfg,
+) -> tuple[list[np.ndarray], list[str]]:
+    """Select ordered future RGB targets independently of current layout.
+
+    Current policy inputs may be a multi-camera composite while the world
+    objective predicts only a canonical camera.  With no explicit selection,
+    historical behavior (all source views) is preserved.
+    """
+
+    configured = _cfg_get(data_cfg, "future_target_view_keys", None)
+    if configured is None:
+        return future_views, source_view_keys
+    requested = (
+        [str(configured)]
+        if isinstance(configured, str)
+        else [str(key) for key in configured]
+    )
+    if not requested:
+        raise ValueError("future_target_view_keys must not be empty")
+    if len(set(requested)) != len(requested):
+        raise ValueError(
+            f"future_target_view_keys contains duplicates: {requested}"
+        )
+    missing = [key for key in requested if key not in source_view_keys]
+    if missing:
+        raise ValueError(
+            "future_target_view_keys are unavailable: "
+            f"missing={missing}, available={source_view_keys}"
+        )
+    by_key = dict(zip(source_view_keys, future_views, strict=True))
+    return [by_key[key] for key in requested], requested
+
+
 def _text_value(value: Any) -> str:
     """Normalize one parquet text cell without inventing a label."""
 
@@ -662,6 +698,16 @@ class JointLiberoDataset(LeRobotSingleDataset):
                         )
                     future_views.append(frames[future_position])
 
+            selected_future_views, future_target_view_keys = (
+                _select_future_target_views(
+                    source_view_keys,
+                    future_views,
+                    self.data_cfg,
+                )
+                if decode_future
+                else ([], [])
+            )
+
             if image_layout in _COMPOSITE_LAYOUTS:
                 expected_source_keys = list(_cfg_get(self.data_cfg, "composite_source_view_keys", []))
                 if expected_source_keys and source_view_keys != expected_source_keys:
@@ -694,16 +740,40 @@ class JointLiberoDataset(LeRobotSingleDataset):
                 img0 = [
                     np.asarray(composite_builder(current_views), dtype=np.uint8)
                 ]
-                img1 = (
-                    [
+                view_keys = [composite_view_key]
+                if not decode_future:
+                    img1 = []
+                    target_view_keys = []
+                elif _cfg_get(
+                    self.data_cfg,
+                    "future_target_view_keys",
+                    None,
+                ) is None:
+                    img1 = [
                         np.asarray(
-                            composite_builder(future_views), dtype=np.uint8
+                            composite_builder(selected_future_views),
+                            dtype=np.uint8,
                         )
                     ]
-                    if decode_future
-                    else []
-                )
-                view_keys = [composite_view_key]
+                    target_view_keys = [composite_view_key]
+                else:
+                    future_size = _cfg_get(
+                        self.data_cfg,
+                        "future_obs_image_size",
+                        None,
+                    )
+                    future_size = (
+                        tuple(int(value) for value in future_size)
+                        if future_size
+                        else None
+                    )
+                    img1 = []
+                    for future_array in selected_future_views:
+                        future = Image.fromarray(future_array)
+                        if future_size and future.size != future_size:
+                            future = future.resize(future_size)
+                        img1.append(np.asarray(future))
+                    target_view_keys = future_target_view_keys
                 if self._text_history_offsets:
                     history_cfg = _cfg_get(self._text_config, "history", {})
                     history_image_field = str(
@@ -743,19 +813,30 @@ class JointLiberoDataset(LeRobotSingleDataset):
                     if target_size and current.size != target_size:
                         current = current.resize(target_size)
                     img0.append(np.asarray(current))
-                for future_array in future_views:
+                future_size = _cfg_get(
+                    self.data_cfg,
+                    "future_obs_image_size",
+                    target_size,
+                )
+                future_size = (
+                    tuple(int(v) for v in future_size)
+                    if future_size
+                    else None
+                )
+                for future_array in selected_future_views:
                     future = Image.fromarray(future_array)
-                    if target_size and future.size != target_size:
-                        future = future.resize(target_size)
+                    if future_size and future.size != future_size:
+                        future = future.resize(future_size)
                     img1.append(np.asarray(future))
                 view_keys = source_view_keys
+                target_view_keys = future_target_view_keys
             sample["image_0"] = np.stack(img0, axis=0)
             if img1:
                 sample["image_1"] = np.stack(img1, axis=0)
             sample["image_view_keys"] = view_keys
             sample["dino_view_keys"] = view_keys
-            if image_layout in _COMPOSITE_LAYOUTS:
-                sample["dino_target_view_keys"] = view_keys
+            if img1:
+                sample["dino_target_view_keys"] = target_view_keys
             #######
             if self._dino_target_latents:
                 target_view_keys = self._dino_target_view_keys()

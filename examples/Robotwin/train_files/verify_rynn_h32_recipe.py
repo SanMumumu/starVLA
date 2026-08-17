@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify Rynn H32 model ABI + Fast-WAM-aligned non-model train controls."""
+"""Verify the FastWAM-aligned RoboTwin Rynn H32 / BS768 / 50K contract."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Non-model controls aligned to
-# outputs/.../starvla_qwengroot_robotwin_fastwam_jitx_corrnoise/config.full.yaml
+# Rynn keeps the FastWAM H32 data ABI while pinning the confirmed BS768/50K
+# schedule and its own causal-DINO MoT model contract.
 EXPECTED = {
     "framework.name": "QwenWorldActionMoT",
     "framework.enable_world_action_mot": True,
@@ -43,10 +43,10 @@ EXPECTED = {
     "datasets.vla_data.world_model.future_stride": 32,
     "datasets.vla_data.fastwam_direct_frame_sampling": True,
     "datasets.vla_data.text_annotations.enabled": False,
-    "datasets.vla_data.per_device_batch_size": 16,
+    "datasets.vla_data.per_device_batch_size": 12,
     "datasets.vla_data.num_workers": 8,
-    "trainer.expected_global_batch_size": 1024,
-    "trainer.max_train_steps": 80000,
+    "trainer.expected_global_batch_size": 768,
+    "trainer.max_train_steps": 50000,
     "trainer.num_warmup_steps": 2000,
     "trainer.save_interval": 10000,
     "trainer.eval_interval": 1000,
@@ -83,19 +83,23 @@ def verify(config: dict[str, Any], *, num_processes: int) -> dict[str, Any]:
         )
         raise ValueError(f"Invalid RoboTwin H32 recipe: {details}")
 
-    if num_processes not in {1, 64}:
+    if num_processes != 64:
         raise ValueError(
-            f"RoboTwin H32 supports 1 or 64 processes, got {num_processes}"
+            "RoboTwin H32 BS768 recipe requires exactly 64 processes, "
+            f"got {num_processes}"
         )
     yaml_micro = int(select(config, "datasets.vla_data.per_device_batch_size"))
     global_batch = int(select(config, "trainer.expected_global_batch_size"))
-    micro = 4 if num_processes == 1 else yaml_micro
-    denominator = micro * num_processes
-    if global_batch % denominator:
+    accumulation = int(
+        select(config, "trainer.gradient_accumulation_steps")
+    )
+    computed_global = yaml_micro * num_processes * accumulation
+    if computed_global != global_batch:
         raise ValueError(
-            f"global batch {global_batch} is not divisible by {micro} x {num_processes}"
+            "global batch contract mismatch: "
+            f"{yaml_micro} x {num_processes} x {accumulation} = "
+            f"{computed_global}, declared {global_batch}"
         )
-    accumulation = global_batch // denominator
 
     height, width = select(config, "framework.dino.image_size")
     patch = int(select(config, "framework.dino.patch_size"))
@@ -114,12 +118,12 @@ def verify(config: dict[str, Any], *, num_processes: int) -> dict[str, Any]:
         )
 
     return {
-        "profile": "robotwin_rynnbrain11_fastwam_h32_bs1024_80k_fastwamhyper_v1",
+        "profile": "rynn_h32_bs768_50k",
         "num_processes": num_processes,
-        "micro_batch_size": micro,
+        "micro_batch_size": yaml_micro,
         "gradient_accumulation_steps": accumulation,
         "global_batch_size": global_batch,
-        "max_train_steps": 80000,
+        "max_train_steps": 50000,
         "save_interval": 10000,
         "current_dino_grid": list(current_grid),
         "pooled_dino_grid": list(pooled_grid),
