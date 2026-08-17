@@ -11,12 +11,15 @@ from starVLA.reproducibility.robodojo_rynn50k import (
     ROBODOJO_RYNN50K_BASE_H25_PROFILE,
     ROBODOJO_RYNN50K_BASE_HISTORY_H25_MEM_PROFILE,
     ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_PROFILE,
+    ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_PROFILE,
     ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_PROFILE,
     ROBODOJO_RYNN50K_WEIGHT_CONTRACT,
+    historical_contract_payload,
     validate_base_h25_current_dino_fullres_config,
     validate_base_h25_config,
     validate_base_history_h25_mem_config,
     validate_base_text_h25_mem_bf16_config,
+    validate_base_text_h25_mem_bf16_current_dino_fullres_config,
     validate_base_text_h25_mem_config,
 )
 
@@ -135,6 +138,21 @@ def test_base_text_h25_mem_profile_requires_event_memory_and_text_loss() -> None
         validate_base_text_h25_mem_config(variant)
 
 
+def test_base_text_h25_mem_contract_ignores_resume_runtime_state() -> None:
+    initial = _load("rynn_base_text_h25_mem_50k.yaml")
+    initial_summary = validate_base_text_h25_mem_config(initial)
+
+    resumed = deepcopy(initial)
+    resumed["trainer"]["is_resume"] = True
+    resumed["trainer"]["resume_state_path"] = "/runtime/checkpoints/full_state_step_40000"
+    resumed_summary = validate_base_text_h25_mem_config(resumed)
+
+    assert resumed_summary == initial_summary
+    payload = historical_contract_payload(resumed)
+    assert "trainer.is_resume" not in payload
+    assert "trainer.resume_state_path" not in payload
+
+
 def test_base_text_h25_mem_bf16_is_a_precision_only_counterpart() -> None:
     fp32 = _load("rynn_base_text_h25_mem_50k.yaml")
     bf16 = _load("rynn_base_text_h25_mem_bf16_50k.yaml")
@@ -153,6 +171,32 @@ def test_base_text_h25_mem_bf16_is_a_precision_only_counterpart() -> None:
     assert bf16["framework"]["world_action_mot"]["action_precision_mode"] == (
         "inherit"
     )
+
+
+def test_bf16_eventmem_current_dino_fullres_changes_only_current_grid() -> None:
+    control = _load("rynn_base_text_h25_mem_bf16_50k.yaml")
+    variant = _load(
+        "rynn_base_text_h25_mem_bf16_current_dino_fullres_50k.yaml"
+    )
+    summary = validate_base_text_h25_mem_bf16_current_dino_fullres_config(
+        variant
+    )
+    assert (
+        summary["profile"]
+        == ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_PROFILE
+    )
+    assert variant["framework"]["dino"]["current_dino_pool"] == 1
+    assert variant["framework"]["dino"]["dino_pool"] == 2
+    assert variant["framework"]["world_action_mot"]["action_precision_mode"] == (
+        "inherit"
+    )
+
+    control["run_id"] = variant["run_id"]
+    control["framework"]["reproduction_profile"] = variant["framework"][
+        "reproduction_profile"
+    ]
+    control["framework"]["dino"]["current_dino_pool"] = 1
+    assert control == variant
 
 
 def test_history_h25_mem_is_strict_text_plan_ablation() -> None:

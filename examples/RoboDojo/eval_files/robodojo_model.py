@@ -63,6 +63,28 @@ def _load_fastwam_image_module():
     return module
 
 
+def _load_eventmem_module():
+    """Load the deployment-owned, dataset-free rollout renderer."""
+
+    module_path = (
+        Path(__file__).resolve().parents[3]
+        / "deployment/robodojo_eventmem.py"
+    )
+    if not module_path.is_file():
+        raise FileNotFoundError(
+            f"StarVLA deployment event-memory renderer is missing: {module_path}"
+        )
+    spec = importlib.util.spec_from_file_location(
+        "_robodojo_eventmem_renderer",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load event-memory renderer from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -657,6 +679,40 @@ class Model(ModelTemplate):
             if len(checkpoint_path.parents) >= 2
             else checkpoint_path.name
         )
+        self.eventmem_capture_enabled = _as_bool(
+            self.model_cfg.get("eventmem_capture", False)
+        )
+        self.eventmem_latest_image_by_env: dict[int, np.ndarray] = {}
+        self.eventmem_recorder = None
+        if self.eventmem_capture_enabled:
+            if not self.event_memory_enabled:
+                raise RuntimeError(
+                    "ROBODOJO_SAVE_MODE=images requires an event-memory checkpoint"
+                )
+            output_dir = str(
+                self.model_cfg.get("eventmem_output_dir") or ""
+            ).strip()
+            if not output_dir:
+                raise ValueError(
+                    "eventmem_output_dir is required when eventmem_capture=true"
+                )
+            eventmem = _load_eventmem_module()
+            self.eventmem_recorder = eventmem.RolloutEventMemoryRecorder(
+                output_dir,
+                task_name=str(self.model_cfg.get("task_name") or "unknown"),
+                checkpoint_label=str(
+                    self.model_cfg.get("ckpt_name") or checkpoint_run
+                ),
+                num_envs=int(self.model_cfg.get("eventmem_num_envs", 1)),
+                max_frames=int(
+                    self.model_cfg.get("eventmem_max_frames", 9)
+                ),
+            )
+            print(
+                "[starVLA][RoboDojo][eventmem] "
+                f"saving figures to {output_dir}",
+                flush=True,
+            )
         rtc_summary = "disabled"
         if self.rtc_enabled:
             rtc_summary = (
@@ -738,6 +794,11 @@ class Model(ModelTemplate):
             self._latest_env_idx_list.append(env_idx)
             converted = self._convert_obs(obs)
             self.obs_by_env[env_idx] = converted
+            if getattr(self, "eventmem_capture_enabled", False):
+                self.eventmem_latest_image_by_env[env_idx] = _extract_camera(
+                    obs,
+                    ("cam_head", "cam_high", "head_camera"),
+                ).copy()
             if getattr(self, "text_history_enabled", False):
                 self._record_planner_observation(
                     env_idx,
@@ -1067,6 +1128,35 @@ class Model(ModelTemplate):
                         f"subtask={self.cached_current_subtask_by_env.get(env_idx, self.event_empty_cached_subtask)!r}",
                         flush=True,
                     )
+                recorder = getattr(self, "eventmem_recorder", None)
+                if recorder is not None:
+                    image = self.eventmem_latest_image_by_env.get(env_idx)
+                    if image is None:
+                        raise RuntimeError(
+                            "event-memory capture is missing the live third-person "
+                            f"image for env {env_idx}"
+                        )
+                    recorder.capture(
+                        env_idx=env_idx,
+                        frame=self.step_by_env.get(env_idx, 0),
+                        image=image,
+                        instruction=str(
+                            self.obs_by_env[env_idx].get(
+                                "lang", self.default_instruction
+                            )
+                        ),
+                        decision=decision,
+                        memory_add=memory_adds[position],
+                        planner_text=self.planner_text_by_env.get(env_idx),
+                        running_subtask_after=(
+                            self.cached_current_subtask_by_env.get(
+                                env_idx, self.event_empty_cached_subtask
+                            )
+                        ),
+                        running_memory_after=self.semantic_memory_by_env.get(
+                            env_idx, self.event_empty_memory
+                        ),
+                    )
         elif getattr(self, "text_planning_enabled", False):
             if planner_texts is None:
                 raise RuntimeError(
@@ -1211,6 +1301,14 @@ class Model(ModelTemplate):
         return actions
 
     def reset(self):
+        recorder = getattr(self, "eventmem_recorder", None)
+        if recorder is not None:
+            written = recorder.finish_interrupted_group()
+            for path in written:
+                print(
+                    f"[starVLA][RoboDojo][eventmem] wrote interrupted {path}",
+                    flush=True,
+                )
         self.obs_by_env.clear()
         self.action_chunks_by_env.clear()
         getattr(self, "normalized_action_chunks_by_env", {}).clear()
@@ -1218,11 +1316,23 @@ class Model(ModelTemplate):
         self.planner_text_by_env.clear()
         getattr(self, "semantic_memory_by_env", {}).clear()
         getattr(self, "cached_current_subtask_by_env", {}).clear()
+        getattr(self, "eventmem_latest_image_by_env", {}).clear()
         self.planner_observation_history_by_env.clear()
         self.finished_task_list_by_env.clear()
         self.planner_input_finished_task_list_by_env.clear()
         self.step_by_env.clear()
         self._latest_env_idx_list = [0]
+
+    def on_trial_end(self, result=None):
+        recorder = getattr(self, "eventmem_recorder", None)
+        if recorder is None:
+            return None
+        written = recorder.finish_episode_group(
+            result if isinstance(result, dict) else None
+        )
+        for path in written:
+            print(f"[starVLA][RoboDojo][eventmem] wrote {path}", flush=True)
+        return {"eventmem_figures": [str(path) for path in written]}
 
 
 __all__ = ["Model"]

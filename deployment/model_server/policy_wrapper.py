@@ -43,6 +43,10 @@ from deployment.model_server.policy_norm_processor import (
 )
 from starVLA.dataloader.gr00t_lerobot.registry import ROBOT_TYPE_CONFIG_MAP
 from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
+from starVLA.dataloader.jointflow.joint_dataset import (
+    _append_state_norm_if_needed,
+    _drop_video_transforms,
+)
 from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import read_mode_config
 
@@ -610,7 +614,17 @@ class PolicyServerWrapper:
             state_key_dims=state_key_dims,
         )
 
-        transform = data_config.transform()
+        transform = _drop_video_transforms(data_config.transform())
+        # JointFlow training appends q99/binary state normalization on top of the
+        # action-only Libero4in1 transform.  Mirror that here so include_state=true
+        # checkpoints receive normalized proprioception at inference.
+        vla_cfg = (model_cfg.get("datasets") or {}).get("vla_data") or {}
+        state_norm_modes = vla_cfg.get("state_norm_modes", None)
+        transform = _append_state_norm_if_needed(
+            transform,
+            state_keys,
+            state_norm_modes,
+        )
         if not isinstance(transform, ComposedModalityTransform):
             transform = ComposedModalityTransform(transforms=[transform])
         transform.set_metadata(ds_meta)

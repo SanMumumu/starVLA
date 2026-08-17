@@ -553,6 +553,35 @@ def test_maintained_robodojo_text_and_mem_recipes() -> None:
         "released_rynn50k/launch.sh base_text_h25_mem_bf16"
     )
 
+    event_bf16_fullres = OmegaConf.load(
+        train_dir
+        / "rynn_base_text_h25_mem_bf16_current_dino_fullres_50k.yaml"
+    )
+    assert int(event_bf16_fullres.framework.dino.current_dino_pool) == 1
+    assert int(event_bf16_fullres.framework.dino.dino_pool) == 2
+    assert str(
+        event_bf16_fullres.framework.world_action_mot.action_precision_mode
+    ) == "inherit"
+    bf16_control = OmegaConf.to_container(event_bf16, resolve=True)
+    fullres_payload = OmegaConf.to_container(event_bf16_fullres, resolve=True)
+    bf16_control["run_id"] = fullres_payload["run_id"]
+    bf16_control["framework"]["reproduction_profile"] = fullres_payload[
+        "framework"
+    ]["reproduction_profile"]
+    bf16_control["framework"]["dino"]["current_dino_pool"] = 1
+    assert bf16_control == fullres_payload
+
+    event_bf16_fullres_job = OmegaConf.to_container(
+        OmegaConf.load(
+            job_dir / "job_base_text_bf16_current_dino_fullres_50k.yaml"
+        ),
+        resolve=False,
+    )
+    assert str(event_bf16_fullres_job["REQUIRED"]["RUN_SCRIPTS"]).endswith(
+        "released_rynn50k/launch.sh "
+        "base_text_h25_mem_bf16_current_dino_fullres"
+    )
+
     history = OmegaConf.load(train_dir / "rynn_base_history_h25_mem_50k.yaml")
     assert not bool(history.framework.planner.text_supervision.enabled)
     assert float(history.framework.world_action_mot.text_loss_weight) == 0.0
@@ -593,13 +622,18 @@ def test_maintained_robodojo_text_and_mem_recipes() -> None:
     history_submit = "job_base_history_50k.yaml"
     event_submit = "job_base_text_50k.yaml"
     event_bf16_submit = "job_base_text_bf16_50k.yaml"
+    event_bf16_fullres_submit = (
+        "job_base_text_bf16_current_dino_fullres_50k.yaml"
+    )
     assert history_submit in runbook
     assert event_submit in runbook
     assert event_bf16_submit in runbook
+    assert event_bf16_fullres_submit in runbook
     assert (
         runbook.index(history_submit)
         < runbook.index(event_submit)
         < runbook.index(event_bf16_submit)
+        < runbook.index(event_bf16_fullres_submit)
     )
 
 

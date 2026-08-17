@@ -1403,23 +1403,40 @@ class LeRobotSingleDataset(Dataset):
         image_layout = str(
             self.data_cfg.get("image_layout", "separate_views") if self.data_cfg is not None else "separate_views"
         ).lower()
-        if image_layout in {"fastwam_composite", "tri_view_composite"}:
-            from starVLA.dataloader.fastwam_image import (
-                FASTWAM_COMPOSITE_SIZE,
-                build_robotwin_composite,
-            )
+        if image_layout in {
+            "fastwam_composite",
+            "tri_view_composite",
+            "libero_dual_view_composite",
+        }:
+            if image_layout == "libero_dual_view_composite":
+                from starVLA.dataloader.libero_image import (
+                    LIBERO_COMPOSITE_SIZE as composite_size,
+                    build_libero_composite as composite_builder,
+                )
+            else:
+                from starVLA.dataloader.fastwam_image import (
+                    FASTWAM_COMPOSITE_SIZE as composite_size,
+                    build_robotwin_composite as composite_builder,
+                )
 
             expected_source_keys = list(self.data_cfg.get("composite_source_view_keys", []))
             if expected_source_keys and video_keys != expected_source_keys:
                 raise ValueError(
-                    "FastWAM composite camera order mismatch: "
+                    "Composite camera order mismatch: "
                     f"dataset={video_keys}, configured={expected_source_keys}"
                 )
-            step_images = [build_robotwin_composite([data[key][0] for key in video_keys])]
-            configured_size = tuple(int(value) for value in self.data_cfg.get("obs_image_size", FASTWAM_COMPOSITE_SIZE))
-            if configured_size != FASTWAM_COMPOSITE_SIZE or step_images[0].size != FASTWAM_COMPOSITE_SIZE:
+            step_images = [
+                composite_builder([data[key][0] for key in video_keys])
+            ]
+            configured_size = tuple(
+                int(value)
+                for value in self.data_cfg.get(
+                    "obs_image_size", composite_size
+                )
+            )
+            if configured_size != composite_size or step_images[0].size != composite_size:
                 raise ValueError(
-                    f"FastWAM composite must be {FASTWAM_COMPOSITE_SIZE} (width,height), "
+                    f"{image_layout} must be {composite_size} (width,height), "
                     f"configured={configured_size}, actual={step_images[0].size}"
                 )
         else:

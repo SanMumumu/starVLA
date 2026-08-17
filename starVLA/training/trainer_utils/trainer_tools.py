@@ -26,7 +26,11 @@ logger = get_logger(__name__)
 
 def normalize_dotlist_args(args):
     """
-    Convert ['--x.y', 'val'] and ['--flag'] → ['x.y=val', 'flag=true']
+    Convert CLI overrides into OmegaConf dotlist entries.
+
+    Accepted forms:
+      ['--x.y', 'val'] / ['--flag'] / ['--x.y=val'] → ['x.y=val', 'flag=true']
+      ['x.y=val'] → ['x.y=val']  (bare OmegaConf-style overrides)
     """
     normalized = []
     skip = False
@@ -45,6 +49,9 @@ def normalize_dotlist_args(args):
                 skip = True
             else:
                 normalized.append(f"{key}=true")
+        elif "=" in arg and not arg.startswith("-"):
+            # Bare OmegaConf-style override, e.g. trainer.is_resume=true.
+            normalized.append(arg)
         else:
             pass  # skip orphaned values
     return normalized

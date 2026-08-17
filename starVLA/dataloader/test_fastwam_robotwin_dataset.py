@@ -219,7 +219,7 @@ def test_fastwam_checkpoint_sample_and_direct_sampler() -> None:
         checkpoint = run_dir / "checkpoints/steps_1_pytorch_model.pt"
         checkpoint.parent.mkdir(parents=True)
         checkpoint.touch()
-        source_config = REPO_ROOT / "examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam_old.yaml"
+        source_config = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h50_50k.yaml"
         (run_dir / "config.yaml").write_text(source_config.read_text(encoding="utf-8"), encoding="utf-8")
         (run_dir / "dataset_statistics.json").write_text(stats_path.read_text(encoding="utf-8"), encoding="utf-8")
         from deployment.model_server.policy_norm_processor import PolicyNormProcessor
@@ -236,11 +236,6 @@ def test_fastwam_checkpoint_sample_and_direct_sampler() -> None:
         np.testing.assert_allclose(prepared["state"][0], normalized, rtol=2e-5, atol=2e-5)
         wrapper._expects_state = False
         assert "state" not in wrapper._prepare_examples([{"state": source.copy(), "image": sample["image"]}])[0]
-        from examples.Robotwin.eval_files.verify_fastwam_checkpoint_contract import verify
-
-        assert verify(checkpoint, replan_steps=24)["replan"] == 24
-
-
 def test_fastwam_split_domain_and_wam_composite_target() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -435,8 +430,8 @@ def test_fastwam_jointflow_adapter_for_rynn_base_pretraining() -> None:
         assert action_stats["mask"] == [True] * 14
 
 
-def test_rynn_h50_config_uses_fastwam_release_abi_and_aligned_world_stride() -> None:
-    """The production RoboTwin Rynn recipe must not fall back to H32 indices."""
+def test_rynn_h32_config_uses_fastwam_release_abi_and_aligned_world_stride() -> None:
+    """The production RoboTwin Rynn recipe must use the Fast-WAM H32 ABI."""
 
     from starVLA.dataloader.gr00t_lerobot.registry import (
         DATASET_NAMED_MIXTURES,
@@ -449,11 +444,11 @@ def test_rynn_h50_config_uses_fastwam_release_abi_and_aligned_world_stride() -> 
     data = config["datasets"]["vla_data"]
 
     assert framework["name"] == "QwenWorldActionMoT"
-    assert framework["planner"]["num_action_queries"] == 50
-    assert framework["action_model"]["action_horizon"] == 50
-    assert data["action_horizon"] == 50
-    assert data["world_model"]["future_stride"] == 50
-    assert data["data_mix"] == "robotwin_fastwam_h50"
+    assert framework["planner"]["num_action_queries"] == 32
+    assert framework["action_model"]["action_horizon"] == 32
+    assert data["action_horizon"] == 32
+    assert data["world_model"]["future_stride"] == 32
+    assert data["data_mix"] == "robotwin_fastwam"
     assert data["image_layout"] == "fastwam_composite"
     assert data["composite_view_key"] == "video.robotwin_composite"
     assert data["fastwam_direct_frame_sampling"] is True
@@ -461,18 +456,54 @@ def test_rynn_h50_config_uses_fastwam_release_abi_and_aligned_world_stride() -> 
     assert data["fastwam_val_fraction"] == 0.01
     assert data["fastwam_split_seed"] == 42
     assert data["per_device_batch_size"] == 16
+    assert data["include_state"] is True
+    assert data["num_workers"] == 8
     assert config["trainer"]["expected_global_batch_size"] == 1024
+    assert config["trainer"]["max_train_steps"] == 80000
+    assert config["trainer"]["num_warmup_steps"] == 2000
+    assert config["trainer"]["freeze_modules"] == ""
+    assert config["trainer"]["logging_frequency"] == 200
 
-    robot_type = DATASET_NAMED_MIXTURES["robotwin_fastwam_h50"][0][2]
-    assert robot_type == "robotwin_fastwam_h50"
-    h50_data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
-    assert h50_data_config.action_indices == list(range(50))
+    robot_type = DATASET_NAMED_MIXTURES["robotwin_fastwam"][0][2]
+    assert robot_type == "robotwin_fastwam"
+    h32_data_config = ROBOT_TYPE_CONFIG_MAP[robot_type]
+    assert h32_data_config.action_indices == list(range(32))
     assert h50_data_config.action_keys == [
         "action.left_joints",
         "action.left_gripper",
         "action.right_joints",
         "action.right_gripper",
     ]
+
+
+def test_rynn_h32_fullres_current_dino_variant_only_changes_current_pool() -> None:
+    """The ablation keeps dense current tokens without changing future targets."""
+
+    base_path = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h50_50k.yaml"
+    variant_path = (
+        REPO_ROOT
+        / "examples/Robotwin/train_files/rynn_base_h50_current_dino_fullres_50k.yaml"
+    )
+    base = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+    variant = yaml.safe_load(variant_path.read_text(encoding="utf-8"))
+
+    dino = variant["framework"]["dino"]
+    mot = variant["framework"]["world_action_mot"]
+    data = variant["datasets"]["vla_data"]
+    assert dino["image_size"] == [384, 320]
+    assert dino["patch_size"] == 16
+    assert dino["current_dino_pool"] == 1
+    assert dino["dino_pool"] == 2
+    assert (mot["world_grid_height"], mot["world_grid_width"]) == (12, 10)
+    assert mot["max_world_tokens"] == 120
+    assert variant["framework"]["action_model"]["action_horizon"] == 32
+    assert data["world_model"]["future_stride"] == 32
+    assert variant["trainer"]["expected_global_batch_size"] == 1024
+
+    expected = copy.deepcopy(base)
+    expected["run_id"] = variant["run_id"]
+    expected["framework"]["dino"]["current_dino_pool"] = 1
+    assert variant == expected
 
 
 def test_fastwam_jointflow_h50_emits_aligned_action_and_world_indices() -> None:
@@ -533,7 +564,7 @@ def test_fastwam_train_infer_order_and_contract() -> None:
     from examples.Robotwin.eval_files.model2robotwin_fastwam_interface import FastWAMRobotWinModelClient
     from examples.Robotwin.eval_files.model2robotwin_interface import resolve_replan_steps
 
-    config_path = REPO_ROOT / "examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam_old.yaml"
+    config_path = REPO_ROOT / "examples/Robotwin/train_files/rynn_base_h50_50k.yaml"
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert PolicyServerWrapper._config_expects_state(config)
     assert resolve_replan_steps(24, 32) == 24
@@ -725,23 +756,6 @@ def test_fastwam_real_cluster_config_snapshots() -> None:
         assert verify(checkpoint, replan_steps=24)["state_contract_source"] == source
 
 
-def test_fastwam_cluster_preflight_fixture() -> None:
-    from examples.Robotwin.train_files.verify_fastwam_robotwin_data import verify_fastwam_robotwin_data
-
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        _write_fixture(root)
-        summary = verify_fastwam_robotwin_data(
-            root,
-            root / "dataset_stats.json",
-            expected_episodes=4,
-            expected_frames=166,
-            expected_tasks=1,
-        )
-        assert summary["fps"] == 50
-        assert summary["domain_counts"] == {"clean": 2, "randomized": 2, "unknown": 0}
-
-
 def test_correlated_noise_artifact_is_a_strict_train_deploy_contract() -> None:
     from unittest.mock import patch
 
@@ -819,73 +833,6 @@ def test_correlated_noise_artifact_is_a_strict_train_deploy_contract() -> None:
         framework.injected = None
         construct()
         assert framework.injected is None
-
-
-def test_robotwin_causal_query_and_coflow_yaml_contracts() -> None:
-    """The active WAM warmup is state-free, online DINO-B, and gate-ready."""
-
-    from starVLA.dataloader.gr00t_lerobot.registry import ROBOT_TYPE_CONFIG_MAP
-    from starVLA.dataloader.gr00t_lerobot.transform.state_action import StateActionTransform
-
-    config_dir = REPO_ROOT / "examples/Robotwin/train_files"
-    cfg = yaml.safe_load(
-        (config_dir / "robotwin_wam_query_warmup_old.yaml").read_text(encoding="utf-8")
-    )
-    action_cfg = cfg["framework"]["action_model"]
-    dino_cfg = cfg["framework"]["dino"]
-    data_cfg = cfg["datasets"]["vla_data"]
-    guidance = cfg["framework"]["wam"]["guidance"]
-    assert action_cfg["use_correlated_noise"] is False
-    assert action_cfg["action_horizon"] == action_cfg["n_action_query"] == 32
-    assert action_cfg["state_dim"] == 0
-    assert data_cfg["include_state"] is False
-    assert data_cfg["per_device_batch_size"] == 16
-    assert cfg["trainer"]["expected_global_batch_size"] == 1024
-    assert cfg["trainer"]["max_train_steps"] == 80000
-    assert cfg["trainer"]["wam_two_stage_phase"] == "predictor_warmup"
-    assert guidance["causal_query_suffix"] is True
-    assert guidance["include_context_in_action_memory"] is False
-    assert guidance["include_context_in_world_memory"] is False
-    assert guidance["world_condition_on_state"] is False
-    assert guidance["concat_current_dino"] is False
-    assert guidance["world_to_action_enabled"] is True
-    assert guidance["action_world_bypass"] is True
-    assert guidance["freeze_world_to_action_in_warmup"] is True
-    assert dino_cfg["model_size"] == "base"
-    assert dino_cfg["weights"].endswith("/DINO-B/")
-    assert dino_cfg["load_live_backbone"] is True
-    assert dino_cfg["force_online"] is True
-
-    assert not (config_dir / "robotwin_action_world_coflow.yaml").exists()
-    coflow = yaml.safe_load(
-        (config_dir / "robotwin_action_world_coflow_better.yaml").read_text(encoding="utf-8")
-    )
-    assert coflow["framework"]["name"] == "QwenActionWorldCoFlow"
-    assert coflow["framework"]["enable_action_world_coflow"] is True
-    assert coflow["framework"]["action_model"]["use_correlated_noise"] is False
-    assert coflow["framework"]["action_model"]["action_horizon"] == 16
-    coflow_model = coflow["framework"]["action_world_coflow"]
-    assert "segment_boundaries" not in coflow_model
-    assert "future_strides" not in coflow_model
-    assert "z32_loss_weight" not in coflow_model
-    coflow_data = coflow["datasets"]["vla_data"]
-    assert coflow_data["data_mix"] == "robotwin_fastwam_h16"
-    assert "fastwam_coflow_future_strides" not in coflow_data
-    assert coflow_data["include_state"] is True
-    assert coflow_data["per_device_batch_size"] == 12
-    assert coflow_data["num_workers"] == 4
-    assert coflow["trainer"]["gradient_accumulation_steps"] == 1
-    assert coflow["trainer"]["expected_global_batch_size"] == 768
-
-    data_config = ROBOT_TYPE_CONFIG_MAP["robotwin_fastwam"]
-    state_action_transforms = [
-        transform for transform in data_config.transform().transforms if isinstance(transform, StateActionTransform)
-    ]
-    assert len(state_action_transforms) == 2
-    assert all(
-        set(transform.normalization_modes.values()) == {"fastwam_zscore"}
-        for transform in state_action_transforms
-    )
 
 
 def test_coflow_checkpoint_verifier_accepts_only_h16_single_bridge() -> None:

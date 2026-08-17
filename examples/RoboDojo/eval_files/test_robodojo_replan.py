@@ -600,6 +600,18 @@ def test_event_memory_inference_updates_delta_then_keeps_state(monkeypatch) -> N
     model.cached_current_subtask_by_env = {}
     model.planner_text_by_env = {}
     model.log_planner_text = False
+    model.step_by_env = {0: 0}
+    model.default_instruction = "put the cup away"
+    model.eventmem_latest_image_by_env = {
+        0: np.zeros((24, 32, 3), dtype=np.uint8)
+    }
+    captures = []
+
+    class Recorder:
+        def capture(self, **kwargs):
+            captures.append(kwargs)
+
+    model.eventmem_recorder = Recorder()
     payloads = []
 
     class Client:
@@ -638,6 +650,9 @@ def test_event_memory_inference_updates_delta_then_keeps_state(monkeypatch) -> N
     assert "cached_planner_texts" not in payloads[0]
     assert model.semantic_memory_by_env[0] == "None."
     assert model.cached_current_subtask_by_env[0] == "Open the drawer."
+    assert captures[0]["decision"] == "UPDATE"
+    assert captures[0]["running_subtask_after"] == "Open the drawer."
+    assert captures[0]["running_memory_after"] == "None."
 
     model._infer_chunks([0])
     second = payloads[1]["examples"][0]
@@ -645,6 +660,122 @@ def test_event_memory_inference_updates_delta_then_keeps_state(monkeypatch) -> N
     assert second["cached_current_subtask"] == "Open the drawer."
     assert second["semantic_cache_valid"] is True
     assert model.cached_current_subtask_by_env[0] == "Open the drawer."
+    assert captures[1]["decision"] == "KEEP"
+    assert captures[1]["running_subtask_after"] == "Open the drawer."
+
+
+def test_rollout_eventmem_loader_uses_deployment_module(monkeypatch) -> None:
+    adapter = _load_adapter(monkeypatch)
+    renderer = adapter._load_eventmem_module()
+    assert Path(renderer.__file__).resolve() == (
+        EVAL_DIR.parents[2] / "deployment/robodojo_eventmem.py"
+    ).resolve()
+
+
+def test_rollout_eventmem_recorder_writes_png_and_records(tmp_path: Path) -> None:
+    eventmem_path = (
+        EVAL_DIR.parents[2] / "deployment/robodojo_eventmem.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_test_rollout_eventmem",
+        eventmem_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    recorder = module.RolloutEventMemoryRecorder(
+        tmp_path,
+        task_name="stack_bowls",
+        checkpoint_label="steps_50000",
+        num_envs=1,
+        max_frames=3,
+    )
+    image = np.full((120, 160, 3), 96, dtype=np.uint8)
+    recorder.capture(
+        env_idx=0,
+        frame=0,
+        image=image,
+        instruction="stack the bowls",
+        decision="UPDATE",
+        memory_add="None.",
+        planner_text="<UPDATE>",
+        running_subtask_after="Pick up the red bowl.",
+        running_memory_after="None.",
+    )
+    recorder.capture(
+        env_idx=0,
+        frame=10,
+        image=image,
+        instruction="stack the bowls",
+        decision="KEEP",
+        running_subtask_after="Pick up the red bowl.",
+        running_memory_after="None.",
+    )
+    written = recorder.finish_episode_group(
+        {"success_by_env": {0: True}}
+    )
+
+    assert len(written) == 1
+    assert written[0].is_file()
+    with Image.open(written[0]) as figure:
+        assert figure.width > figure.height
+    payload = json.loads(
+        (written[0].parent / "records.json").read_text(encoding="utf-8")
+    )
+    assert payload["status"] == "complete"
+    assert payload["success"] is True
+    assert [record["pred_decision"] for record in payload["records"]] == [
+        "UPDATE",
+        "KEEP",
+    ]
+
+
+def test_rollout_deploy_flushes_eventmem_at_episode_end(monkeypatch) -> None:
+    deploy_path = (
+        EVAL_DIR
+        / "xpolicy_overlay/XPolicyLab/policy/starVLA/deploy.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_test_robodojo_deploy_eventmem",
+        deploy_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setenv("ROBODOJO_EVENTMEM_CAPTURE", "true")
+
+    class Env:
+        success = [True]
+        take_action_cnt = [1]
+
+        def __init__(self):
+            self.end_checks = 0
+
+        def is_episode_end(self):
+            self.end_checks += 1
+            return self.end_checks > 1
+
+        def get_obs(self):
+            return {"env_idx": 0}
+
+        def take_action(self, _action):
+            return None
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, func_name=None, obs=None):
+            self.calls.append((func_name, obs))
+            if func_name == "get_action":
+                return [{}]
+            return None
+
+    client = Client()
+    module.eval_one_episode(Env(), client)
+    assert client.calls[-1][0] == "trial_end"
+    assert client.calls[-1][1]["success_by_env"] == {"0": True}
 
 
 def test_history_inference_updates_memory_but_reuses_the_original_prompt_state(
@@ -822,6 +953,12 @@ def test_eval_launchers_keep_optional_rtc_and_visualization_contracts() -> None:
     assert "ROBODOJO_EVAL_MODE=visualize" in visualization_launcher
     assert "ROBODOJO_TRIALS" in visualization_launcher
     assert "ROBODOJO_RUN_NAME" in visualization_launcher
+    assert "ROBODOJO_SAVE_MODE" in eval_launcher
+    assert "ROBODOJO_EVENTMEM_CAPTURE" in eval_launcher
+    assert "deployment/robodojo_eventmem.py" in eval_launcher
+    assert "Third_github/text_update" not in eval_launcher
+    assert 'eventmem_capture="${ROBODOJO_EVENTMEM_CAPTURE}"' in eval_launcher
+    assert 'eventmem_output_dir="${EVENTMEM_OUTPUT_DIR}"' in eval_launcher
 
 
 def test_eval_launchers_support_25_action_chunk_with_replan_16() -> None:
@@ -898,9 +1035,15 @@ def test_text_h25_event_memory_recipe_preserves_fp32_physical_contract() -> None
     assert "base_text_h25_eventmem_ntp_nohist_fp32_50k" in runbook
     assert "base_text_h25_eventmem_ntp_nohist_bf16_50k" in runbook
     assert "job_base_text_bf16_50k.yaml" in runbook
+    assert "base_text_h25_eventmem_ntp_nohist_bf16_current_dino_fullres_50k" in runbook
+    assert "job_base_text_bf16_current_dino_fullres_50k.yaml" in runbook
     assert "ROBODOJO_TEXT_REPLAN_CHUNKS=1" in runbook
     assert "run_robodojo_policy_servers_8.sh" in runbook
     assert "run_aidi_robodojo_fast_full.sh" in runbook
+    assert "##################### 5C." in runbook
+    assert "ROBODOJO_TASK=stack_bowls" in runbook
+    assert "ROBODOJO_TRIALS=3" in runbook
+    assert "ROBODOJO_SAVE_MODE=images" in runbook
 
 
 def test_short_result_tree_uses_metadata_instead_of_checkpoint_in_path(
@@ -1102,6 +1245,29 @@ def test_checkpoint_preflight_reports_h25_recipe_and_legacy_defaults(
     assert text_mem_bf16_summary["action_chunk"] == [25, 14]
     assert text_mem_bf16_summary["text_planning_enabled"] is True
     assert text_mem_bf16_summary["event_memory_enabled"] is True
+
+    text_mem_bf16_fullres_config = yaml.safe_load(
+        (
+            EVAL_DIR.parent
+            / "train_files/released_rynn50k/rynn_base_text_h25_mem_bf16_current_dino_fullres_50k.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    text_mem_bf16_fullres_serialized = yaml.safe_dump(
+        text_mem_bf16_fullres_config
+    )
+    (run_dir / "config.yaml").write_text(
+        text_mem_bf16_fullres_serialized,
+        encoding="utf-8",
+    )
+    config_path.write_text(
+        text_mem_bf16_fullres_serialized,
+        encoding="utf-8",
+    )
+    _write_causal_mot_shape_checkpoint(checkpoint, text_mem_bf16_fullres_config)
+    text_mem_bf16_fullres_summary = verify(str(checkpoint))
+    assert text_mem_bf16_fullres_summary["action_chunk"] == [25, 14]
+    assert text_mem_bf16_fullres_summary["text_planning_enabled"] is True
+    assert text_mem_bf16_fullres_summary["event_memory_enabled"] is True
 
     legacy = yaml.safe_load(yaml.safe_dump(config))
     physical = legacy["framework"]["world_action_mot"]

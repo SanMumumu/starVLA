@@ -6,6 +6,35 @@ the repository adapter replans its checkpoint-defined StarVLA chunk at the
 configured execution interval.
 """
 
+import os
+
+
+def _eventmem_capture_enabled():
+    return os.environ.get("ROBODOJO_EVENTMEM_CAPTURE", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _finish_eventmem_rollout(TASK_ENV, model_client):
+    if not _eventmem_capture_enabled():
+        return
+    model_client.call(
+        func_name="trial_end",
+        obs={
+            "success_by_env": {
+                str(env_idx): bool(success)
+                for env_idx, success in enumerate(TASK_ENV.success)
+            },
+            "steps_by_env": {
+                str(env_idx): int(steps)
+                for env_idx, steps in enumerate(TASK_ENV.take_action_cnt)
+            },
+        },
+    )
+
 
 def eval_one_episode(TASK_ENV, model_client):
     model_client.call(func_name="reset")
@@ -15,6 +44,7 @@ def eval_one_episode(TASK_ENV, model_client):
         if len(actions) != 1:
             raise RuntimeError(f"StarVLA server must return one cached action per control step, got {len(actions)}.")
         TASK_ENV.take_action(actions[0])
+    _finish_eventmem_rollout(TASK_ENV, model_client)
 
 
 def eval_one_episode_batch(TASK_ENV, model_client):
@@ -32,6 +62,7 @@ def eval_one_episode_batch(TASK_ENV, model_client):
             sizes = [len(env_actions) for env_actions in actions]
             raise RuntimeError(f"StarVLA server must return one cached action per env, got chunk sizes {sizes}.")
         TASK_ENV.take_action_batch([env_actions[0] for env_actions in actions], env_idx_list)
+    _finish_eventmem_rollout(TASK_ENV, model_client)
 
 
 __all__ = ["eval_one_episode", "eval_one_episode_batch"]

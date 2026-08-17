@@ -1,4 +1,3 @@
-# Archived legacy baseline; kept for reference and not used by the current launcher.
 run_id: starvla
 run_root_dir: playground/Checkpoints
 seed: 42

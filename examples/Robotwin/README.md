@@ -1,29 +1,59 @@
-# Current Rynn H50 recipe
+# Current Rynn H32 recipe (Fast-WAM-aligned)
 
 The canonical training config is `train_files/rynn_base_h50_50k.yaml`. It
 keeps the current Rynn model/optimizer implementation and adopts the released
-FastWAM RoboTwin data ABI from
-`train_files/starvla_qwengroot_robotwin_fastwam_old.yaml`: 50 Hz metadata,
+FastWAM RoboTwin data ABI directly: 50 Hz metadata,
 14-D absolute actions/state in release order, global z-score normalization,
 the exact 320x384 head+wrist composite, and seeded global-frame sampling
-without replacement. Both the action chunk and world target use H50/t+50.
-Evaluation executes 20 actions from each chunk before replanning.
+without replacement. Both the action chunk and world target use **H32/t+32**.
+Evaluation replans after **24** actions, matching Fast-WAM.
 
-Train on 8 nodes with 8 GPUs per node through Slurm:
+Non-model train controls follow the Fast-WAM baseline
+`starvla_qwengroot_robotwin_fastwam_jitx_corrnoise` (demo_clean **91.88%**):
+`include_state=true`, **H32**, **replan=24**, **80K** steps, warmup 2K, action LR 1e-4,
+empty freeze list, logging 200, `num_workers=8`. Model ABI stays Rynn MoT +
+`robotwin_fastwam` (H32 indices).
+
+Submit the maintained 8-node, 8-GPU-per-node AIDI recipe:
 
 ```bash
-sbatch --export=ALL,\
-ROBOTWIN_DATA_ROOT=/path/to/RoboTwin/lerobot/data,\
-RYNN_BASE_VLM=/path/to/rynnbrain1.1-2B,\
-RUN_ROOT_DIR=/path/to/outputs \
-examples/Robotwin/train_files/run_robotwin_train_batch.sh
+cd /home/users/sen02.wang/workspace/starvla_dev/RBT
+aidi-inf-cli job submit -f job_base_h50_50k.yaml \
+    -q project-ppu-robot-lab-acloud-bj
 ```
 
-The YAML and launcher are deliberately locked to
+The YAML and AIDI launcher are deliberately locked to
 `16 per GPU x 8 nodes x 8 GPUs x 1 accumulation = global batch 1024`.
-`run_robotwin_train_batch.sh` starts one Accelerate launcher per node; the
-node-local `run_robotwin_train.sh` rejects any topology that would change this
-batch contract.
+
+## Dense-current-DINO variant
+
+`train_files/rynn_base_h50_current_dino_fullres_50k.yaml` is the matching
+ablation with no DINO downsampling on the current frame. It sets
+`current_dino_pool: 1`, so the current prefix retains the full 24x20 grid
+(480 tokens), while `dino_pool: 2` keeps the future target at 12x10
+(120 tokens). All other training settings are identical to the canonical
+H32 recipe.
+
+Submit its maintained 8-node training job with:
+
+```bash
+cd /home/users/sen02.wang/workspace/starvla_dev/RBT
+aidi-inf-cli job submit -f job_base_h50_current_dino_fullres_50k.yaml \
+    -q project-ppu-robot-lab-acloud-bj
+```
+
+The job runs
+`examples/Robotwin/train_files/run_rynn_base_h50_current_dino_fullres_50k.sh`.
+To validate the recipe locally without starting distributed training:
+
+```bash
+python3 examples/Robotwin/train_files/verify_rynn_h50_recipe.py \
+    --config examples/Robotwin/train_files/rynn_base_h50_50k.yaml \
+    --num-processes 64
+
+VERIFY_ONLY=1 \
+bash examples/Robotwin/train_files/run_rynn_base_h50_current_dino_fullres_50k.sh
+```
 
 For full 8-way evaluation, run the policy servers in the StarVLA environment:
 
@@ -40,15 +70,23 @@ Then run the RoboTwin clients (same node: `HOST=127.0.0.1`):
 CKPT=/path/to/steps_50000_pytorch_model.pt \
 HOST=127.0.0.1 \
 ROBOTWIN_PATH=/path/to/RoboTwin \
-BASE_PORT=6698 REPLAN_STEPS=20 \
+BASE_PORT=6698 REPLAN_STEPS=24 \
 bash examples/Robotwin/eval_files/eval_robotwin_8clients_rynn_fastwam_h50.sh
 ```
 
-All previous top-level training YAML files, including the superseded FP32
-Robotwin recipe, were retained as `*_old.yaml`.
-Legacy experiment launchers, `compare_files/`, and old evaluation paths are
-intentionally preserved; the two canonical Robotwin training launchers now use
-the current 8-node Rynn recipe.
+For a checkpoint trained with the dense-current-DINO variant, keep the same
+server command and use the variant client wrapper:
+
+```bash
+CKPT=/path/to/steps_50000_pytorch_model.pt \
+HOST=127.0.0.1 \
+ROBOTWIN_PATH=/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/RoboTwin \
+BASE_PORT=6698 REPLAN_STEPS=24 \
+bash examples/Robotwin/eval_files/eval_robotwin_8clients_rynn_fastwam_h50_current_dino_fullres.sh
+```
+
+Superseded Robotwin training recipes and launchers have been removed; the H32
+control and dense-current-DINO ablation above are the maintained recipes.
 
 ---
 
@@ -448,41 +486,18 @@ This schedules all 50 tasks across 8 GPUs, running up to 8 tasks in parallel. Wh
 The policy always predicts the action horizon stored in the checkpoint. To execute only the first `N` actions and then infer a fresh chunk, use the result-only replan launcher:
 
 ```bash
-REPLAN_STEPS=20 \
+REPLAN_STEPS=24 \
 CKPT=/path/to/checkpoint.pt \
 HOST=policy-server-host \
 ROBOTWIN_PATH=/path/to/RoboTwin \
-bash examples/Robotwin/eval_files/eval_robotwin_8clients_replan.sh
+bash examples/Robotwin/eval_files/eval_robotwin_8clients_rynn_fastwam_h50.sh
 ```
 
-The current Rynn default is `20` for an H50 checkpoint. For a 50-action
-checkpoint, `REPLAN_STEPS=50` executes the full predicted chunk. Values larger
-than the checkpoint action horizon are rejected. This execution horizon is
-independent from the training target: the Rynn world model predicts `t+50` to
-align with its H50 action chunk even when evaluation replans after 20 actions.
-The archived QwenGR00T FastWAM launcher continues to use its historical 24/32
-contract.
-
-### FastWAM 50 Hz IID baseline
-
-Use this config for the controlled FastWAM data experiment:
-
-```text
-examples/Robotwin/train_files/starvla_qwengroot_robotwin_fastwam_old.yaml
-```
-
-It reads the full global 50 Hz LeRobot release, applies its global z-score
-(`std + 1e-8`, clamp to `[-5, 5]`), and predicts 32-step absolute-action
-chunks with IID action noise. The policy consumes the current 14-D state and
-the exact 320x384 FastWAM head+wrist composite in release action order.
-
-Run evaluation for these checkpoints through:
-
-```bash
-bash examples/Robotwin/eval_files/eval_robotwin_8clients_fastwam.sh
-```
-
-This launcher uses `replan_steps=24`, so each 32-action prediction executes 24 actions before the next policy call.
+The current Rynn default is `24` for an H32 checkpoint (Fast-WAM matched).
+For a 32-action checkpoint, `REPLAN_STEPS=32` executes the full predicted chunk.
+Values larger than the checkpoint action horizon are rejected. The world model
+predicts `t+32` to align with its H32 action chunk when evaluation replans
+after 24 actions.
 
 ### Runtime output
 

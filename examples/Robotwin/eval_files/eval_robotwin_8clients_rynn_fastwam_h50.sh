@@ -7,9 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # state/action order, normalization, and composite image follow FastWAM.
 export ROBOTWIN_POLICY_NAME="model2robotwin_fastwam_interface"
 export DEPLOY_POLICY_TEMPLATE_PATH="${SCRIPT_DIR}/deploy_policy_fastwam.yml"
-export REPLAN_STEPS="${REPLAN_STEPS:-${ROBOTWIN_REPLAN_STEPS:-20}}"
+export REPLAN_STEPS="${REPLAN_STEPS:-${ROBOTWIN_REPLAN_STEPS:-24}}"
 export ROBOTWIN_REPLAN_STEPS="${REPLAN_STEPS}"
-export RUN_NAME="${RUN_NAME:-robotwin_rynn_fastwam_h50_replan${REPLAN_STEPS}}"
+export RUN_NAME="${RUN_NAME:-robotwin_rynn_fastwam_h32_replan${REPLAN_STEPS}}"
 
 # These controls apply only to the archived two-stage WAM/Co-Flow models.
 unset WAM_EXPECTED_PHASE WAM_EXPECTED_WORLD_TO_ACTION

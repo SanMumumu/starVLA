@@ -11,4 +11,4 @@ port: 5694
 unnorm_key: "new_embodiment"
 action_mode: "abs"
 normalization_mode: "min_max"  # informational; server uses the checkpoint's training transform
-replan_steps: 20  # current Rynn H50 recipe executes 20 actions, then requests a fresh chunk
+replan_steps: 24  # Fast-WAM/Rynn H32 recipe executes 24 actions, then requests a fresh chunk

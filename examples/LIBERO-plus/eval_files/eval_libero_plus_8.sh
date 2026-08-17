@@ -13,6 +13,7 @@ NUM_CLIENTS="${NUM_CLIENTS:-8}"
 CKPT="${CKPT:?CKPT is required}"
 SEED="${SEED:-7}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
+MAX_TASKS="${MAX_TASKS:-0}"
 EXPECTED_TOTAL="${EXPECTED_TOTAL:-10030}"
 OUTPUT_DIR="${OUTPUT_DIR:-$(dirname "$(dirname "${CKPT}")")/libero_plus_eval_results_$(basename "$(dirname "${CKPT}")")_$(basename "${CKPT}" .pt)_${NUM_CLIENTS}shard}"
 
@@ -63,8 +64,9 @@ for ((i=0; i<NUM_CLIENTS; i++)); do
     log="$OUTPUT_DIR/logs/shard_${i}.log"
     extra=()
     [[ "$SAVE_VIDEO" == "1" ]] && extra+=(--save-video)
+    [[ "${MAX_TASKS}" != "0" ]] && extra+=(--max-tasks "$MAX_TASKS")
 
-    echo "launch client shard=$i gpu=$i server=$HOST:$port"
+    echo "launch client shard=$i gpu=$i server=$HOST:$port save_video=$SAVE_VIDEO max_tasks=$MAX_TASKS"
     (
         export CUDA_VISIBLE_DEVICES="$i"
         export MUJOCO_EGL_DEVICE_ID=0
@@ -93,6 +95,12 @@ for ((i=0; i<NUM_CLIENTS; i++)); do
     fi
 done
 [[ "$failed" == "0" ]] || exit 1
+
+if [[ "${MAX_TASKS}" != "0" ]]; then
+    echo "MAX_TASKS=${MAX_TASKS}: skip full aggregate; videos under $OUTPUT_DIR/videos"
+    ls -la "$OUTPUT_DIR/videos"/*/*/*.mp4 2>/dev/null | head -20 || true
+    exit 0
+fi
 
 python examples/LIBERO-plus/eval_files/aggregate_libero_plus_8.py \
     --output-dir "$OUTPUT_DIR" \

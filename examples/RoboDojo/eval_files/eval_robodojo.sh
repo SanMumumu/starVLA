@@ -114,11 +114,9 @@ EVAL_MODE="${ROBODOJO_EVAL_MODE:-fast}"
 EVAL_MODE="${EVAL_MODE,,}"
 case "${EVAL_MODE}" in
   fast)
-    export ROBODOJO_DISABLE_EVAL_VIDEO=1
     requested_trials="${ROBODOJO_TRIALS:-${EVAL_NUM:-native}}"
     ;;
   visualize)
-    export ROBODOJO_DISABLE_EVAL_VIDEO=0
     requested_trials="${ROBODOJO_TRIALS:-${EVAL_NUM:-5}}"
     ;;
   *)
@@ -126,6 +124,39 @@ case "${EVAL_MODE}" in
     exit 2
     ;;
 esac
+
+# Artifact selector. The default preserves the historical behavior: fast
+# evaluation writes no media, while visualize writes RoboDojo's native MP4s.
+SAVE_MODE="${ROBODOJO_SAVE_MODE:-}"
+if [[ -z "${SAVE_MODE}" ]]; then
+  [[ "${EVAL_MODE}" == "visualize" ]] && SAVE_MODE=video || SAVE_MODE=none
+fi
+SAVE_MODE="${SAVE_MODE,,}"
+case "${SAVE_MODE}" in
+  none)
+    export ROBODOJO_DISABLE_EVAL_VIDEO=1
+    export ROBODOJO_EVENTMEM_CAPTURE=false
+    ;;
+  video)
+    export ROBODOJO_DISABLE_EVAL_VIDEO=0
+    export ROBODOJO_EVENTMEM_CAPTURE=false
+    ;;
+  images)
+    export ROBODOJO_DISABLE_EVAL_VIDEO=1
+    export ROBODOJO_EVENTMEM_CAPTURE=true
+    ;;
+  *)
+    echo "[RoboDojo][ERROR] ROBODOJO_SAVE_MODE must be none, video, or images, got ${SAVE_MODE}" >&2
+    exit 2
+    ;;
+esac
+export ROBODOJO_SAVE_MODE="${SAVE_MODE}"
+EVENTMEM_MAX_FRAMES="${ROBODOJO_EVENTMEM_MAX_FRAMES:-9}"
+if ! [[ "${EVENTMEM_MAX_FRAMES}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[RoboDojo][ERROR] ROBODOJO_EVENTMEM_MAX_FRAMES must be a positive integer, got ${EVENTMEM_MAX_FRAMES}" >&2
+  exit 2
+fi
+export ROBODOJO_EVENTMEM_MAX_FRAMES="${EVENTMEM_MAX_FRAMES}"
 if [[ "${requested_trials}" != "native" ]] && { ! [[ "${requested_trials}" =~ ^[0-9]+$ ]] || (( 10#${requested_trials} <= 0 )); }; then
   echo "[RoboDojo][ERROR] ROBODOJO_TRIALS must be native or a positive integer, got ${requested_trials}" >&2
   exit 2
@@ -151,6 +182,13 @@ EXPLICIT_OUTPUT_ROOT="${ROBODOJO_OUTPUT_ROOT:-${OUTPUT_ROOT:-}}"
 requested_output_root="${ROBODOJO_OUTPUT_ROOT:-${OUTPUT_ROOT:-${MODEL_ROOT}/robodojo_eval_results/${RUN_NAME}_${OUTPUT_RUN_ID}}}"
 mkdir -p "${requested_output_root}"
 OUTPUT_ROOT="$(cd "${requested_output_root}" && pwd -P)"
+EVENTMEM_OUTPUT_DIR="${ROBODOJO_EVENTMEM_OUTPUT_DIR:-${OUTPUT_ROOT}/eventmem}"
+export ROBODOJO_EVENTMEM_OUTPUT_DIR="${EVENTMEM_OUTPUT_DIR}"
+if [[ "${ROBODOJO_EVENTMEM_CAPTURE}" == "true" ]] \
+  && [[ ! -f "${STARVLA_ROOT}/deployment/robodojo_eventmem.py" ]]; then
+  echo "[RoboDojo][ERROR] missing rollout event-memory renderer ${STARVLA_ROOT}/deployment/robodojo_eventmem.py" >&2
+  exit 1
+fi
 LOG_DIR="${OUTPUT_ROOT}/logs"
 NATIVE_WORKDIR="${OUTPUT_ROOT}/native"
 NATIVE_RESULT_ROOT="${NATIVE_WORKDIR}/eval_result"
@@ -398,6 +436,7 @@ payload = {
     "seed": int(seed),
     "task": task,
     "eval_mode": eval_mode,
+    "save_mode": os.environ["ROBODOJO_SAVE_MODE"],
     "trials": trials,
     "action_chunk_size": int(action_chunk_size),
     "replan_steps": int(replan_steps),
@@ -410,6 +449,11 @@ payload = {
         "debug_max_replans": int(rtc_debug_max_replans),
     },
     "text_replan_chunks": int(text_replan_chunks),
+    "eventmem": {
+        "enabled": os.environ.get("ROBODOJO_EVENTMEM_CAPTURE") == "true",
+        "output_dir": os.environ.get("ROBODOJO_EVENTMEM_OUTPUT_DIR"),
+        "max_frames": int(os.environ.get("ROBODOJO_EVENTMEM_MAX_FRAMES", "9")),
+    },
     "run_name": run_name,
     "run_id": run_id,
 }
@@ -427,7 +471,10 @@ echo "[RoboDojo] simulator=${ROBODOJO_ROOT} checkpoint=${CHECKPOINT_PATH}"
 echo "[RoboDojo] python=${ROBODOJO_PYTHON} (policy_env_arg=${policy_conda_env}, eval_env_arg=${eval_env_conda_env})"
 echo "[RoboDojo] task=${task_name} StarVLA=${starvla_host}:${starvla_port} XPolicy-port=${policy_port}"
 echo "[RoboDojo] using external StarVLA server ${starvla_host}:${starvla_port}"
-echo "[RoboDojo] mode=${EVAL_MODE} trials=${requested_trials} videos=$([[ "${ROBODOJO_DISABLE_EVAL_VIDEO}" == "1" ]] && echo disabled || echo enabled)"
+echo "[RoboDojo] mode=${EVAL_MODE} trials=${requested_trials} save_mode=${SAVE_MODE}"
+if [[ "${ROBODOJO_EVENTMEM_CAPTURE}" == "true" ]]; then
+  echo "[RoboDojo] eventmem_output=${EVENTMEM_OUTPUT_DIR} max_frames=${EVENTMEM_MAX_FRAMES}"
+fi
 echo "[RoboDojo] action_chunk=${EXPECTED_ACTION_CHUNK_SIZE} replan_steps=${REPLAN_STEPS}"
 echo "[RoboDojo] rtc=${RTC_ENABLED} overlap=${RTC_OVERLAP} execution_horizon=${RTC_EXECUTION_HORIZON} inference_delay=${RTC_INFERENCE_DELAY} schedule=${RTC_PREFIX_ATTENTION_SCHEDULE} max_guidance_weight=${RTC_MAX_GUIDANCE_WEIGHT} debug_max_replans=${RTC_DEBUG_MAX_REPLANS}"
 echo "[RoboDojo] text_replan_chunks=${TEXT_REPLAN_CHUNKS} text_replan_steps=$((10#${REPLAN_STEPS} * 10#${TEXT_REPLAN_CHUNKS}))"
@@ -463,6 +510,10 @@ CUDA_VISIBLE_DEVICES="${policy_gpu_id}" "${ROBODOJO_PYTHON}" "${SCRIPT_DIR}/laun
     rtc_debug_max_replans="${RTC_DEBUG_MAX_REPLANS}" \
     text_replan_chunks="${TEXT_REPLAN_CHUNKS}" \
     log_planner_text="${LOG_PLANNER_TEXT}" \
+    eventmem_capture="${ROBODOJO_EVENTMEM_CAPTURE}" \
+    eventmem_output_dir="${EVENTMEM_OUTPUT_DIR}" \
+    eventmem_max_frames="${EVENTMEM_MAX_FRAMES}" \
+    eventmem_num_envs="${NUM_ENVS}" \
     expected_action_chunk_size="${EXPECTED_ACTION_CHUNK_SIZE}" \
     expected_action_dim=14 &
 XPOLICY_SERVER_PID=$!

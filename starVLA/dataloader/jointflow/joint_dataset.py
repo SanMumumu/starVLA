@@ -27,6 +27,12 @@ from starVLA.dataloader.fastwam_image import (
     TRI_VIEW_COMPOSITE_VIEW_KEY,
     build_robotwin_composite,
 )
+from starVLA.dataloader.libero_image import (
+    LIBERO_COMPOSITE_LAYOUT,
+    LIBERO_COMPOSITE_SIZE,
+    LIBERO_COMPOSITE_VIEW_KEY,
+    build_libero_composite,
+)
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotMixtureDataset, LeRobotSingleDataset, ModalityConfig
 from starVLA.dataloader.gr00t_lerobot.registry import EmbodimentTag, ROBOT_TYPE_CONFIG_MAP
 from starVLA.dataloader.gr00t_lerobot.transform.base import ComposedModalityTransform
@@ -57,6 +63,37 @@ def _cfg_get(cfg, key: str, default=None):
     if hasattr(cfg, "get"):
         return cfg.get(key, default)
     return getattr(cfg, key, default)
+
+
+_COMPOSITE_LAYOUTS = {
+    FASTWAM_COMPOSITE_LAYOUT,
+    TRI_VIEW_COMPOSITE_LAYOUT,
+    LIBERO_COMPOSITE_LAYOUT,
+}
+
+
+def _composite_contract(image_layout: str):
+    """Return ``(size, view_key, builder)`` for a configured layout."""
+
+    if image_layout == LIBERO_COMPOSITE_LAYOUT:
+        return (
+            LIBERO_COMPOSITE_SIZE,
+            LIBERO_COMPOSITE_VIEW_KEY,
+            build_libero_composite,
+        )
+    if image_layout == TRI_VIEW_COMPOSITE_LAYOUT:
+        return (
+            FASTWAM_COMPOSITE_SIZE,
+            TRI_VIEW_COMPOSITE_VIEW_KEY,
+            build_robotwin_composite,
+        )
+    if image_layout == FASTWAM_COMPOSITE_LAYOUT:
+        return (
+            FASTWAM_COMPOSITE_SIZE,
+            FASTWAM_COMPOSITE_VIEW_KEY,
+            build_robotwin_composite,
+        )
+    raise ValueError(f"Unknown composite image layout: {image_layout!r}")
 
 
 def _text_value(value: Any) -> str:
@@ -264,10 +301,7 @@ class JointLiberoDataset(LeRobotSingleDataset):
                 image_layout = str(
                     _cfg_get(data_cfg, "image_layout", "separate_views")
                 ).lower()
-                if image_layout not in {
-                    FASTWAM_COMPOSITE_LAYOUT,
-                    TRI_VIEW_COMPOSITE_LAYOUT,
-                }:
+                if image_layout not in _COMPOSITE_LAYOUTS:
                     raise ValueError(
                         "Planner image history currently requires a composite image "
                         f"layout, got {image_layout!r}"
@@ -628,38 +662,46 @@ class JointLiberoDataset(LeRobotSingleDataset):
                         )
                     future_views.append(frames[future_position])
 
-            if image_layout in {
-                FASTWAM_COMPOSITE_LAYOUT,
-                TRI_VIEW_COMPOSITE_LAYOUT,
-            }:
+            if image_layout in _COMPOSITE_LAYOUTS:
                 expected_source_keys = list(_cfg_get(self.data_cfg, "composite_source_view_keys", []))
                 if expected_source_keys and source_view_keys != expected_source_keys:
                     raise ValueError(
-                        "FastWAM composite camera order mismatch: "
+                        "Composite camera order mismatch: "
                         f"dataset={source_view_keys}, configured={expected_source_keys}"
                     )
-                configured_size = tuple(
-                    int(value) for value in _cfg_get(self.data_cfg, "obs_image_size", FASTWAM_COMPOSITE_SIZE)
+                composite_size, default_view_key, composite_builder = (
+                    _composite_contract(image_layout)
                 )
-                if configured_size != FASTWAM_COMPOSITE_SIZE:
+                configured_size = tuple(
+                    int(value)
+                    for value in _cfg_get(
+                        self.data_cfg, "obs_image_size", composite_size
+                    )
+                )
+                if configured_size != composite_size:
                     raise ValueError(
-                        f"FastWAM composite must be configured as {FASTWAM_COMPOSITE_SIZE} (width,height), "
+                        f"{image_layout} must be configured as {composite_size} "
+                        "(width,height), "
                         f"got {configured_size}"
                     )
                 composite_view_key = str(
                     _cfg_get(
                         self.data_cfg,
                         "composite_view_key",
-                        (
-                            TRI_VIEW_COMPOSITE_VIEW_KEY
-                            if image_layout == TRI_VIEW_COMPOSITE_LAYOUT
-                            else FASTWAM_COMPOSITE_VIEW_KEY
-                        ),
+                        default_view_key,
                     )
                 )
-                img0 = [np.asarray(build_robotwin_composite(current_views), dtype=np.uint8)]
+                img0 = [
+                    np.asarray(composite_builder(current_views), dtype=np.uint8)
+                ]
                 img1 = (
-                    [np.asarray(build_robotwin_composite(future_views), dtype=np.uint8)] if decode_future else []
+                    [
+                        np.asarray(
+                            composite_builder(future_views), dtype=np.uint8
+                        )
+                    ]
+                    if decode_future
+                    else []
                 )
                 view_keys = [composite_view_key]
                 if self._text_history_offsets:
@@ -684,7 +726,7 @@ class JointLiberoDataset(LeRobotSingleDataset):
                         ]
                         history_images.append(
                             np.asarray(
-                                build_robotwin_composite(history_views),
+                                composite_builder(history_views),
                                 dtype=np.uint8,
                             )
                         )
@@ -712,10 +754,7 @@ class JointLiberoDataset(LeRobotSingleDataset):
                 sample["image_1"] = np.stack(img1, axis=0)
             sample["image_view_keys"] = view_keys
             sample["dino_view_keys"] = view_keys
-            if image_layout in {
-                FASTWAM_COMPOSITE_LAYOUT,
-                TRI_VIEW_COMPOSITE_LAYOUT,
-            }:
+            if image_layout in _COMPOSITE_LAYOUTS:
                 sample["dino_target_view_keys"] = view_keys
             #######
             if self._dino_target_latents:

@@ -141,7 +141,7 @@ if __name__ == "__main__":
     import os
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_yaml", type=str, default="./examples/LIBERO/train_files/starvla_cotrain_libero_old.yaml", help="Path to YAML config")
+    parser.add_argument("--config_yaml", type=str, default="./examples/LIBERO/train_files/starvla_cotrain_libero.yaml", help="Path to YAML config")
     parser.add_argument("--data_mix", type=str, default=None, help="Override data_mix from config")
     parser.add_argument("--data_root_dir", type=str, default=None, help="Override data_root_dir from config")
     args = parser.parse_args()

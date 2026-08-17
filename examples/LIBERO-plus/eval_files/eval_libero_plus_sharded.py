@@ -2,6 +2,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 
 os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
@@ -27,7 +28,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 os.environ["MUJOCO_EGL_DEVICE_ID"] = "0"
 
-from examples.LIBERO.eval_files.model2libero_interface import ModelClient
+from examples.LIBERO.eval_files.model2libero_interface import ModelClient  # composite + state contract
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
@@ -51,11 +52,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--num-steps-wait", type=int, default=10)
     p.add_argument("--save-video", action="store_true")
+    p.add_argument(
+        "--max-tasks",
+        type=int,
+        default=0,
+        help="If >0, only evaluate this many assigned tasks (for video debug).",
+    )
     p.add_argument("--expected-total", type=int, default=10030)
     args = p.parse_args()
     if not 0 <= args.shard_id < args.num_shards:
         raise ValueError(f"invalid shard id {args.shard_id}/{args.num_shards}")
     return args
+
+
+def _quat2axisangle(quat: np.ndarray) -> np.ndarray:
+    """Robosuite quat(x,y,z,w) -> axis-angle; matches base LIBERO eval."""
+    quat = np.asarray(quat, dtype=np.float64).reshape(4).copy()
+    if quat[3] > 1.0:
+        quat[3] = 1.0
+    elif quat[3] < -1.0:
+        quat[3] = -1.0
+    den = np.sqrt(1.0 - quat[3] * quat[3])
+    if math.isclose(den, 0.0):
+        return np.zeros(3, dtype=np.float64)
+    return (quat[:3] * 2.0 * math.acos(quat[3])) / den
 
 
 def find_classification_file() -> pathlib.Path:
@@ -135,6 +155,17 @@ def save_video(path: pathlib.Path, frames: list[np.ndarray]) -> None:
     imageio.mimwrite(path, [np.asarray(x) for x in frames], fps=25)
 
 
+def make_debug_frame(agentview: np.ndarray, wrist: np.ndarray) -> np.ndarray:
+    """Side-by-side [agentview | wrist] after the same flip used for policy input."""
+    left = np.asarray(agentview)
+    right = np.asarray(wrist)
+    if left.shape[0] != right.shape[0]:
+        # Keep heights matched for concat; rare if cameras differ.
+        h = min(left.shape[0], right.shape[0])
+        left, right = left[:h], right[:h]
+    return np.concatenate([left, right], axis=1)
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -164,18 +195,20 @@ def main() -> None:
         raise RuntimeError(f"LIBERO-Plus task count mismatch: got {len(all_jobs)}, expected {args.expected_total}")
 
     assigned = all_jobs[args.shard_id::args.num_shards]
+    if args.max_tasks > 0:
+        assigned = assigned[: args.max_tasks]
     logging.info(
-        "shard %d/%d: %d tasks (global=%d)",
+        "shard %d/%d: %d tasks (global=%d, max_tasks=%s)",
         args.shard_id,
         args.num_shards,
         len(assigned),
         len(all_jobs),
+        args.max_tasks or "all",
     )
 
     client = ModelClient(
         host=args.host,
         port=args.port,
-        image_size=[224, 224],
     )
 
     for local_idx, (suite, task_id) in enumerate(assigned, 1):
@@ -220,13 +253,21 @@ def main() -> None:
                     obs, _, _, _ = env.step(LIBERO_DUMMY_ACTION)
                     continue
 
+                # IMPORTANT: rotate 180 degrees to match train preprocessing
                 image = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
                 wrist = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                state = np.concatenate(
+                    (
+                        obs["robot0_eef_pos"],
+                        _quat2axisangle(obs["robot0_eef_quat"]),
+                        obs["robot0_gripper_qpos"],
+                    )
+                )
                 if args.save_video:
-                    frames.append(image)
+                    frames.append(make_debug_frame(image, wrist))
 
                 response = client.step(
-                    example={"image": [image, wrist], "lang": task_description},
+                    example={"image": [image, wrist], "lang": task_description, "state": state},
                     step=policy_step,
                 )
                 raw_action = response["raw_action"]
@@ -269,6 +310,7 @@ def main() -> None:
                 f"task_{task_id:05d}_{safe_name(task_name)}_{status}.mp4"
             )
             save_video(video_path, frames)
+            logging.info("saved video: %s (%d frames)", video_path, len(frames))
 
     successes = sum(int(x["success"]) for x in completed.values())
     logging.info("shard done: %d/%d successes", successes, len(completed))

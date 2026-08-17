@@ -1,5 +1,23 @@
 # 🚀 LIBERO-plus zero shot Evaluation
 
+The maintained RynnBrain LIBERO H8 checkpoint uses a single 512x256
+`[third-person | wrist]` composite and evaluates with one policy-server GPU plus
+one simulator GPU. From the repository root, use two terminals:
+
+```bash
+# StarVLA server terminal
+CKPT=/path/to/steps_50000_pytorch_model.pt \
+  bash 执行脚本/LIBERO/run.sh server
+
+# LIBERO-plus terminal; HOST is printed by the server command
+HOST=10.x.x.x CKPT=/path/to/steps_50000_pytorch_model.pt \
+  bash 执行脚本/LIBERO/run.sh eval-plus
+```
+
+The second command uses resumable one-shard evaluation over all 10,030 tasks.
+See `执行脚本/LIBERO/README.md` for the source AIDI train/server/client job
+YAMLs. Copy that complete folder to the cluster's sibling `LIBERO/` directory.
+
 This document provides instructions for reproducing our **zero shot experimental results** with LIBERO-plus.  
 The evaluation process consists of two main parts:  
 
@@ -85,4 +103,3 @@ Also ensure the environment variables at the top of `eval_libero.sh` are correct
 ---
 
 ⚠️ **Note:** Since LIBERO-plus has 10,030 tasks, completing all the evaluations will take an extremely long time. It is recommended to run multiple model instances in parallel for the evaluations. We provide code and scripts for parallel testing on cluster `./parallel_eval/run_nebula_libero_plus`. Please modify them to fit your own cluster.
-

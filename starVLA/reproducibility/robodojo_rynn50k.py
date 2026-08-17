@@ -27,6 +27,9 @@ ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_PROFILE = (
 ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_PROFILE = (
     "robodojo_rynnbrain11_causal_dino_mot_base_text_h25_eventmem_ntp_nohist_bf16_50k_v1"
 )
+ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_PROFILE = (
+    "robodojo_rynnbrain11_causal_dino_mot_base_text_h25_eventmem_ntp_nohist_bf16_current_dino_fullres_50k_v1"
+)
 ROBODOJO_RYNN50K_LEGACY_BASE_TEXT_H25_MEM_PROFILE = (
     "robodojo_rynnbrain11_causal_dino_mot_base_text_h25_mem_currenttoken_fullres_50k"
 )
@@ -95,6 +98,12 @@ def _plain(value: Any) -> Any:
 # These baseline fields define the physical contract inherited by the H25
 # recipes. Interaction mode is checked separately so legacy checkpoints remain
 # loadable, while every maintained H25 recipe requires base masking.
+#
+# ``trainer.is_resume`` and ``trainer.resume_state_path`` are deliberately not
+# part of this contract. They describe how a particular process restores an
+# already-defined training run, and therefore legitimately differ between an
+# initial launch, a resumed launch, and checkpoint evaluation. In particular,
+# they must not affect validation or the config fingerprint stored with weights.
 _EXPECTED = {
     "run_root_dir": "/horizon-bucket/robot_lab/users/sen.wang-labs/starVLA/outputs/starvla_robodojo",
     "seed": 42,
@@ -204,7 +213,6 @@ _EXPECTED = {
     "trainer.action_eval_enabled": True,
     "trainer.world_validation.enabled": False,
     "trainer.pretrained_checkpoint": None,
-    "trainer.is_resume": False,
     "trainer.save_full_training_state": True,
     "trainer.learning_rate.base": 1.0e-5,
     "trainer.learning_rate.qwen_vl_interface": 1.0e-5,
@@ -394,6 +402,17 @@ _BASE_TEXT_H25_MEM_BF16_EXPECTED = {
     "framework.world_action_mot.action_precision_mode": "inherit",
 }
 
+# Strict dense-current counterpart of the BF16 event-memory recipe.  Only the
+# clean current prefix changes to the full 24x20 grid; the future denoising
+# target remains pool=2 on the historical 12x10 physical world grid.
+_BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_EXPECTED = {
+    **_BASE_TEXT_H25_MEM_BF16_EXPECTED,
+    "framework.reproduction_profile": (
+        ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_PROFILE
+    ),
+    "framework.dino.current_dino_pool": 1,
+}
+
 # Fields added later as explicit pins.  The preserved config.full.yaml omitted
 # them only because the historical implementation supplied these defaults.
 _HISTORICAL_DEFAULTS = {
@@ -537,6 +556,21 @@ def validate_base_text_h25_mem_bf16_config(config: Any) -> dict[str, Any]:
         config,
         expected=_BASE_TEXT_H25_MEM_BF16_EXPECTED,
         profile=ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_PROFILE,
+        expected_mode="base",
+    )
+
+
+def validate_base_text_h25_mem_bf16_current_dino_fullres_config(
+    config: Any,
+) -> dict[str, Any]:
+    """Validate BF16 event memory with dense current and pooled future DINO."""
+
+    return _validate_contract(
+        config,
+        expected=_BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_EXPECTED,
+        profile=(
+            ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_PROFILE
+        ),
         expected_mode="base",
     )
 

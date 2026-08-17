@@ -21,11 +21,13 @@ from starVLA.reproducibility.robodojo_rynn50k import (  # noqa: E402
     ROBODOJO_RYNN50K_BASE_H25_PROFILE,
     ROBODOJO_RYNN50K_BASE_HISTORY_H25_MEM_PROFILE,
     ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_PROFILE,
+    ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_PROFILE,
     ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_PROFILE,
     validate_base_h25_current_dino_fullres_config,
     validate_base_h25_config,
     validate_base_history_h25_mem_config,
     validate_base_text_h25_mem_bf16_config,
+    validate_base_text_h25_mem_bf16_current_dino_fullres_config,
     validate_base_text_h25_mem_config,
     validate_dataset_statistics,
 )
@@ -38,6 +40,9 @@ BASE_H25_CURRENT_DINO_FULLRES_CONFIG = (
 )
 BASE_TEXT_H25_MEM_CONFIG = HERE / "rynn_base_text_h25_mem_50k.yaml"
 BASE_TEXT_H25_MEM_BF16_CONFIG = HERE / "rynn_base_text_h25_mem_bf16_50k.yaml"
+BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_CONFIG = (
+    HERE / "rynn_base_text_h25_mem_bf16_current_dino_fullres_50k.yaml"
+)
 BASE_HISTORY_H25_MEM_CONFIG = HERE / "rynn_base_history_h25_mem_50k.yaml"
 EXPECTED_MIXTURE = [
     ("RoboDojo_lerobot_v21_language_v1", 1.0, "robodojo_arx_x5")
@@ -54,9 +59,22 @@ def _load(path: Path) -> dict:
     return payload
 
 
+def _strip_runtime_trainer_fields(config: dict) -> None:
+    """Resume knobs are runtime-only and must not affect recipe diffs."""
+    trainer = config.get("trainer")
+    if not isinstance(trainer, dict):
+        return
+    trainer["is_resume"] = False
+    trainer.pop("resume_state_path", None)
+    trainer.pop("resume_epoch", None)
+    trainer.pop("resume_step", None)
+
+
 def _assert_base_h25_current_dino_fullres_variant() -> None:
     control = _load(BASE_H25_CONFIG)
     variant = _load(BASE_H25_CURRENT_DINO_FULLRES_CONFIG)
+    _strip_runtime_trainer_fields(control)
+    _strip_runtime_trainer_fields(variant)
     control["run_id"] = variant["run_id"]
     control["framework"]["reproduction_profile"] = variant["framework"][
         "reproduction_profile"
@@ -73,6 +91,8 @@ def _assert_base_h25_current_dino_fullres_variant() -> None:
 def _assert_base_text_h25_mem_variant() -> None:
     base = _load(BASE_H25_CONFIG)
     variant = _load(BASE_TEXT_H25_MEM_CONFIG)
+    _strip_runtime_trainer_fields(base)
+    _strip_runtime_trainer_fields(variant)
     base["run_id"] = variant["run_id"]
     base["framework"]["reproduction_profile"] = variant["framework"][
         "reproduction_profile"
@@ -99,6 +119,8 @@ def _assert_base_text_h25_mem_variant() -> None:
 def _assert_base_text_h25_mem_bf16_variant() -> None:
     control = _load(BASE_TEXT_H25_MEM_CONFIG)
     variant = _load(BASE_TEXT_H25_MEM_BF16_CONFIG)
+    _strip_runtime_trainer_fields(control)
+    _strip_runtime_trainer_fields(variant)
     control["run_id"] = variant["run_id"]
     control["framework"]["reproduction_profile"] = variant["framework"][
         "reproduction_profile"
@@ -114,9 +136,29 @@ def _assert_base_text_h25_mem_bf16_variant() -> None:
         )
 
 
+def _assert_base_text_h25_mem_bf16_current_dino_fullres_variant() -> None:
+    control = _load(BASE_TEXT_H25_MEM_BF16_CONFIG)
+    variant = _load(BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_CONFIG)
+    _strip_runtime_trainer_fields(control)
+    _strip_runtime_trainer_fields(variant)
+    control["run_id"] = variant["run_id"]
+    control["framework"]["reproduction_profile"] = variant["framework"][
+        "reproduction_profile"
+    ]
+    control["framework"]["dino"]["current_dino_pool"] = 1
+    if control != variant:
+        raise ValueError(
+            "The BF16 current-DINO-fullres YAML must differ from its BF16 "
+            "event-memory control only in run_id, reproduction_profile, and "
+            "framework.dino.current_dino_pool"
+        )
+
+
 def _assert_base_history_h25_mem_variant() -> None:
     control = _load(BASE_H25_CONFIG)
     ablation = _load(BASE_HISTORY_H25_MEM_CONFIG)
+    _strip_runtime_trainer_fields(control)
+    _strip_runtime_trainer_fields(ablation)
     control["run_id"] = ablation["run_id"]
     control["framework"]["reproduction_profile"] = ablation["framework"][
         "reproduction_profile"
@@ -192,6 +234,14 @@ def main() -> None:
     elif profile == ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_PROFILE:
         summary = validate_base_text_h25_mem_bf16_config(config)
         _assert_base_text_h25_mem_bf16_variant()
+    elif (
+        profile
+        == ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_PROFILE
+    ):
+        summary = validate_base_text_h25_mem_bf16_current_dino_fullres_config(
+            config
+        )
+        _assert_base_text_h25_mem_bf16_current_dino_fullres_variant()
     elif profile == ROBODOJO_RYNN50K_BASE_HISTORY_H25_MEM_PROFILE:
         summary = validate_base_history_h25_mem_config(config)
         _assert_base_history_h25_mem_variant()

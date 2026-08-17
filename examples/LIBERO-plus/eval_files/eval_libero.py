@@ -90,7 +90,6 @@ def eval_libero(args: Args) -> None:
     client_model = ModelClient(
         host=args.host,
         port=args.port,
-        image_size=args.resize_size,
     )
 
     disturb_res = {}

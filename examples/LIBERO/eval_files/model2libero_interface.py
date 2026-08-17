@@ -21,6 +21,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 
+from deployment.libero_image import (
+    LIBERO_COMPOSITE_LAYOUT,
+    LIBERO_COMPOSITE_SIZE,
+    LIBERO_COMPOSITE_SOURCE_VIEW_KEYS,
+    LIBERO_COMPOSITE_VIEW_KEY,
+    build_libero_composite,
+)
 from deployment.model_server.tools.websocket_policy_client import WebsocketClientPolicy
 try:
     from examples.SimplerEnv.eval_files.adaptive_ensemble import AdaptiveEnsembler
@@ -48,6 +55,24 @@ class ModelClient:
         meta = self.client.get_server_metadata()
         self.action_chunk_size = int(meta["action_chunk_size"])
         self._server_metadata = meta
+        self.image_layout = str(meta.get("image_layout", "separate_views"))
+        self.composite_view_key = meta.get("composite_view_key")
+        self.composite_source_view_keys = tuple(
+            meta.get("composite_source_view_keys", []) or []
+        )
+
+        if self.image_layout == LIBERO_COMPOSITE_LAYOUT:
+            if self.composite_view_key != LIBERO_COMPOSITE_VIEW_KEY:
+                raise RuntimeError(
+                    "LIBERO checkpoint has an incompatible composite key: "
+                    f"{self.composite_view_key!r}"
+                )
+            if self.composite_source_view_keys != LIBERO_COMPOSITE_SOURCE_VIEW_KEYS:
+                raise RuntimeError(
+                    "LIBERO checkpoint camera order must be "
+                    f"{list(LIBERO_COMPOSITE_SOURCE_VIEW_KEYS)}, got "
+                    f"{list(self.composite_source_view_keys)}"
+                )
 
         configured_size = meta.get("obs_image_size", [])
         if image_size is not None:
@@ -57,6 +82,14 @@ class ModelClient:
             self.image_size = (int(configured_size[1]), int(configured_size[0]))
         else:
             self.image_size = (224, 224)
+        if self.image_layout == LIBERO_COMPOSITE_LAYOUT and self.image_size != (
+            LIBERO_COMPOSITE_SIZE[1],
+            LIBERO_COMPOSITE_SIZE[0],
+        ):
+            raise RuntimeError(
+                "LIBERO composite checkpoint must use obs_image_size="
+                f"{list(LIBERO_COMPOSITE_SIZE)}, got {configured_size}"
+            )
         self.expects_state = bool(meta.get("expects_state", False))
         self.policy_setup = policy_setup
         self.unnorm_key = unnorm_key
@@ -123,6 +156,14 @@ class ModelClient:
         task_description = example.get("lang", None)
         if task_description != self.task_description:
             self.reset(task_description)
+
+        if self.image_layout == LIBERO_COMPOSITE_LAYOUT:
+            images = list(example.get("image") or [])
+            composite = build_libero_composite(images)
+            example = {
+                **example,
+                "image": [np.asarray(composite, dtype=np.uint8)],
+            }
 
         # Resize images to self.image_size if needed.
         if self.image_size and example.get("image"):

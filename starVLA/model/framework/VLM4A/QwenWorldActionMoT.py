@@ -43,12 +43,14 @@ from starVLA.reproducibility.robodojo_rynn50k import (
     ROBODOJO_RYNN50K_BASE_H25_PROFILE,
     ROBODOJO_RYNN50K_BASE_HISTORY_H25_MEM_PROFILE,
     ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_PROFILE,
+    ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_PROFILE,
     ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_PROFILE,
     ROBODOJO_RYNN50K_PROFILE,
     validate_base_h25_current_dino_fullres_config as validate_robodojo_rynn50k_base_h25_current_dino_fullres_config,
     validate_base_h25_config as validate_robodojo_rynn50k_base_h25_config,
     validate_base_history_h25_mem_config as validate_robodojo_rynn50k_base_history_h25_mem_config,
     validate_base_text_h25_mem_bf16_config as validate_robodojo_rynn50k_base_text_h25_mem_bf16_config,
+    validate_base_text_h25_mem_bf16_current_dino_fullres_config as validate_robodojo_rynn50k_base_text_h25_mem_bf16_current_dino_fullres_config,
     validate_base_text_h25_mem_config as validate_robodojo_rynn50k_base_text_h25_mem_config,
     validate_config as validate_robodojo_rynn50k_config,
 )
@@ -287,6 +289,15 @@ class QwenWorldActionMoT(baseframework):
             # Exact text/event-memory counterpart whose action path inherits
             # the BF16 dtype used by the maintained train and eval launchers.
             validate_robodojo_rynn50k_base_text_h25_mem_bf16_config(self.config)
+        elif (
+            reproduction_profile
+            == ROBODOJO_RYNN50K_BASE_TEXT_H25_MEM_BF16_CURRENT_DINO_FULLRES_PROFILE
+        ):
+            # BF16 event-memory recipe with the full 24x20 clean current-DINO
+            # prefix; the future denoising target remains pooled to 12x10.
+            validate_robodojo_rynn50k_base_text_h25_mem_bf16_current_dino_fullres_config(
+                self.config
+            )
         elif reproduction_profile == ROBODOJO_RYNN50K_BASE_HISTORY_H25_MEM_PROFILE:
             # Strict text-plan ablation: the physical planner retains the same
             # six-frame MEM input while AR generation/NTP remain disabled.

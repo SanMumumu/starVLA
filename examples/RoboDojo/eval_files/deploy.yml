@@ -41,6 +41,13 @@ text_replan_chunks: 4
 # official run. ROBODOJO_LOG_PLANNER_TEXT can override this per invocation.
 log_planner_text: false
 
+# Optional simulator-rollout event-memory figures. eval_robodojo.sh enables
+# this only for ROBODOJO_SAVE_MODE=images and supplies the concrete output.
+eventmem_capture: false
+eventmem_output_dir: null
+eventmem_max_frames: 9
+eventmem_num_envs: 1
+
 # These are hard ABI checks, not image-processing suggestions.
 image_size: [320, 384]
 expected_image_layout: fastwam_composite
